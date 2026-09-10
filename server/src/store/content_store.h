@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -27,13 +28,22 @@ class ContentStore {
   bool drop(const std::string& hex, std::string& err);
 
   // 按 chunkSize 切块写入，返回分块哈希序列与整文件哈希
-  // （整文件哈希 = 各分块哈希拼接后的 SHA-256）。
+  // （整文件哈希 = 原始字节的 SHA-256，与 file_node.content_hash 一致，用于秒传判重）。
   bool putChunked(const std::string& data, std::size_t chunkSize,
                   std::vector<std::string>& chunkHashes,
                   std::vector<std::size_t>& chunkSizes, std::string& fileHash,
                   std::string& err);
   bool getChunked(const std::vector<std::string>& chunkHashes, std::string& out,
                   std::string& err) const;
+
+  // 仅提取 [offset, offset+length) 区间字节（按分块读取，内存占用只约一个分块大小）。
+  // 用于下载端到端 Range/206，避免整文件入内存。
+  bool readRange(const std::vector<std::string>& chunkHashes, std::int64_t offset,
+                 std::int64_t length, std::string& out, std::string& err) const;
+
+  // 把 blob 以硬链接（失败则复制）镜像到 targetAbs（文件树下载语义的物理载体）。
+  // 父目录由调用方创建并完成越界校验；本方法只保证 blob 存在与落位。
+  bool materialize(const std::string& hex, const std::string& targetAbs, std::string& err);
 
  private:
   std::string root_;

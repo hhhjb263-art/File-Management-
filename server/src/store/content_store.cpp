@@ -170,4 +170,55 @@ bool ContentStore::getChunked(const std::vector<std::string>& chunkHashes,
   return true;
 }
 
+bool ContentStore::readRange(const std::vector<std::string>& chunkHashes,
+                             std::int64_t offset, std::int64_t length, std::string& out,
+                             std::string& err) const {
+  out.clear();
+  if (offset < 0 || length <= 0) return true;  // 空区间：直接返回空
+  std::int64_t pos = 0;
+  std::int64_t wantEnd = offset + length;       // 半开区间终点
+  for (const std::string& h : chunkHashes) {
+    std::string part;
+    if (!get(h, part, err)) return false;
+    const std::int64_t psz = static_cast<std::int64_t>(part.size());
+    // 计算本分块与 [offset, wantEnd) 的重叠区间
+    const std::int64_t s = std::max<std::int64_t>(0, offset - pos);
+    const std::int64_t e = std::min<std::int64_t>(psz, wantEnd - pos);
+    if (s < e) out.append(part, static_cast<std::size_t>(s),
+                          static_cast<std::size_t>(e - s));
+    pos += psz;
+    if (pos >= wantEnd) break;                  // 已满足请求区间，提前结束
+  }
+  return true;
+}
+
+bool ContentStore::materialize(const std::string& hex, const std::string& targetAbs,
+                               std::string& err) {
+  if (!validHash(hex)) {
+    err = "invalid hash";
+    return false;
+  }
+  std::error_code ec;
+  fs::path src = fs::path(pathOf(hex));
+  if (!fs::exists(src, ec)) {
+    err = "blob missing: " + hex;
+    return false;
+  }
+  fs::path dst = fs::path(targetAbs);
+  // 覆盖旧镜像（重传同名文件时保持指向最新内容）
+  fs::remove(dst, ec);
+  // 优先硬链接：同一数据目录内零拷贝；跨设备等场景退回复制
+  ec.clear();
+  fs::create_hard_link(src, dst, ec);
+  if (ec) {
+    std::error_code cec;
+    fs::copy_file(src, dst, fs::copy_options::overwrite_existing, cec);
+    if (cec) {
+      err = "materialize failed: link=" + ec.message() + " copy=" + cec.message();
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace cv
