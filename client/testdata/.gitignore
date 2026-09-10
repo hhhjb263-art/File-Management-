@@ -1,0 +1,3 @@
+# gen_big.sh / gen_big.bat 生成的约 6MB 大文件不入库
+big.txt
+*.big

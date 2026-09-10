@@ -23,14 +23,24 @@ server/
 
 ---
 
-## 2. Linux 构建
+## 2. Linux 构建（编译命令）
+
+> 目标平台为 **Linux / POSIX**（`net` 模块用 POSIX socket 实现），**Windows 下无法编译**。
+> 需要 CMake ≥ 3.16 与支持 C++17 的编译器。
+
+### 2.1 安装依赖
 
 ```bash
 # Debian / Ubuntu
 sudo apt install -y build-essential cmake libsqlite3-dev
-# RHEL / CentOS / Rocky
-sudo yum install -y gcc-c++ cmake sqlite-devel
 
+# RHEL / CentOS / Rocky / Fedora
+sudo yum install -y gcc-c++ cmake sqlite-devel        # Fedora 也可用 dnf
+```
+
+### 2.2 基础构建（Release，推荐）
+
+```bash
 cd server
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
@@ -40,9 +50,101 @@ cmake --build build -j$(nproc)
 
 - `build/cloudvault-server` —— 服务端
 - `build/cv_tests` —— 核心自检（SHA-256 向量、JSON 往返、分块读写）
+- `build/compile_commands.json` —— 编译数据库（用 `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` 获得，已默认开启）
+  供 clangd / VSCode / CLion 等 IDE 做跳转与补全；clangd 用户可把它软链到项目根：`ln -s build/compile_commands.json compile_commands.json`
+
+### 2.3 跑自检
 
 ```bash
-./build/cv_tests        # 期望输出：全部自检通过
+# 方式一：CTest（构建时已用 add_test(cv_tests) 注册，测试名就叫 cv_tests）
+ctest --test-dir build --output-on-failure
+
+# 方式二：直接运行（期望输出：全部自检通过）
+./build/cv_tests
+```
+
+> `ctest --test-dir` 需要 CMake/CTest ≥ 3.20；老版本改用 `cd build && ctest --output-on-failure`。
+
+不想要自检目标时用 `-DCV_BUILD_TESTS=OFF` 关闭（此时不会生成 `cv_tests`，也就没有 CTest 用例）：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCV_BUILD_TESTS=OFF
+cmake --build build -j$(nproc)
+```
+
+### 2.4 调试构建
+
+```bash
+# Debug：-O0 -g，便于 gdb 单步
+cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-debug -j$(nproc)
+
+# RelWithDebInfo：-O2 -g，兼顾性能与调试信息
+cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-rel -j$(nproc)
+```
+
+### 2.5 Sanitizer 构建（排查内存 / 并发问题）
+
+```bash
+# AddressSanitizer：地址越界、use-after-free、内存泄漏
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCV_ENABLE_ASAN=ON
+cmake --build build-asan -j$(nproc)
+ctest --test-dir build-asan --output-on-failure
+
+# ThreadSanitizer：数据竞争
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCV_ENABLE_TSAN=ON
+cmake --build build-tsan -j$(nproc)
+ctest --test-dir build-tsan --output-on-failure
+```
+
+> **`CV_ENABLE_ASAN` 与 `CV_ENABLE_TSAN` 互斥**：两者不能同时使用。
+> 若同时传 `-DCV_ENABLE_ASAN=ON -DCV_ENABLE_TSAN=ON`，CMake 会打印一条 WARNING
+> 并**自动关闭 TSAN、只保留 ASAN**。Sanitizer 建议配 Debug 构建使用。
+
+### 2.6 安装
+
+```bash
+# 默认安装前缀 /usr/local；可执行文件装到 <prefix>/bin
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake --build build -j$(nproc)
+sudo cmake --install build
+
+# 顺带装上测试数据（默认 OFF，安装到 <prefix>/share/cloudvault/testdata）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DCV_INSTALL_TESTDATA=ON
+cmake --build build -j$(nproc)
+sudo cmake --install build
+```
+
+安装到用户目录（无需 sudo）：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/.local
+cmake --build build -j$(nproc)
+cmake --install build
+```
+
+### 2.7 可配置项一览
+
+| 选项 | 默认值 | 说明 |
+|---|---|---|
+| `CMAKE_BUILD_TYPE` | `Release` | `Release` / `Debug` / `RelWithDebInfo` / `MinSizeRel` |
+| `CV_BUILD_TESTS` | `ON` | 是否构建自检目标 `cv_tests` 并注册 CTest 用例 |
+| `CV_INSTALL_TESTDATA` | `OFF` | 是否把 `testdata/` 安装到 `<prefix>/share/cloudvault` |
+| `CV_ENABLE_ASAN` | `OFF` | 开启 AddressSanitizer |
+| `CV_ENABLE_TSAN` | `OFF` | 开启 ThreadSanitizer（与 `CV_ENABLE_ASAN` 互斥） |
+| `CMAKE_INSTALL_PREFIX` | `/usr/local` | 安装前缀 |
+| `CMAKE_EXPORT_COMPILE_COMMANDS` | `ON` | 生成 `build/compile_commands.json` |
+
+### 2.8 一键复制版
+
+```bash
+# 依赖 → 构建 → 自检 → 安装，一条龙
+sudo apt install -y build-essential cmake libsqlite3-dev && \
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
+cmake --build build -j$(nproc) && \
+ctest --test-dir build --output-on-failure && \
+sudo cmake --install build
 ```
 
 ---
