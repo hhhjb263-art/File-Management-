@@ -1,0 +1,3 @@
+你好，云匣 CloudVault！
+这是一份最小上传样例，内容包含中文，用于验证 body 原样透传与下载回读一致性。
+Hello, CloudVault!

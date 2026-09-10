@@ -1,0 +1,173 @@
+#include "store/content_store.h"
+
+#include <sys/stat.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <system_error>
+
+#include "core/sha256.h"
+
+namespace cv {
+namespace fs = std::filesystem;
+
+namespace {
+
+bool writeFileAtomic(const std::string& finalPath, const std::string& data,
+                     std::string& err) {
+  std::string tmp = finalPath + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+      err = "cannot write " + tmp + ": " + std::strerror(errno);
+      return false;
+    }
+    if (!data.empty()) out.write(data.data(), static_cast<std::streamsize>(data.size()));
+    out.flush();
+    if (!out.good()) {
+      err = "write failed: " + tmp;
+      return false;
+    }
+  }
+  std::error_code ec;
+  fs::rename(tmp, finalPath, ec);
+  if (ec) {
+    fs::remove(tmp, ec);
+    err = "rename failed: " + ec.message();
+    return false;
+  }
+  return true;
+}
+
+bool readFileAll(const std::string& path, std::string& out, std::string& err) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open()) {
+    err = "cannot open " + path + ": " + std::strerror(errno);
+    return false;
+  }
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  out = ss.str();
+  return true;
+}
+
+}  // namespace
+
+ContentStore::ContentStore(std::string root) : root_(std::move(root)) {}
+
+bool ContentStore::validHash(const std::string& hex) {
+  if (hex.size() != 64) return false;
+  for (char c : hex) {
+    bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    if (!ok) return false;
+  }
+  return true;
+}
+
+std::string ContentStore::pathOf(const std::string& hex) const {
+  return root_ + "/" + hex.substr(0, 2) + "/" + hex;
+}
+
+bool ContentStore::init(std::string& err) {
+  std::error_code ec;
+  fs::create_directories(root_, ec);
+  if (ec) {
+    err = "create blob root failed: " + ec.message();
+    return false;
+  }
+  return true;
+}
+
+bool ContentStore::exists(const std::string& hex) const {
+  if (!validHash(hex)) return false;
+  std::error_code ec;
+  return fs::exists(pathOf(hex), ec);
+}
+
+bool ContentStore::put(const std::string& hex, const std::string& data, std::string& err) {
+  if (!validHash(hex)) {
+    err = "invalid content hash";
+    return false;
+  }
+  if (exists(hex)) return true;  // 去重：内容相同直接成功
+
+  std::string dir = root_ + "/" + hex.substr(0, 2);
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  if (ec) {
+    err = "create dir failed: " + ec.message();
+    return false;
+  }
+  return writeFileAtomic(pathOf(hex), data, err);
+}
+
+bool ContentStore::get(const std::string& hex, std::string& out, std::string& err) const {
+  if (!validHash(hex)) {
+    err = "invalid content hash";
+    return false;
+  }
+  return readFileAll(pathOf(hex), out, err);
+}
+
+bool ContentStore::drop(const std::string& hex, std::string& err) {
+  if (!validHash(hex)) {
+    err = "invalid content hash";
+    return false;
+  }
+  std::error_code ec;
+  bool removed = fs::remove(pathOf(hex), ec);
+  if (!removed) {
+    err = "remove failed: " + ec.message();
+    return false;
+  }
+  return true;
+}
+
+bool ContentStore::putChunked(const std::string& data, std::size_t chunkSize,
+                              std::vector<std::string>& chunkHashes,
+                              std::vector<std::size_t>& chunkSizes,
+                              std::string& fileHash, std::string& err) {
+  if (chunkSize == 0) {
+    err = "invalid chunk size";
+    return false;
+  }
+  chunkHashes.clear();
+  chunkSizes.clear();
+  std::string concat;
+  std::size_t offset = 0;
+  if (data.empty()) {
+    std::string h = Sha256::of("", 0);
+    if (!put(h, "", err)) return false;
+    chunkHashes.push_back(h);
+    chunkSizes.push_back(0);
+    concat += h;
+  }
+  while (offset < data.size()) {
+    std::size_t n = std::min(chunkSize, data.size() - offset);
+    std::string h = Sha256::of(data.data() + offset, n);
+    if (!put(h, std::string(data.data() + offset, n), err)) return false;
+    chunkHashes.push_back(h);
+    chunkSizes.push_back(n);
+    concat += h;
+    offset += n;
+  }
+  fileHash = Sha256::of(concat);
+  return true;
+}
+
+bool ContentStore::getChunked(const std::vector<std::string>& chunkHashes,
+                              std::string& out, std::string& err) const {
+  out.clear();
+  for (const std::string& h : chunkHashes) {
+    std::string part;
+    if (!get(h, part, err)) return false;
+    out += part;
+  }
+  return true;
+}
+
+}  // namespace cv

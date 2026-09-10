@@ -1,0 +1,5 @@
+CloudVault dedup sample - A
+内容完全相同的一份文本，用于验证秒传（instant）。
+先上传 dup-a.txt，再上传 dup-b.txt，第二次应返回 "instant": true，
+且服务端 blobs 目录不会新增分块。
+0123456789abcdefghijklmnopqrstuvwxyz
