@@ -14,6 +14,7 @@ class QLabel;
 class QLineEdit;
 class QNetworkAccessManager;
 class QNetworkReply;
+class QThreadPool;
 class QNetworkRequest;
 class QPlainTextEdit;
 class QProgressBar;
@@ -36,6 +37,28 @@ struct DlItem
     QString name;
     qint64 size = 0;
     QString targetPath;
+};
+
+// 后台线程池任务结果（阻塞式文件 IO / 哈希全部移出 UI 线程）
+struct ChunkScanResult
+{
+    bool ok = false;
+    QString err;
+    QString path;
+    QString name;
+    QString hash;
+    qint64 size = 0;
+    qint64 mtime = 0;
+    QList<ChunkPlan> chunks;
+};
+
+struct ChunkReadResult
+{
+    QString hash;      // 分块 SHA-256（线程池内算好，避免占用 UI 线程）
+    bool ok = false;
+    QString err;
+    int seq = 0;
+    QByteArray data;
 };
 
 // 文件列表行数据（客户端侧数据模型：排序 / 渲染都基于它）
@@ -107,8 +130,6 @@ private:
     void handleListReply(const QByteArray &raw);
 
     // ---- 分块上传（断点续传）----
-    // 流式算整文件 SHA-256，同时按 chunk_size 切出分块表（不把整文件读进内存）
-    bool prepareChunkPlan(const QString &path, QString *err);
     bool loadManifest(const QString &path);   // 读本地 manifest，校验 size/mtime/hash
     void saveManifest();                      // 把当前会话落盘（每收到一个分块 ACK 都调用）
     void clearManifest();                     // 上传完成后删除 manifest
@@ -116,7 +137,6 @@ private:
     void sendInit();         // POST /api/v1/uploads/init
     void beginUploading(const QJsonArray &serverUploaded);  // 合并已传集合并启动并发上传
     void pumpChunks();       // 按并发上限补齐在途分块；全部完成则 complete
-    void launchChunk(int seq);     // PUT 单块（带 X-Chunk-SHA256，指数退避重试）
     void sendComplete();     // POST /api/v1/uploads/:id/complete
     // 分块会话内所有响应的统一收口，按 step 分派；
     // dlTotal / dlStart 取自 Content-Range（仅下载用，dlStart=-1 表示 200 整文件响应）
@@ -128,7 +148,6 @@ private:
     void handleChunkReply(int status, const QString &errorString, const QByteArray &raw,
                           int seq);
     void handleCompleteReply(int status, const QString &errorString, const QByteArray &raw);
-    bool readChunk(int seq, QByteArray *out, QString *err) const;  // seek + read 单块
     int uploadedCount() const;                                     // 已确认分块数（0..total）
     void updateProgress();       // 刷新进度条与进度文案
     void updateCancelButton();   // 【取消上传】只在上传会话进行中可用
@@ -154,6 +173,14 @@ private:
     void sendWholeFile(const QString &path, bool overwrite);
     // 同名冲突：返回 true = 用户选择覆盖，false = 跳过
     bool askOverwrite(const QString &dir, const QString &name);
+
+    // ---- 线程池：阻塞式文件 IO / 哈希移出 UI 线程 ----
+    void onChunkScanDone(const ChunkScanResult &r);      // 扫描（含 SHA-256）完成
+    void afterChunkPlanReady(const QString &dir);        // 拿到分块表后继续建立会话
+    void launchChunkAsync(int seq);                      // 后台读分块 → 回主线程发送
+    void onChunkReadDone(const ChunkReadResult &r);
+    void appendDownloadSegmentAsync(const QByteArray &data, qint64 offset);  // 后台追加落盘
+    void onDownloadSegmentWritten(bool ok, const QString &err, qint64 bytes);
 
     // ---- 文件列表数据模型与排序 ----
     void renderRows();                  // 按 m_rows 重建表格
@@ -213,6 +240,12 @@ private:
     QPushButton *m_previewForceBtn = nullptr;// 【仍要预览】，超过体积上限时才出现
 
     QNetworkAccessManager *m_nam = nullptr;
+    QThreadPool *m_ioPool = nullptr;   // 文件 IO / 哈希线程池（默认 3 线程）
+    // ⚠️ 线程安全规则（无锁模型的前提）：池内 lambda 只允许捕获「值拷贝」，
+    //    禁止捕获 this / 读写任何 m_ 成员；结果必须经 QMetaObject::invokeMethod(
+    //    self, …, Qt::QueuedConnection) 回主线程后再改成员。违反即引入数据竞争。
+    bool m_scanning = false;           // 正在后台扫描文件（防重入）
+    QString m_pendingChunkDir;         // 异步扫描期间暂存目标目录
     QHash<QNetworkReply *, QElapsedTimer> m_timers;   // 每个请求各自的计时器
     QHash<QString, bool> m_instantById;               // 文件 id -> 是否秒传
     int m_pending = 0;                                // 在途请求数

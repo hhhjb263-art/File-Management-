@@ -27,6 +27,8 @@
 #include <algorithm>
 
 #include <QCryptographicHash>
+#include <QPointer>
+#include <QThreadPool>
 #include <QDir>
 #include <QJsonArray>
 #include <QMenu>
@@ -113,6 +115,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 
     m_nam = new QNetworkAccessManager(this);
     connect(m_nam, &QNetworkAccessManager::finished, this, &MainWindow::onReplyFinished);
+
+    // 文件 IO / 哈希线程池：扫描整文件算 SHA-256、逐块读、下载落盘都在这里跑，
+    // 保证 UI 线程只做界面操作（默认 3 线程，避免与网络并发叠加打满磁盘）
+    m_ioPool = new QThreadPool(this);
+    m_ioPool->setMaxThreadCount(3);
 
     // manifest 目录：AppDataLocation/cloudvault（程序退出也不丢进度）
     m_manifestDir =
@@ -373,6 +380,12 @@ void MainWindow::startNextUpload()
                       .arg(path, formatSize(fileSize), formatSize(kStreamUploadThreshold)));
         QString err;
         if (!beginChunkedUploadFor(path, m_upDir, &err)) {
+            if (m_scanning) {
+                // 已有文件在扫描：排回队首，稍后重试（不算失败）
+                m_upQueue.prepend(path);
+                QTimer::singleShot(300, this, [this] { startNextUpload(); });
+                return;
+            }
             appendLog(QStringLiteral("init"), buildUrl(QStringLiteral("/api/v1/uploads/init")), 0, 0,
                       QStringLiteral("✗ 无法开始分块上传：%1（%2）").arg(path, err));
             ++m_upFail;
@@ -809,6 +822,9 @@ void MainWindow::onChunkedUpload()
 
 // 建立一次分块上传会话（流式：按 5MiB 逐块 seek+read，绝不整文件入内存）。
 // 供【分块上传】按钮与批量上传中的大文件共用；失败时返回 false 且 err 非空。
+// 纯函数：流式扫描文件 + 算整文件 SHA-256（定义在文件后部；在线程池里执行）
+ChunkScanResult scanFileForChunks(const QString &path);
+
 bool MainWindow::beginChunkedUploadFor(const QString &path, const QString &dir, QString *err)
 {
     if (m_chunkActive) {
@@ -817,16 +833,56 @@ bool MainWindow::beginChunkedUploadFor(const QString &path, const QString &dir, 
         }
         return false;
     }
-
-    QString perr;
-    if (!prepareChunkPlan(path, &perr)) {
+    if (m_scanning) {
         if (err) {
-            *err = perr;
+            *err = QStringLiteral("正在扫描另一个文件，请稍候");
         }
         return false;
     }
-    m_chunkDir = dir;
 
+    // 大文件的扫描 + SHA-256 可能耗时数十秒：放到线程池，避免冻结界面
+    m_scanning = true;
+    m_pendingChunkDir = dir;
+    showStatus(QStringLiteral("… 正在扫描文件（计算 SHA-256）…"), true);
+    QThreadPool *pool = m_ioPool;
+    QPointer<MainWindow> self(this);
+    pool->start( [self, path]() {
+        const ChunkScanResult r = scanFileForChunks(path);
+        if (self) {
+            QMetaObject::invokeMethod(
+                self, [self, r]() { if (self) self->onChunkScanDone(r); }, Qt::QueuedConnection);
+        }
+    });
+    return true;
+}
+
+// 扫描（含整文件 SHA-256）在线程池里完成 → 回主线程继续建立上传会话
+void MainWindow::onChunkScanDone(const ChunkScanResult &r)
+{
+    m_scanning = false;
+    if (!r.ok) {
+        appendLog(QStringLiteral("扫描"), buildUrl(QStringLiteral("/api/v1/uploads/init")), 0, 0,
+                  QStringLiteral("✗ 无法读取本机文件：%1（%2）").arg(r.path, r.err));
+        showStatus(QStringLiteral("✗ 扫描文件失败"), false);
+        if (m_upBatch) {
+            ++m_upFail;
+            QTimer::singleShot(0, this, [this] { startNextUpload(); });
+        }
+        return;
+    }
+    m_chunkFileSize = r.size;
+    m_chunkMtime = r.mtime;
+    m_chunkName = r.name;
+    m_chunkPath = r.path;
+    m_chunkFileHash = r.hash;
+    m_chunks = r.chunks;
+    afterChunkPlanReady(m_pendingChunkDir);
+}
+
+// 拿到分块表后：重置会话状态、尝试续传、启动 init
+void MainWindow::afterChunkPlanReady(const QString &dir)
+{
+    m_chunkDir = dir;
     // 本地即可算出总分块数（chunk_size 固定为 kChunkSize），保证所有分支（含 GET 会话续传）
     // 在传块前都已知道 m_totalChunks
     m_totalChunks = static_cast<int>((m_chunkFileSize + kChunkSize - 1) / kChunkSize);
@@ -842,7 +898,7 @@ bool MainWindow::beginChunkedUploadFor(const QString &path, const QString &dir, 
     m_chunkOverwrite = false;   // 每次新会话重新询问同名覆盖
 
     // 本地 manifest 校验：size / mtime / full_hash 三者全一致才复用，否则从头传
-    const bool resumed = loadManifest(path);
+    const bool resumed = loadManifest(m_chunkPath);
     if (!resumed) {
         m_uploadId = 0;
         m_doneSeq.clear();
@@ -862,7 +918,6 @@ bool MainWindow::beginChunkedUploadFor(const QString &path, const QString &dir, 
     } else {
         sendInit();
     }
-    return true;
 }
 
 void MainWindow::onCancelUpload()
@@ -1088,30 +1143,28 @@ void MainWindow::resetPreview()
 
 // 流式读取文件，边读边喂 QCryptographicHash 算整文件 SHA-256，
 // 同时按 chunk_size 切出每个分块的偏移 / 长度表（任何时刻内存里只有 1MiB 缓冲）。
-bool MainWindow::prepareChunkPlan(const QString &path, QString *err)
+// 流式扫描本地文件：边读边算整文件 SHA-256，同时按 kChunkSize 切出分块表。
+// ⚠️ 纯函数、不碰 Qt 界面对象 —— 它在线程池里执行（大文件扫描+哈希是 UI 卡顿的元凶）。
+ChunkScanResult scanFileForChunks(const QString &path)
 {
+    ChunkScanResult r;
     QFileInfo info(path);
-    m_chunkFileSize = info.size();
-    m_chunkMtime = info.lastModified().toMSecsSinceEpoch();
-    m_chunkName = info.fileName();
-    // 必须记录绝对路径：后续 readChunk()/loadManifest() 都靠它定位本地文件
-    // （漏了这句会让 QFile("") 打开失败，报 "No file name specified"）
-    m_chunkPath = info.absoluteFilePath();
+    r.size = info.size();
+    r.mtime = info.lastModified().toMSecsSinceEpoch();
+    r.name = info.fileName();
+    r.path = info.absoluteFilePath();
 
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        if (err) {
-            *err = file.errorString();
-        }
-        return false;
+        r.err = file.errorString();
+        return r;
     }
 
     QCryptographicHash hash(QCryptographicHash::Sha256);
-    m_chunks.clear();
     qint64 chunkStart = 0;   // 当前分块的起始偏移
     qint64 curLen = 0;       // 当前分块已累积长度
     qint64 pos = 0;          // 已处理的总字节数
-    const qint64 size = m_chunkFileSize;
+    const qint64 size = r.size;
 
     QByteArray buf;
     buf.resize(static_cast<int>(kHashBufferSize));
@@ -1120,11 +1173,9 @@ bool MainWindow::prepareChunkPlan(const QString &path, QString *err)
         const qint64 toRead = qMin(kHashBufferSize, size - pos);
         const qint64 got = file.read(buf.data(), static_cast<int>(toRead));
         if (got != toRead || got < 0) {
-            if (err) {
-                *err = QStringLiteral("读取文件失败");
-            }
+            r.err = QStringLiteral("读取文件失败");
             file.close();
-            return false;
+            return r;
         }
         hash.addData(QByteArrayView(buf.constData(), static_cast<qsizetype>(got)));
 
@@ -1137,7 +1188,7 @@ bool MainWindow::prepareChunkPlan(const QString &path, QString *err)
             pos += take;
             // 分块攒满，或已到文件末尾 -> 收尾一个分块
             if (curLen >= kChunkSize || pos >= size) {
-                m_chunks.append(ChunkPlan{chunkStart, curLen});
+                r.chunks.append(ChunkPlan{chunkStart, curLen});
                 chunkStart = pos;
                 curLen = 0;
             }
@@ -1145,8 +1196,9 @@ bool MainWindow::prepareChunkPlan(const QString &path, QString *err)
     }
 
     file.close();
-    m_chunkFileHash = QString::fromUtf8(hash.result().toHex());
-    return true;
+    r.hash = QString::fromUtf8(hash.result().toHex());
+    r.ok = true;
+    return r;
 }
 
 // 读取本地 manifest，仅当 size/mtime/full_hash 与当前文件完全一致才视为命中续传
@@ -1310,7 +1362,7 @@ void MainWindow::pumpChunks()
         if (m_inflightSeq.size() >= kMaxConcurrent) {
             break;
         }
-        launchChunk(seq);
+        launchChunkAsync(seq);
     }
 
     const bool allDone = (m_totalChunks == 0) ||
@@ -1321,32 +1373,75 @@ void MainWindow::pumpChunks()
     }
 }
 
-// PUT 单个分块（带 X-Chunk-SHA256），失败按指数退避重试
-void MainWindow::launchChunk(int seq)
+// 在**线程池**里读取单个分块（5MiB seek+read 不该阻塞 UI），读完回主线程发送
+void MainWindow::launchChunkAsync(int seq)
 {
-    QByteArray data;
-    QString err;
-    if (!readChunk(seq, &data, &err)) {
+    if (seq < 0 || seq >= m_chunks.size()) {
+        return;
+    }
+    // 先占位，避免 pumpChunks 重复派发同一块
+    m_inflightSeq.insert(seq);
+
+    const QString path = m_chunkPath;
+    const ChunkPlan plan = m_chunks.at(seq);
+    QThreadPool *pool = m_ioPool;
+    QPointer<MainWindow> self(this);
+    pool->start( [self, path, plan, seq]() {
+        ChunkReadResult r;
+        r.seq = seq;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            r.err = file.errorString();
+        } else if (!file.seek(plan.offset)) {
+            r.err = QStringLiteral("seek 失败");
+            file.close();
+        } else {
+            r.data = file.read(plan.length);
+            file.close();
+            if (r.data.size() != plan.length) {
+                r.err = QStringLiteral("读取文件失败（期望 %1 字节，实得 %2）")
+                            .arg(plan.length).arg(r.data.size());
+            } else {
+                // 分块 SHA-256 在线程池里算（此前在 UI 线程，5MiB 一块会造成卡顿）
+                r.hash = QString::fromUtf8(
+                    QCryptographicHash::hash(r.data, QCryptographicHash::Sha256).toHex());
+                r.ok = true;
+            }
+        }
+        if (self) {
+            QMetaObject::invokeMethod(
+                self, [self, r]() { if (self) self->onChunkReadDone(r); }, Qt::QueuedConnection);
+        }
+    });
+}
+
+void MainWindow::onChunkReadDone(const ChunkReadResult &r)
+{
+    if (!m_chunkActive) {
+        return;   // 会话已结束/取消：丢弃在途结果
+    }
+    if (m_cancelRequested) {
+        m_inflightSeq.remove(r.seq);
+        return;
+    }
+    if (!r.ok) {
+        m_inflightSeq.remove(r.seq);
         appendLog(QStringLiteral("chunk"),
-                  buildUrl(QStringLiteral("/api/v1/uploads/%1/chunk/%2").arg(m_uploadId).arg(seq)),
-                  0, 0, QStringLiteral("[读取失败] %1").arg(err));
+                  buildUrl(QStringLiteral("/api/v1/uploads/%1/chunk/%2").arg(m_uploadId).arg(r.seq)),
+                  0, 0, QStringLiteral("[读取失败] %1").arg(r.err));
         finishChunkSession(false);
         return;
     }
 
-    const QString chunkHash = QString::fromUtf8(
-        QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex());
-
+    const QString chunkHash = r.hash;   // 已在线程池内算好
     QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/uploads/%1/chunk/%2")
-                                     .arg(m_uploadId).arg(seq)));
+                                     .arg(m_uploadId).arg(r.seq)));
     req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/octet-stream"));
-    req.setHeader(QNetworkRequest::ContentLengthHeader, data.size());
+    req.setHeader(QNetworkRequest::ContentLengthHeader, r.data.size());
     req.setRawHeader("X-Chunk-SHA256", chunkHash.toUtf8());
-
-    QNetworkReply *r = sendRequest(req, "PUT", data);
-    r->setProperty("cvStep", QStringLiteral("chunk"));
-    r->setProperty("cvSeq", seq);
-    m_inflightSeq.insert(seq);
+    QNetworkReply *reply = sendRequest(req, "PUT", r.data);
+    reply->setProperty("cvStep", QStringLiteral("chunk"));
+    reply->setProperty("cvSeq", r.seq);
 }
 
 void MainWindow::sendComplete()
@@ -1508,7 +1603,7 @@ void MainWindow::handleChunkReply(int status, const QString &errorString, const 
                           .arg(tries + 1).arg(delay));
             QTimer::singleShot(delay, this, [this, seq] {
                 if (m_chunkActive && !m_cancelRequested) {
-                    launchChunk(seq);
+                    launchChunkAsync(seq);
                 }
             });
             updateProgress();
@@ -1626,40 +1721,6 @@ void MainWindow::handleCompleteReply(int status, const QString &errorString, con
     finishChunkSession(false);
 }
 
-bool MainWindow::readChunk(int seq, QByteArray *out, QString *err) const
-{
-    if (seq < 0 || seq >= m_chunks.size()) {
-        if (err) {
-            *err = QStringLiteral("分块序号越界");
-        }
-        return false;
-    }
-    const ChunkPlan &p = m_chunks.at(seq);
-    QFile file(m_chunkPath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        if (err) {
-            *err = file.errorString();
-        }
-        return false;
-    }
-    if (!file.seek(p.offset)) {
-        if (err) {
-            *err = QStringLiteral("seek 失败");
-        }
-        file.close();
-        return false;
-    }
-    const QByteArray data = file.read(p.length);
-    file.close();
-    if (data.size() != p.length) {
-        if (err) {
-            *err = QStringLiteral("读取字节数不足");
-        }
-        return false;
-    }
-    *out = data;
-    return true;
-}
 
 int MainWindow::uploadedCount() const
 {
@@ -1802,22 +1863,55 @@ void MainWindow::handleDownloadChunkReply(int status, bool networkError, const Q
     if (dlTotal > 0) {
         m_dlTotal = dlTotal;   // 以 Content-Range 的 total 为准
     }
-    QFile part(m_dlPartPath);
-    if (!part.open(QIODevice::WriteOnly)) {
+    // 落盘放到线程池（每段 4MiB 写盘不该阻塞 UI）；写完回主线程推进进度/下一段
+    appendDownloadSegmentAsync(raw, m_dlOffset);
+}
+
+// 后台追加写下载段（先 seek 到 offset 再写，支持断点续传语义）
+void MainWindow::appendDownloadSegmentAsync(const QByteArray &data, qint64 offset)
+{
+    const QString partPath = m_dlPartPath;
+    QThreadPool *pool = m_ioPool;
+    QPointer<MainWindow> self(this);
+    pool->start( [self, partPath, data, offset]() {
+        bool ok = false;
+        QString err;
+        QFile part(partPath);
+        if (!part.open(QIODevice::ReadWrite)) {
+            err = part.errorString();
+        } else if (!part.seek(offset)) {
+            err = QStringLiteral("seek 失败：%1").arg(part.errorString());
+            part.close();
+        } else if (part.write(data) != data.size()) {
+            err = QStringLiteral("写入不足：%1").arg(part.errorString());
+            part.close();
+        } else {
+            part.close();
+            ok = true;
+        }
+        if (self) {
+            QMetaObject::invokeMethod(
+                self,
+                [self, ok, err]() { if (self) self->onDownloadSegmentWritten(ok, err, 0); },
+                Qt::QueuedConnection);
+        }
+    });
+}
+
+void MainWindow::onDownloadSegmentWritten(bool ok, const QString &err, qint64 bytes)
+{
+    Q_UNUSED(bytes);
+    if (!m_dlActive) {
+        return;   // 已被取消/结束
+    }
+    if (!ok) {
         appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_dlPartPath), 0, 0,
-                  QStringLiteral("[落盘失败] %1").arg(part.errorString()));
+                  QStringLiteral("[落盘失败] %1").arg(err));
         finishDownload(false);
         return;
     }
-    if (!part.seek(m_dlOffset)) {
-        appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_dlPartPath), 0, 0,
-                  QStringLiteral("[seek 失败] %1").arg(part.errorString()));
-        finishDownload(false);
-        return;
-    }
-    part.write(raw);
-    part.close();
-    m_dlOffset += raw.size();
+    // 实际落盘字节数 = .part 当前大小（seek+write 后由文件系统裁定）
+    m_dlOffset = QFileInfo(m_dlPartPath).size();
 
     const int pct = m_dlTotal > 0 ? static_cast<int>(m_dlOffset * 100LL / m_dlTotal) : 0;
     // 进度条用 0..1000 千分比：直接 setRange(0, m_dlTotal) 在 >2GiB 时会 int 溢出
@@ -2234,7 +2328,9 @@ void MainWindow::setBusy(bool busy)
     m_downloadBtn->setEnabled(!busy);
     m_chunkUploadBtn->setEnabled(!busy);
     m_dlResumeBtn->setEnabled(!busy);
-    if (busy) {
+    // 分块上传/批量传输会持续产生大量短请求，若每个都切忙碌光标会不停闪烁；
+    // 这类场景只禁用按钮，不改光标（IO 已在线程池，界面保持可交互）
+    if (busy && !m_chunkActive && !m_upBatch && !m_dlBatch) {
         setCursor(Qt::BusyCursor);
     } else {
         unsetCursor();
