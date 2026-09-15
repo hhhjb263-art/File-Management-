@@ -62,6 +62,9 @@ namespace {
 // 日志里单条响应最多展示的字节数，避免大文件把日志区刷爆
 constexpr int kMaxBodyInLog = 4096;
 
+// 二进制响应体在日志里只展示前 N 字节的十六进制摘要（避免整段乱码）
+constexpr qsizetype kBodyBinaryPreviewBytes = 48;
+
 // 服务端默认端口
 constexpr int kDefaultPort = 8080;
 
@@ -91,7 +94,7 @@ constexpr qsizetype kBinaryScanBytes = 8 * 1024;
 
 QString defaultServerUrl()
 {
-    return QStringLiteral("http://127.0.0.1:%1").arg(kDefaultPort);
+    return QStringLiteral("http://172.20.32.231:%1").arg(kDefaultPort);
 }
 
 }  // namespace
@@ -1539,11 +1542,20 @@ QUrl MainWindow::buildUrl(const QString &path) const
     while (base.endsWith(QLatin1Char('/'))) {
         base.chop(1);
     }
-    if (base.isEmpty() || (!base.startsWith(QStringLiteral("http://"))
-                           && !base.startsWith(QStringLiteral("https://")))) {
-        base = defaultServerUrl();   // 地址栏为空或格式不对时退回默认地址
+    if (base.isEmpty()) {
+        base = defaultServerUrl();
     }
-    return QUrl(base + path);
+    // 容忍只填 IP 或 IP:端口 —— 缺 scheme 时补 http://
+    // （旧实现在缺 scheme 时静默退回默认地址，导致用户填了服务器 IP 也连不上）
+    if (!base.startsWith(QStringLiteral("http://"))
+        && !base.startsWith(QStringLiteral("https://"))) {
+        base.prepend(QStringLiteral("http://"));
+    }
+    QUrl url(base + path);
+    if (url.port() < 0) {
+        url.setPort(kDefaultPort);   // 未显式带端口时补默认端口
+    }
+    return url;
 }
 
 QNetworkReply *MainWindow::sendRequest(const QNetworkRequest &request, const QByteArray &verb,
@@ -1936,12 +1948,23 @@ QString MainWindow::formatSize(qint64 bytes)
 
 QString MainWindow::formatBody(const QByteArray &raw)
 {
-    // 大响应（例如 6MB 下载）不参与 JSON 解析与全量转码，避免界面卡顿
-    if (raw.size() > kMaxBodyInLog * 4) {
-        return QStringLiteral("（响应体 %1，过大，仅展示大小）").arg(formatSize(raw.size()));
+    if (raw.isEmpty()) {
+        return QString();
     }
 
-    // 先尝试按 JSON 美化输出，失败则按纯文本/二进制截断展示
+    // 二进制响应体（下载内容、分块回读等）绝不按文本转码，否则会整段乱码。
+    // 只给「大小 + 前 N 字节十六进制摘要」——文件过大时"显示部分即可"。
+    if (looksBinary(raw)) {
+        const qsizetype preview =
+            raw.size() < kBodyBinaryPreviewBytes ? raw.size() : kBodyBinaryPreviewBytes;
+        return QStringLiteral("（二进制响应体 %1，前 %2 字节：%3%4）")
+            .arg(formatSize(raw.size()))
+            .arg(preview)
+            .arg(QString::fromLatin1(raw.left(preview).toHex(' ')))
+            .arg(raw.size() > preview ? QStringLiteral(" …") : QString());
+    }
+
+    // 先尝试按 JSON 美化输出，失败则按纯文本展示
     QJsonParseError err;
     const QJsonDocument doc = QJsonDocument::fromJson(raw, &err);
     QString text;
@@ -1951,9 +1974,14 @@ QString MainWindow::formatBody(const QByteArray &raw)
         text = QString::fromUtf8(raw);
     }
 
+    // 过长文本只展示前 kMaxBodyInLog 个字符（且在字符边界截断，不产生乱码）
     if (text.size() > kMaxBodyInLog) {
-        return QStringLiteral("%1\n…（响应过长，已省略 %2 字节）")
-            .arg(text.left(kMaxBodyInLog), QString::number(text.size() - kMaxBodyInLog));
+        QString head = text.left(kMaxBodyInLog);
+        if (!head.isEmpty() && head.at(head.size() - 1).isHighSurrogate()) {
+            head.chop(1);   // 避免切断代理对
+        }
+        return QStringLiteral("%1\n…（响应共 %2，已省略后 %3 字符）")
+            .arg(head, formatSize(raw.size()), QString::number(text.size() - head.size()));
     }
     return text;
 }

@@ -280,8 +280,12 @@ void FileTreeDialog::handleDirsReply(int status, bool networkError, const QByteA
 {
     if (networkError || status != 200) {
         m_loadError = true;
-        m_loadErrorMsg = networkError ? QStringLiteral("网络错误，无法拉取目录列表。")
-                                      : QStringLiteral("拉取目录列表失败（HTTP %1）。").arg(status);
+        m_loadErrorMsg = networkError
+            ? QStringLiteral("网络错误，无法连接 %1（请检查服务器地址与网络是否可达）。")
+                  .arg(m_dirsUrl.toString())
+            : QStringLiteral("拉取目录列表失败（HTTP %1）：%2")
+                  .arg(status)
+                  .arg(m_dirsUrl.toString());
     } else {
         QJsonParseError perr;
         const QJsonDocument doc = QJsonDocument::fromJson(raw, &perr);
@@ -299,8 +303,12 @@ void FileTreeDialog::handleFilesReply(int status, bool networkError, const QByte
 {
     if (networkError || status != 200) {
         m_loadError = true;
-        m_loadErrorMsg = networkError ? QStringLiteral("网络错误，无法拉取文件列表。")
-                                      : QStringLiteral("拉取文件列表失败（HTTP %1）。").arg(status);
+        m_loadErrorMsg = networkError
+            ? QStringLiteral("网络错误，无法连接 %1（请检查服务器地址与网络是否可达）。")
+                  .arg(m_filesUrl.toString())
+            : QStringLiteral("拉取文件列表失败（HTTP %1）：%2")
+                  .arg(status)
+                  .arg(m_filesUrl.toString());
     } else {
         QJsonParseError perr;
         const QJsonDocument doc = QJsonDocument::fromJson(raw, &perr);
