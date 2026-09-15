@@ -36,6 +36,8 @@ struct Response {
   int status = 200;
   std::string contentType = "application/json; charset=utf-8";
   std::string body;
+  // 附加响应头（如 Accept-Ranges / Content-Range），键已转小写
+  std::map<std::string, std::string> extraHeaders;
 
   void setJson(int code, const std::string& json);
   void setText(int code, const std::string& text);

@@ -203,10 +203,15 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke.sh   # 指定其他端口
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/healthz` | 健康检查 |
-| POST | `/api/v1/files` | 上传（body 为原始字节，文件名取请求头 `X-CV-Name`，需 URL 编码） |
+| POST | `/api/v1/files` | 整文件上传（body 为原始字节，文件名取请求头 `X-CV-Name`，需 URL 编码） |
 | GET | `/api/v1/files` | 文件列表（最近 500 条） |
 | GET | `/api/v1/files/:id` | 文件元数据 |
-| GET | `/api/v1/files/:id/content` | 下载（按分块顺序重组） |
+| GET | `/api/v1/files/:id/content` | 下载（按分块顺序重组；支持 `Range: bytes=`，返回 `206` + `Content-Range`） |
+| POST | `/api/v1/uploads/init` | 分块上传会话初始化（含秒传 / 断点复用） |
+| GET | `/api/v1/uploads/:id` | 查询会话状态与已收分块 |
+| PUT | `/api/v1/uploads/:id/chunk/:seq` | 上传单个分块（幂等，可带 `X-Chunk-SHA256`） |
+| POST | `/api/v1/uploads/:id/complete` | 合并分块落库 |
+| DELETE | `/api/v1/uploads/:id` | 取消会话 |
 
 ```bash
 # 1) 健康检查
@@ -235,6 +240,62 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 
 ---
 
+## 4.1 分块上传 + 断点续传（`/api/v1/uploads/*`）
+
+适用于**大文件 / 弱网 / 可暂停续传**的场景。流程：`init` 拿到 `upload_id` → 逐块 `PUT` → `complete` 合并落库。客户端与服务端共用下方契约（已冻结）。
+
+整文件上传（`POST /api/v1/files`）与分块上传是**两套独立协议**，互不干扰；两者落库后的文件都通过同一 `file_node` 表管理，整文件哈希定义一致（= 原始字节的 SHA-256），因此**分块上传完成的内容可被整文件秒传判重命中，反之亦然**。
+
+### 状态表
+
+`upload_session` 的 `status` 取以下值之一：`created`（已建会话未收块）、`uploading`（已收部分分块）、`completed`（已合并）、`aborted`（已取消/超时）。
+
+### 端点
+
+**`POST /api/v1/uploads/init`**　body：`{"name","size","chunk_size"（可选，缺省服务端配置，clamp 到 64KiB~64MiB）,"hash"（整文件 SHA-256，可选）}`
+- 若 `hash` 已在内容库命中 → 秒传：返回 `{"upload_id":0,"done":true,"file_id":<已存在id>,...}`。
+- 若同 `(hash,size,chunk_size)` 存在**未完成**会话 → 复用，返回其 `upload_id` 与 `uploaded` 列表（跨重启续传的关键）。
+- 否则新建会话：返回 `{"upload_id","name","size","chunk_size","hash","uploaded":[],"received_bytes":0}`。
+- 错误：`400` 参数非法（含 size<0、hash 非 64-hex）/ `413` 总量超过 2GiB 上限。
+
+**`GET /api/v1/uploads/:id`**　返回 `{"upload_id","size","chunk_size","uploaded":[seq...],"received_bytes","status"}`；`404` 会话不存在。
+
+**`PUT /api/v1/uploads/:id/chunk/:seq`**　body = 分块原始字节，可选头 `X-Chunk-SHA256` 落盘后比对。
+- 校验：`seq` 越界 → `400`；非末尾分块大小必须 == `chunk_size`，末尾分块必须 `<= chunk_size` 且与剩余字节一致 → 否则 `400`；`X-Chunk-SHA256` 与落盘哈希不符 → `400`。
+- 幂等：同一 `seq` 重复上传（内容相同/不同）均成功，覆盖旧记录，不产生重复行。
+- 返回 `{"seq","received_bytes"}`；`404` 会话不存在 / `409` 会话已完成。
+
+**`POST /api/v1/uploads/:id/complete`**　返回 `{"file_id","name","size","hash"}`。
+- 缺分块 → `409` `{"missing":[...]}`；按 seq 流式算出的整文件哈希与 init 提供的 `hash` 不符 → `422` `{"invalid":[...]}`（坏分块 seq 列表，便于客户端只重传坏块）。
+- 成功后将分块迁入内容库（内容寻址去重）、建 `file_node`、会话置 `completed`、清理临时分块文件。
+
+**`DELETE /api/v1/uploads/:id`**　`204`（无 body）取消会话：置 `aborted`、删除临时分块、删除会话记录；`404` 不存在。
+
+### 断点续传与自愈设计
+
+- **持久化 + 重启可续传**：分块临时落 `<dataDir>/tmp/uploads/<upload_id>/<seq>.part`（先写 `.tmp` 再原子 `rename`）；会话进度存于 `upload_session` / `upload_chunk` 表。服务端重启后，客户端用相同 `hash` 重新 `init` 即可复用原会话。
+- **DB 为真相源 + 自愈**：`GET`/`init` 返回 `uploaded` 时，对每个 DB 分块行**双重校验磁盘 `.part` 是否存在且大小匹配**；不一致则剔除该 DB 行（并回退 `status`），避免脏状态。
+- **会话 GC**：启动时清理 `status ∈ {created,uploading}` 且 `updated_at` 超过 24h 的闲置会话（删临时文件 + 删记录），防止临时目录无限增长。
+- **并发 / 幂等**：不同 `seq` 的 `PUT` 互不影响；同 `seq` 走 `ON CONFLICT(upload_id,seq) DO UPDATE`，重复上传安全幂等。
+
+### 下载 Range 支持
+
+`GET /api/v1/files/:id/content` 支持 `Range: bytes=start-` 与 `bytes=start-end`：命中返回 `206` + `Accept-Ranges: bytes` + `Content-Range: bytes start-end/total`，并按分块 seek 读取**仅请求区间**（内存只约一个分块），不整文件入内存；无 Range 时保持 `200` 全文（沿用 `getChunked`）。
+
+### 跑分块冒烟脚本
+
+```bash
+# 先启动服务端（默认端口 8080）
+./build/cloudvault-server --data-dir=/tmp/cvdata --port=8080
+
+# 再运行（覆盖：init→逐块PUT→complete→下载回读、断点续传、秒传、空文件、Range）
+./testdata/smoke_chunked.sh
+BASE=http://127.0.0.1:9090 ./testdata/smoke_chunked.sh   # 指定端口
+```
+> 注意：Windows 下 git 不保留脚本执行位，请用 `bash testdata/smoke_chunked.sh` 显式运行；脚本仅依赖 `curl`/`sha256sum`/`dd`/`stat`，不依赖 `jq`。
+
+---
+
 ## 5. 今天做 / 没做的边界
 
 **已实现**
@@ -243,15 +304,18 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 - 配置（命令行 > 环境变量 > 配置文件 > 默认值）、结构化日志
 - HTTP/1.1 服务器：POSIX socket + 线程池 + 路径参数路由（每连接单请求后关闭）
 - SHA-256 内容寻址存储：5MB 分块、原子写入（临时文件 + rename）、去重
-- SQLite 元数据：chunk / file_node / file_chunk / file_version 建表，写入走事务
+- SQLite 元数据：chunk / file_node / file_chunk / file_version / upload_session / upload_chunk 建表，写入走事务
+- 整文件上传 / 列表 / 下载（下载支持 `Range: bytes=` → `206`）
+- 分块上传协议 + 断点续传 + 秒传：`init` → `PUT chunk` → `complete` → `DELETE`，含会话复用、DB+磁盘双重校验自愈、闲置会话 GC
+- 端到端冒烟脚本 `testdata/smoke_chunked.sh`（覆盖续传 / 秒传 / 空文件 / Range）
 
 **明确未实现（后续模块）**
 
-- 分块上传协议与断点续传（现在是整文件 body，256MB 上限）
 - 用户、登录、会话、配额
 - 分享链接、回收站、版本回溯（表结构已预留）
 - WebSocket 同步事件推送
 - HTTPS（生产环境应在前面挂 Caddy / Nginx 终止 TLS）
+- 下载的「流式」输出仍在应用层按区间拼装（受 net 层 `resp.body` 模型限制）；超大文件全文下载仍整文件入内存，未来可在 net 层引入分块流式回应
 
 ---
 
@@ -259,7 +323,7 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 
 | 模块 | 内容 | 依赖 |
 |---|---|---|
-| 模块 2 | 分块上传协议：`POST /uploads/init` → `PUT /uploads/:id/chunk/:seq` → `POST /uploads/:id/complete`，支持断点续传与秒传 | 模块 1 |
+| 模块 2 | ~~分块上传协议（已完成）~~ | 模块 1 |
 | 模块 3 | 用户与会话：用户表、密码哈希、登录 Token、踢下线 | 模块 1 |
 | 模块 4 | 目录树（parent_id）、回收站（软删除）、版本回溯 | 模块 3 |
 | 模块 5 | 分享链接（签名 URL + 提取码 + 次数限制） | 模块 4 |

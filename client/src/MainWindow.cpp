@@ -1,17 +1,32 @@
 // 云匣 CloudVault 测试客户端 —— 主窗口实现
 //
-// 与服务端（server/src/app/main.cpp）约定的接口：
-//   GET  /healthz                    健康检查          -> {"status":"ok","version":...,"data_dir":...}
-//   POST /api/v1/files               上传（body 原样） -> 201 {"id","name","size","hash","chunks","instant"}
-//                                    文件名走请求头 X-CV-Name（百分号编码）
-//   GET  /api/v1/files               列表              -> {"total":N,"items":[{id,name,size,hash,chunks,created_at}]}
-//   GET  /api/v1/files/:id           元数据            -> {id,name,size,hash,chunks,created_at}
-//   GET  /api/v1/files/:id/content   下载              -> application/octet-stream
+// 与服务端约定的接口（详见 server/src/app/main.cpp 与团队冻结契约）：
+//   GET  /healthz                          健康检查
+//   POST /api/v1/files                     整文件上传（body 原样），头 X-CV-Name=文件名百分号编码
+//   GET  /api/v1/files                     列表
+//   GET  /api/v1/files/:id                 元数据
+//   GET  /api/v1/files/:id/content         下载；支持 Range: bytes=start- -> 206
+//
+// 分块上传（断点续传，本文件新增）：
+//   POST   /api/v1/uploads/init            {name,size,chunk_size,hash}
+//                                        -> {upload_id,name,size,chunk_size,hash,uploaded:[seq],received_bytes}
+//   GET    /api/v1/uploads/:id             续传前确认会话是否有效（失效则 404）
+//   PUT    /api/v1/uploads/:id/chunk/:seq  body=分块字节，头 X-Chunk-SHA256
+//                                        -> {seq,received_bytes}（幂等）
+//   POST   /api/v1/uploads/:id/complete    -> {file_id,...}；缺块 409{missing}；哈希不符 422{invalid}
+//   DELETE /api/v1/uploads/:id             -> 204，取消会话
 //
 // 说明：列表接口不返回 instant 字段，因此"是否秒传"一列取自本地记录的上传结果，
 //       未经由本客户端上传过的文件显示为 "-"。
 
 #include "MainWindow.h"
+
+#include <QCryptographicHash>
+#include <QDir>
+#include <QJsonArray>
+#include <QProgressBar>
+#include <QStandardPaths>
+#include <QTimer>
 
 #include <QByteArray>
 #include <QDateTime>
@@ -22,7 +37,6 @@
 #include <QFontDatabase>
 #include <QHBoxLayout>
 #include <QHeaderView>
-#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -41,11 +55,23 @@
 
 namespace {
 
-// 日志里单条响应最多展示的字节数，避免 6MB 大文件把日志区刷爆
+// 日志里单条响应最多展示的字节数，避免大文件把日志区刷爆
 constexpr int kMaxBodyInLog = 4096;
 
 // 服务端默认端口
 constexpr int kDefaultPort = 8080;
+
+// 分块大小：5 MiB（与服务端契约一致；整文件哈希也按此切分块表）
+constexpr qint64 kChunkSize = 5 * 1024 * 1024;
+
+// 流式算哈希 / 读块时的缓冲大小（1 MiB），避免整文件入内存
+constexpr qint64 kHashBufferSize = 1024 * 1024;
+
+// 分块上传并发上限（2~4 之间取 3）
+constexpr int kMaxConcurrent = 3;
+
+// 单块失败后的最大重试次数（指数退避 0.5/1/2 秒）
+constexpr int kMaxRetries = 3;
 
 // 预览渲染上限：超过只渲染前 64 KiB
 constexpr qsizetype kMaxPreviewRenderBytes = 64 * 1024;
@@ -69,10 +95,15 @@ QString defaultServerUrl()
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 {
     setWindowTitle(QStringLiteral("云匣 CloudVault 测试客户端"));
-    resize(900, 620);
+    resize(900, 640);
 
     m_nam = new QNetworkAccessManager(this);
     connect(m_nam, &QNetworkAccessManager::finished, this, &MainWindow::onReplyFinished);
+
+    // manifest 目录：AppDataLocation/cloudvault（程序退出也不丢进度）
+    m_manifestDir =
+        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/cloudvault");
+    QDir().mkpath(m_manifestDir);
 
     // 整体布局：顶部工具条 / 中部列表 / 底部日志
     QWidget *center = new QWidget(this);
@@ -95,35 +126,62 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 QWidget *MainWindow::createTopBar()
 {
     QWidget *bar = new QWidget(this);
+    QVBoxLayout *barLayout = new QVBoxLayout(bar);
+    barLayout->setContentsMargins(0, 0, 0, 0);
 
-    QLabel *label = new QLabel(QStringLiteral("服务器地址："), bar);
-    m_serverEdit = new QLineEdit(defaultServerUrl(), bar);
+    // 第一行：服务器地址 + 七个按钮
+    QWidget *row1 = new QWidget(this);
+    QLabel *label = new QLabel(QStringLiteral("服务器地址："), row1);
+    m_serverEdit = new QLineEdit(defaultServerUrl(), row1);
     m_serverEdit->setClearButtonEnabled(true);
-    m_serverEdit->setMinimumWidth(260);
+    m_serverEdit->setMinimumWidth(240);
 
-    m_healthBtn = new QPushButton(QStringLiteral("健康检查"), bar);
-    m_uploadBtn = new QPushButton(QStringLiteral("选择文件并上传"), bar);
-    m_listBtn = new QPushButton(QStringLiteral("列出文件"), bar);
-    m_downloadBtn = new QPushButton(QStringLiteral("下载选中文件"), bar);
-    m_clearLogBtn = new QPushButton(QStringLiteral("清空日志"), bar);
+    m_healthBtn = new QPushButton(QStringLiteral("健康检查"), row1);
+    m_uploadBtn = new QPushButton(QStringLiteral("选择文件并上传"), row1);
+    m_listBtn = new QPushButton(QStringLiteral("列出文件"), row1);
+    m_downloadBtn = new QPushButton(QStringLiteral("下载选中文件"), row1);
+    m_chunkUploadBtn = new QPushButton(QStringLiteral("分块上传（断点续传）"), row1);
+    m_cancelUploadBtn = new QPushButton(QStringLiteral("取消上传"), row1);
+    m_dlResumeBtn = new QPushButton(QStringLiteral("分块下载（断点续传）"), row1);
+    m_clearLogBtn = new QPushButton(QStringLiteral("清空日志"), row1);
 
     connect(m_healthBtn, &QPushButton::clicked, this, &MainWindow::onHealthCheck);
     connect(m_uploadBtn, &QPushButton::clicked, this, &MainWindow::onUpload);
     connect(m_listBtn, &QPushButton::clicked, this, &MainWindow::onListFiles);
     connect(m_downloadBtn, &QPushButton::clicked, this, &MainWindow::onDownload);
+    connect(m_chunkUploadBtn, &QPushButton::clicked, this, &MainWindow::onChunkedUpload);
+    connect(m_cancelUploadBtn, &QPushButton::clicked, this, &MainWindow::onCancelUpload);
+    connect(m_dlResumeBtn, &QPushButton::clicked, this, &MainWindow::onResumableDownload);
     connect(m_clearLogBtn, &QPushButton::clicked, this, &MainWindow::onClearLog);
 
-    QHBoxLayout *layout = new QHBoxLayout(bar);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(label);
-    layout->addWidget(m_serverEdit);
-    layout->addWidget(m_healthBtn);
-    layout->addWidget(m_uploadBtn);
-    layout->addWidget(m_listBtn);
-    layout->addWidget(m_downloadBtn);
-    layout->addWidget(m_clearLogBtn);
-    layout->addStretch(1);
+    QHBoxLayout *layout1 = new QHBoxLayout(row1);
+    layout1->setContentsMargins(0, 0, 0, 0);
+    layout1->addWidget(label);
+    layout1->addWidget(m_serverEdit);
+    layout1->addWidget(m_healthBtn);
+    layout1->addWidget(m_uploadBtn);
+    layout1->addWidget(m_listBtn);
+    layout1->addWidget(m_downloadBtn);
+    layout1->addWidget(m_chunkUploadBtn);
+    layout1->addWidget(m_cancelUploadBtn);
+    layout1->addWidget(m_dlResumeBtn);
+    layout1->addWidget(m_clearLogBtn);
+    layout1->addStretch(1);
 
+    // 第二行：进度条 + 进度文案（分块上传 / 分块下载共用，仅在会话进行中更新）
+    QWidget *row2 = new QWidget(this);
+    m_progressLabel = new QLabel(QStringLiteral("进度：空闲"), row2);
+    m_progressBar = new QProgressBar(row2);
+    m_progressBar->setRange(0, 1);
+    m_progressBar->setValue(0);
+    m_progressBar->setMinimumWidth(200);
+    QHBoxLayout *layout2 = new QHBoxLayout(row2);
+    layout2->setContentsMargins(0, 0, 0, 0);
+    layout2->addWidget(m_progressLabel);
+    layout2->addWidget(m_progressBar, 1);
+
+    barLayout->addWidget(row1);
+    barLayout->addWidget(row2);
     return bar;
 }
 
@@ -282,6 +340,124 @@ void MainWindow::onDownload()
     sendRequest(req, "GET");
 }
 
+void MainWindow::onChunkedUpload()
+{
+    if (m_chunkActive) {
+        QMessageBox::information(this, QStringLiteral("正在上传"),
+                                 QStringLiteral("已有分块上传会话进行中，请先等待完成或点击【取消上传】。"));
+        return;
+    }
+
+    const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("选择要分块上传的文件"));
+    if (path.isEmpty()) {
+        return;   // 用户取消
+    }
+
+    QString err;
+    if (!prepareChunkPlan(path, &err)) {
+        QMessageBox::warning(this, QStringLiteral("无法读取文件"), err);
+        return;
+    }
+
+    // 本地即可算出总分块数（chunk_size 固定为 kChunkSize），保证所有分支（含 GET 会话续传）
+    // 在传块前都已知道 m_totalChunks
+    m_totalChunks = static_cast<int>((m_chunkFileSize + kChunkSize - 1) / kChunkSize);
+
+    // 重置会话（manifest 命中与否在 loadManifest 中决定）
+    m_uploadId = 0;
+    m_doneSeq.clear();
+    m_inflightSeq.clear();
+    m_chunkRetries.clear();
+    m_resumeHit = false;
+    m_completeSent = false;
+    m_cancelRequested = false;
+
+    // 本地 manifest 校验：size / mtime / full_hash 三者全一致才复用，否则从头传
+    const bool resumed = loadManifest(path);
+    if (!resumed) {
+        m_uploadId = 0;
+        m_doneSeq.clear();
+        m_resumeHit = false;
+    }
+
+    m_chunkActive = true;
+    updateCancelButton();
+    updateProgress();
+
+    if (resumed && m_uploadId > 0) {
+        // 先确认 upload_id 是否仍有效（服务端会话被清则 404 -> 重新 init）
+        appendLog(QStringLiteral("续传"), buildUrl(QStringLiteral("/api/v1/uploads")), 0, 0,
+                  QStringLiteral("命中本地 manifest，尝试复用 upload_id=%1，已确认分块 %2 块")
+                      .arg(m_uploadId).arg(m_doneSeq.size()));
+        sendGetSession();
+    } else {
+        sendInit();
+    }
+}
+
+void MainWindow::onCancelUpload()
+{
+    if (!m_chunkActive) {
+        return;
+    }
+    m_cancelRequested = true;
+    appendLog(QStringLiteral("取消"), buildUrl(QStringLiteral("/api/v1/uploads")), 0, 0,
+              QStringLiteral("用户取消，请求服务端丢弃会话 upload_id=%1").arg(m_uploadId));
+
+    // 通知服务端丢弃会话（可选，但契约支持）
+    if (m_uploadId > 0) {
+        QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/uploads/%1").arg(m_uploadId)));
+        QNetworkReply *r = sendRequest(req, "DELETE");
+        r->setProperty("cvStep", QStringLiteral("cancel"));
+    }
+
+    finishChunkSession(false);   // 保留 upload_id 与已传分块，供下次续传
+}
+
+void MainWindow::onResumableDownload()
+{
+    if (m_dlActive) {
+        QMessageBox::information(this, QStringLiteral("正在下载"),
+                                 QStringLiteral("已有分块下载进行中。"));
+        return;
+    }
+
+    const QString id = currentFileId();
+    if (id.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("请先选择文件"),
+                                 QStringLiteral("请在列表中选中一行，再点击【分块下载（断点续传）】。"));
+        return;
+    }
+
+    const QString name = currentFileName();
+    const QString savePath = QFileDialog::getSaveFileName(this, QStringLiteral("保存到"), name);
+    if (savePath.isEmpty()) {
+        return;   // 用户取消
+    }
+
+    const QString partPath = savePath + QStringLiteral(".part");
+    qint64 offset = 0;
+    if (QFile::exists(partPath)) {
+        offset = QFileInfo(partPath).size();   // 已下载字节数 = .part 当前大小
+    }
+
+    m_dlActive = true;
+    m_dlId = id;
+    m_dlFinalPath = savePath;
+    m_dlPartPath = partPath;
+    m_dlTotal = currentFileSize();   // 来自列表，最终以 Content-Range 的 total 为准
+    m_dlOffset = offset;
+
+    QUrl url = buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(id));
+    if (offset > 0) {
+        appendLog(QStringLiteral("下载"), url, 0, 0,
+                  QStringLiteral("续传：已存在 .part（%1），从 offset=%2 继续")
+                      .arg(partPath).arg(offset));
+    }
+
+    sendDownloadRange(offset);
+}
+
 void MainWindow::onClearLog()
 {
     m_log->clear();
@@ -437,6 +613,720 @@ void MainWindow::resetPreview()
 }
 
 // ---------------------------------------------------------------------------
+//  分块上传（断点续传）
+// ---------------------------------------------------------------------------
+
+// 流式读取文件，边读边喂 QCryptographicHash 算整文件 SHA-256，
+// 同时按 chunk_size 切出每个分块的偏移 / 长度表（任何时刻内存里只有 1MiB 缓冲）。
+bool MainWindow::prepareChunkPlan(const QString &path, QString *err)
+{
+    QFileInfo info(path);
+    m_chunkFileSize = info.size();
+    m_chunkMtime = info.lastModified().toMSecsSinceEpoch();
+    m_chunkName = info.fileName();
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (err) {
+            *err = file.errorString();
+        }
+        return false;
+    }
+
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    m_chunks.clear();
+    qint64 chunkStart = 0;   // 当前分块的起始偏移
+    qint64 curLen = 0;       // 当前分块已累积长度
+    qint64 pos = 0;          // 已处理的总字节数
+    const qint64 size = m_chunkFileSize;
+
+    QByteArray buf;
+    buf.resize(static_cast<int>(kHashBufferSize));
+
+    while (pos < size) {
+        const qint64 toRead = qMin(kHashBufferSize, size - pos);
+        const qint64 got = file.read(buf.data(), static_cast<int>(toRead));
+        if (got != toRead || got < 0) {
+            if (err) {
+                *err = QStringLiteral("读取文件失败");
+            }
+            file.close();
+            return false;
+        }
+        hash.addData(QByteArrayView(buf.constData(), static_cast<qsizetype>(got)));
+
+        qsizetype used = 0;
+        while (used < static_cast<qsizetype>(got)) {
+            const qsizetype room = static_cast<qsizetype>(kChunkSize - curLen);
+            const qsizetype take = qMin(room, static_cast<qsizetype>(got) - used);
+            curLen += take;
+            used += take;
+            pos += take;
+            // 分块攒满，或已到文件末尾 -> 收尾一个分块
+            if (curLen >= kChunkSize || pos >= size) {
+                m_chunks.append(ChunkPlan{chunkStart, curLen});
+                chunkStart = pos;
+                curLen = 0;
+            }
+        }
+    }
+
+    file.close();
+    m_chunkFileHash = QString::fromUtf8(hash.result().toHex());
+    return true;
+}
+
+// 读取本地 manifest，仅当 size/mtime/full_hash 与当前文件完全一致才视为命中续传
+bool MainWindow::loadManifest(const QString &path)
+{
+    const QString file = m_manifestDir + QStringLiteral("/upload_manifest.json");
+    QFile f(file);
+    if (!f.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+    f.close();
+    if (!doc.isObject()) {
+        return false;
+    }
+    const QJsonObject entry = doc.object().value(path).toObject();
+    if (entry.isEmpty()) {
+        return false;
+    }
+    const qint64 size = entry.value(QStringLiteral("size")).toVariant().toLongLong();
+    const qint64 mtime = entry.value(QStringLiteral("mtime")).toVariant().toLongLong();
+    const QString hash = entry.value(QStringLiteral("full_hash")).toString();
+    if (size != m_chunkFileSize || mtime != m_chunkMtime || hash != m_chunkFileHash) {
+        return false;   // 源文件已变化，废弃该 manifest（从头传）
+    }
+    m_uploadId = entry.value(QStringLiteral("upload_id")).toVariant().toLongLong();
+    m_doneSeq.clear();
+    for (const QJsonValue &v : entry.value(QStringLiteral("uploaded_seqs")).toArray()) {
+        m_doneSeq.insert(v.toInt());
+    }
+    return true;
+}
+
+// 把当前会话（upload_id + 已确认分块）落盘，保证程序退出也能续传
+void MainWindow::saveManifest()
+{
+    const QString file = m_manifestDir + QStringLiteral("/upload_manifest.json");
+    QDir().mkpath(m_manifestDir);
+
+    QJsonObject root;
+    {
+        QFile f(file);
+        if (f.open(QIODevice::ReadOnly)) {
+            const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+            if (doc.isObject()) {
+                root = doc.object();
+            }
+            f.close();
+        }
+    }
+
+    QJsonObject entry;
+    entry.insert(QStringLiteral("abs_path"), m_chunkPath);
+    entry.insert(QStringLiteral("name"), m_chunkName);
+    entry.insert(QStringLiteral("size"), m_chunkFileSize);
+    entry.insert(QStringLiteral("mtime"), m_chunkMtime);
+    entry.insert(QStringLiteral("full_hash"), m_chunkFileHash);
+    entry.insert(QStringLiteral("upload_id"), m_uploadId);
+    entry.insert(QStringLiteral("chunk_size"), kChunkSize);
+    QJsonArray uploaded;
+    for (int s : m_doneSeq) {
+        uploaded.append(s);
+    }
+    entry.insert(QStringLiteral("uploaded_seqs"), uploaded);
+    root.insert(m_chunkPath, entry);
+
+    QFile f(file);
+    if (f.open(QIODevice::WriteOnly)) {
+        f.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+        f.close();
+    }
+}
+
+// 上传完成后删除该文件的 manifest 记录
+void MainWindow::clearManifest()
+{
+    const QString file = m_manifestDir + QStringLiteral("/upload_manifest.json");
+    QFile f(file);
+    if (!f.open(QIODevice::ReadOnly)) {
+        return;
+    }
+    QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+    f.close();
+    if (root.isEmpty()) {
+        return;
+    }
+    root.remove(m_chunkPath);
+    if (root.isEmpty()) {
+        f.remove();
+        return;
+    }
+    if (f.open(QIODevice::WriteOnly)) {
+        f.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+        f.close();
+    }
+}
+
+void MainWindow::sendGetSession()
+{
+    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/uploads/%1").arg(m_uploadId)));
+    QNetworkReply *r = sendRequest(req, "GET");
+    r->setProperty("cvStep", QStringLiteral("getsession"));
+}
+
+void MainWindow::sendInit()
+{
+    QJsonObject body;
+    body.insert(QStringLiteral("name"), m_chunkName);
+    body.insert(QStringLiteral("size"), m_chunkFileSize);
+    body.insert(QStringLiteral("chunk_size"), kChunkSize);
+    body.insert(QStringLiteral("hash"), m_chunkFileHash);
+    const QByteArray payload = QJsonDocument(body).toJson(QJsonDocument::Compact);
+
+    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/uploads/init")));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    req.setHeader(QNetworkRequest::ContentLengthHeader, payload.size());
+    QNetworkReply *r = sendRequest(req, "POST", payload);
+    r->setProperty("cvStep", QStringLiteral("init"));
+    appendLog(QStringLiteral("init"), req.url(), 0, 0,
+              QStringLiteral("准备分块上传：%1（%2，chunk_size=%3，hash=%4）")
+                  .arg(m_chunkPath, formatSize(m_chunkFileSize),
+                       formatSize(kChunkSize), m_chunkFileHash));
+}
+
+// 合并"服务端已传分块"与"本地 manifest 已传分块"，落盘，然后启动并发上传
+void MainWindow::beginUploading(const QJsonArray &serverUploaded)
+{
+    if (!m_chunkActive) {
+        return;
+    }
+    for (const QJsonValue &v : serverUploaded) {
+        m_doneSeq.insert(v.toInt());
+    }
+    saveManifest();
+    updateProgress();
+
+    if (m_resumeHit && !m_doneSeq.isEmpty()) {
+        appendLog(QStringLiteral("续传"), buildUrl(QStringLiteral("/api/v1/uploads")), 0, 0,
+                  QStringLiteral("已确认分块 %1/%2，将从断点继续（跳过已传分块）")
+                      .arg(m_doneSeq.size()).arg(m_totalChunks));
+    }
+    pumpChunks();
+}
+
+// 在并发上限内补齐缺失分块；全部完成则请求 complete
+void MainWindow::pumpChunks()
+{
+    if (!m_chunkActive) {
+        return;
+    }
+    for (int seq = 0; seq < m_totalChunks; ++seq) {
+        if (m_inflightSeq.contains(seq) || m_doneSeq.contains(seq)) {
+            continue;
+        }
+        if (m_inflightSeq.size() >= kMaxConcurrent) {
+            break;
+        }
+        launchChunk(seq);
+    }
+
+    const bool allDone = (m_totalChunks == 0) ||
+        (m_doneSeq.size() >= m_totalChunks && m_inflightSeq.isEmpty());
+    if (allDone && !m_completeSent) {
+        m_completeSent = true;
+        sendComplete();
+    }
+}
+
+// PUT 单个分块（带 X-Chunk-SHA256），失败按指数退避重试
+void MainWindow::launchChunk(int seq)
+{
+    QByteArray data;
+    QString err;
+    if (!readChunk(seq, &data, &err)) {
+        appendLog(QStringLiteral("chunk"),
+                  buildUrl(QStringLiteral("/api/v1/uploads/%1/chunk/%2").arg(m_uploadId).arg(seq)),
+                  0, 0, QStringLiteral("[读取失败] %1").arg(err));
+        finishChunkSession(false);
+        return;
+    }
+
+    const QString chunkHash = QString::fromUtf8(
+        QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex());
+
+    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/uploads/%1/chunk/%2")
+                                     .arg(m_uploadId).arg(seq)));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/octet-stream"));
+    req.setHeader(QNetworkRequest::ContentLengthHeader, data.size());
+    req.setRawHeader("X-Chunk-SHA256", chunkHash.toUtf8());
+
+    QNetworkReply *r = sendRequest(req, "PUT", data);
+    r->setProperty("cvStep", QStringLiteral("chunk"));
+    r->setProperty("cvSeq", seq);
+    m_inflightSeq.insert(seq);
+}
+
+void MainWindow::sendComplete()
+{
+    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/uploads/%1/complete").arg(m_uploadId)));
+    QNetworkReply *r = sendRequest(req, "POST", QByteArray());
+    r->setProperty("cvStep", QStringLiteral("complete"));
+    appendLog(QStringLiteral("complete"), req.url(), 0, 0,
+              QStringLiteral("所有分块已传完，请求合并（upload_id=%1）").arg(m_uploadId));
+}
+
+// 分块会话响应统一收口（init / getsession / chunk / complete / cancel）
+void MainWindow::handleChunkedReply(const QString &step, int seq, int status, bool networkError,
+                                    const QString &errorString, const QByteArray &raw,
+                                    qint64 dlTotal, qint64 dlStart)
+{
+    if (step == QStringLiteral("dlchunk")) {
+        // 分块下载必须在取消守卫之前分派：下载会话与上传会话互不相干
+        handleDownloadChunkReply(status, networkError, errorString, raw, dlTotal, dlStart);
+        return;
+    }
+    if (m_cancelRequested && step != QStringLiteral("cancel")) {
+        return;   // 取消中的在途请求直接丢弃
+    }
+    if (step == QStringLiteral("getsession")) {
+        handleGetSessionReply(status, raw);
+    } else if (step == QStringLiteral("init")) {
+        handleInitReply(status, raw);
+    } else if (step == QStringLiteral("chunk")) {
+        handleChunkReply(status, errorString, raw, seq);
+    } else if (step == QStringLiteral("complete")) {
+        handleCompleteReply(status, errorString, raw);
+    }
+    // cancel 步骤无需额外处理
+}
+
+void MainWindow::handleGetSessionReply(int status, const QByteArray &raw)
+{
+    if (!m_chunkActive) {
+        return;   // 取消/收尾后到达的过期响应，直接丢弃
+    }
+    if (status == 200) {
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        QJsonArray uploaded;
+        if (doc.isObject()) {
+            uploaded = doc.object().value(QStringLiteral("uploaded")).toArray();
+        }
+        beginUploading(uploaded);
+    } else if (status == 404) {
+        // upload_id 失效：清空本地已传集合，重新 init
+        appendLog(QStringLiteral("续传"), buildUrl(QStringLiteral("/api/v1/uploads")), status, 0,
+                  QStringLiteral("upload_id 失效（404），丢弃本地进度并重新 init"));
+        m_doneSeq.clear();
+        m_resumeHit = false;
+        m_uploadId = 0;
+        sendInit();
+    } else {
+        // 其他错误（含网络错误）：保守起见回到 init 重新建会话
+        appendLog(QStringLiteral("续传"), buildUrl(QStringLiteral("/api/v1/uploads")), status, 0,
+                  QStringLiteral("确认会话失败，改为重新 init"));
+        m_doneSeq.clear();
+        m_resumeHit = false;
+        m_uploadId = 0;
+        sendInit();
+    }
+}
+
+void MainWindow::handleInitReply(int status, const QByteArray &raw)
+{
+    if (!m_chunkActive) {
+        return;   // 取消/收尾后到达的过期 init 响应，直接丢弃（否则会重新拉起上传）
+    }
+    if (status != 200) {
+        appendLog(QStringLiteral("init"), buildUrl(QStringLiteral("/api/v1/uploads/init")), status, 0,
+                  QStringLiteral("init 失败：%1").arg(formatBody(raw)));
+        finishChunkSession(false);
+        return;
+    }
+    const QJsonDocument doc = QJsonDocument::fromJson(raw);
+    if (!doc.isObject()) {
+        finishChunkSession(false);
+        return;
+    }
+    const QJsonObject obj = doc.object();
+
+    // 秒传命中：服务端已有相同内容，无需传分块
+    // （契约字段为 done：server main.cpp init 秒传分支 v.set("done", true)；兼容旧名 instant）
+    if (obj.value(QStringLiteral("done")).toBool()
+        || obj.value(QStringLiteral("instant")).toBool()) {
+        const QString fid = QString::number(obj.value(QStringLiteral("file_id")).toVariant().toLongLong());
+        appendLog(QStringLiteral("秒传"), buildUrl(QStringLiteral("/api/v1/uploads/init")), 200, 0,
+                  QStringLiteral("秒传命中，file_id=%1").arg(fid));
+        clearManifest();
+        finishChunkSession(true);
+        return;
+    }
+
+    m_uploadId = obj.value(QStringLiteral("upload_id")).toVariant().toLongLong();
+    // 分块总数以本地按 chunk_size 切出的分块表为准（服务端 init 不返回 total_chunks）
+    m_totalChunks = m_chunks.size();
+
+    beginUploading(obj.value(QStringLiteral("uploaded")).toArray());
+}
+
+void MainWindow::handleChunkReply(int status, const QString &errorString, const QByteArray &, int seq)
+{
+    if (!m_chunkActive || m_cancelRequested) {
+        return;   // 会话已结束（含取消）或用户已取消：在途响应直接丢弃，不再写进度
+    }
+    m_inflightSeq.remove(seq);
+
+    if (status != 200) {
+        // 失败：指数退避重试（0.5 / 1 / 2 秒，最多 kMaxRetries 次）
+        const int tries = m_chunkRetries.value(seq, 0);
+        if (tries < kMaxRetries) {
+            m_chunkRetries.insert(seq, tries + 1);
+            const int delay = (tries == 0) ? 500 : (tries == 1 ? 1000 : 2000);
+            appendLog(QStringLiteral("chunk"),
+                      buildUrl(QStringLiteral("/api/v1/uploads/%1/chunk/%2").arg(m_uploadId).arg(seq)),
+                      0, 0,
+                      QStringLiteral("分块 seq=%1 失败（%2），第 %3 次重试，%4 ms 后继续")
+                          .arg(seq)
+                          .arg(status > 0 ? QStringLiteral("HTTP %1").arg(status) : errorString)
+                          .arg(tries + 1).arg(delay));
+            QTimer::singleShot(delay, this, [this, seq] {
+                if (m_chunkActive && !m_cancelRequested) {
+                    launchChunk(seq);
+                }
+            });
+            updateProgress();
+            return;
+        }
+        appendLog(QStringLiteral("chunk"),
+                  buildUrl(QStringLiteral("/api/v1/uploads/%1/chunk/%2").arg(m_uploadId).arg(seq)),
+                  0, 0, QStringLiteral("分块 seq=%1 重试耗尽，上传失败").arg(seq));
+        finishChunkSession(false);   // 保留 upload_id 与已传分块，供续传
+        return;
+    }
+
+    // 成功：记下已传分块并立即落盘（每收到一个 ACK 都持久化）
+    m_doneSeq.insert(seq);
+    m_chunkRetries.remove(seq);
+    saveManifest();
+    updateProgress();
+    pumpChunks();
+}
+
+void MainWindow::handleCompleteReply(int status, const QString &errorString, const QByteArray &raw)
+{
+    Q_UNUSED(errorString);
+    if (!m_chunkActive || m_cancelRequested) {
+        return;   // 会话已结束（含取消）或用户已取消：在途响应直接丢弃，不再写进度
+    }
+    if (status == 200) {
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (doc.isObject()) {
+            const QJsonObject obj = doc.object();
+            const QString fid = QString::number(obj.value(QStringLiteral("file_id")).toVariant().toLongLong());
+            const QString name = obj.value(QStringLiteral("name")).toString();
+            const qint64 size = obj.value(QStringLiteral("size")).toVariant().toLongLong();
+            const QString hash = obj.value(QStringLiteral("hash")).toString();
+            const qint64 createdAt = QDateTime::currentMSecsSinceEpoch();
+            addRow(fid, name.isEmpty() ? m_chunkName : name, size, hash,
+                   QStringLiteral("否"), createdAt);
+            appendLog(QStringLiteral("complete"),
+                      buildUrl(QStringLiteral("/api/v1/uploads/%1/complete").arg(m_uploadId)), 200, 0,
+                      QStringLiteral("分块上传完成：file_id=%1，大小=%2，hash=%3")
+                          .arg(fid).arg(formatSize(size)).arg(hash));
+        }
+        clearManifest();
+        finishChunkSession(true);
+        return;
+    }
+
+    if (status == 409) {
+        // 缺分块：解析 missing，移除对应已传标记后补传
+        QJsonArray missing;
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (doc.isObject()) {
+            missing = doc.object().value(QStringLiteral("missing")).toArray();
+        }
+        QStringList missTxt;
+        for (const QJsonValue &v : missing) {
+            const int s = v.toInt();
+            if (s >= 0 && s < m_totalChunks) {
+                m_doneSeq.remove(s);
+                m_chunkRetries.remove(s);
+                missTxt.append(QString::number(s));
+            }
+        }
+        appendLog(QStringLiteral("complete"),
+                  buildUrl(QStringLiteral("/api/v1/uploads/%1/complete").arg(m_uploadId)), status, 0,
+                  QStringLiteral("缺失分块 %1，正在补传").arg(missTxt.join(QLatin1Char(','))));
+        m_completeSent = false;
+        pumpChunks();
+        return;
+    }
+
+    if (status == 422) {
+        // 哈希不符：invalid 精确列出坏分块；为空表示各分块单检都通过、仅整文件哈希不符
+        // （通常是本地声明的 hash 有误）——重传无济于事，直接失败并保留会话供排查
+        QJsonArray invalid;
+        QString reason;
+        const QJsonDocument doc = QJsonDocument::fromJson(raw);
+        if (doc.isObject()) {
+            const QJsonObject obj = doc.object();
+            invalid = obj.value(QStringLiteral("invalid")).toArray();
+            reason = obj.value(QStringLiteral("reason")).toString();
+        }
+        if (invalid.isEmpty()) {
+            appendLog(QStringLiteral("complete"),
+                      buildUrl(QStringLiteral("/api/v1/uploads/%1/complete").arg(m_uploadId)),
+                      status, 0,
+                      QStringLiteral("整文件哈希不符且无坏分块（invalid 为空%1），终止重传，保留会话")
+                          .arg(reason.isEmpty()
+                                   ? QString()
+                                   : QStringLiteral("：%1").arg(reason)));
+            finishChunkSession(false);
+            return;
+        }
+        QStringList badTxt;
+        for (const QJsonValue &v : invalid) {
+            const int s = v.toInt();
+            if (s >= 0 && s < m_totalChunks) {
+                m_doneSeq.remove(s);
+                m_chunkRetries.remove(s);
+                badTxt.append(QString::number(s));
+            }
+        }
+        appendLog(QStringLiteral("complete"),
+                  buildUrl(QStringLiteral("/api/v1/uploads/%1/complete").arg(m_uploadId)), status, 0,
+                  QStringLiteral("坏分块 %1，正在重传").arg(badTxt.join(QLatin1Char(','))));
+        m_completeSent = false;
+        pumpChunks();
+        return;
+    }
+
+    // 其他错误：保留进度供续传
+    appendLog(QStringLiteral("complete"),
+              buildUrl(QStringLiteral("/api/v1/uploads/%1/complete").arg(m_uploadId)), status, 0,
+              QStringLiteral("合并失败：%1").arg(formatBody(raw)));
+    finishChunkSession(false);
+}
+
+bool MainWindow::readChunk(int seq, QByteArray *out, QString *err) const
+{
+    if (seq < 0 || seq >= m_chunks.size()) {
+        if (err) {
+            *err = QStringLiteral("分块序号越界");
+        }
+        return false;
+    }
+    const ChunkPlan &p = m_chunks.at(seq);
+    QFile file(m_chunkPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (err) {
+            *err = file.errorString();
+        }
+        return false;
+    }
+    if (!file.seek(p.offset)) {
+        if (err) {
+            *err = QStringLiteral("seek 失败");
+        }
+        file.close();
+        return false;
+    }
+    const QByteArray data = file.read(p.length);
+    file.close();
+    if (data.size() != p.length) {
+        if (err) {
+            *err = QStringLiteral("读取字节数不足");
+        }
+        return false;
+    }
+    *out = data;
+    return true;
+}
+
+int MainWindow::uploadedCount() const
+{
+    int n = 0;
+    for (int seq = 0; seq < m_totalChunks; ++seq) {
+        if (m_doneSeq.contains(seq)) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+void MainWindow::updateProgress()
+{
+    const int total = m_totalChunks;
+    const int done = m_chunkActive ? uploadedCount() : 0;
+    m_progressBar->setRange(0, total > 0 ? total : 1);
+    m_progressBar->setValue(total > 0 ? qMin(done, total) : 0);
+    if (m_chunkActive) {
+        const int pct = total > 0 ? static_cast<int>(done * 100LL / total) : 0;
+        m_progressLabel->setText(
+            QStringLiteral("分块上传进度：%1 / %2 块（%3%%4）  upload_id=%5%6")
+                .arg(done).arg(total).arg(pct).arg(QLatin1Char('%')).arg(m_uploadId)
+                .arg(m_resumeHit ? QStringLiteral("（命中续传）") : QString()));
+    } else {
+        // 分块下载时进度文案由 handleDownloadChunkReply 直接更新 m_progressLabel
+        m_progressLabel->setText(m_dlActive ? m_progressLabel->text()
+                                            : QStringLiteral("进度：空闲"));
+    }
+}
+
+void MainWindow::updateCancelButton()
+{
+    m_cancelUploadBtn->setEnabled(m_chunkActive);
+}
+
+void MainWindow::finishChunkSession(bool ok)
+{
+    m_chunkActive = false;
+    m_inflightSeq.clear();
+    m_cancelRequested = false;
+    updateCancelButton();
+    updateProgress();
+
+    appendLog(QStringLiteral("结束"), buildUrl(QStringLiteral("/api/v1/uploads")), 0, 0,
+              ok ? QStringLiteral("分块上传成功，会话已清理")
+                 : QStringLiteral("分块上传中断，保留 upload_id=%1（重选同一文件可从断点续传）")
+                       .arg(m_uploadId));
+
+    if (ok) {
+        // 成功：清空会话状态
+        m_uploadId = 0;
+        m_doneSeq.clear();
+        m_chunks.clear();
+        m_chunkPath.clear();
+        m_resumeHit = false;
+        m_completeSent = false;
+        m_chunkRetries.clear();
+        m_totalChunks = 0;
+    }
+    // 失败（ok=false）：保留 m_uploadId / m_chunkPath / m_doneSeq，供下次续传
+}
+
+// ---------------------------------------------------------------------------
+//  分块下载（断点续传）
+// ---------------------------------------------------------------------------
+void MainWindow::sendDownloadRange(qint64 offset)
+{
+    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(m_dlId)));
+    if (offset > 0) {
+        req.setRawHeader("Range", QStringLiteral("bytes=%1-").arg(offset).toUtf8());
+    }
+    QNetworkReply *r = sendRequest(req, "GET");
+    r->setProperty("cvStep", QStringLiteral("dlchunk"));
+}
+
+void MainWindow::handleDownloadChunkReply(int status, bool networkError, const QString &errorString,
+                                          const QByteArray &raw, qint64 dlTotal, qint64 dlStart)
+{
+    if (!m_dlActive) {
+        return;   // 已被取消 / 结束
+    }
+    if (networkError || (status != 200 && status != 206)) {
+        appendLog(QStringLiteral("下载"),
+                  buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(m_dlId)), status, 0,
+                  QStringLiteral("[下载失败] %1（HTTP %2）")
+                      .arg(status > 0 ? formatBody(raw) : errorString).arg(status));
+        finishDownload(false);
+        return;
+    }
+
+    if (status == 200) {
+        // 服务端不支持 Range，返回整文件：直接写最终路径
+        QFile out(m_dlFinalPath);
+        if (!out.open(QIODevice::WriteOnly)) {
+            appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_dlFinalPath), 0, 0,
+                      QStringLiteral("[落盘失败] %1").arg(out.errorString()));
+            finishDownload(false);
+            return;
+        }
+        out.write(raw);
+        out.close();
+        QFile::remove(m_dlPartPath);
+        appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_dlFinalPath), 200, 0,
+                  QStringLiteral("服务端不支持 Range，整文件写入 %1（%2）")
+                      .arg(m_dlFinalPath).arg(formatSize(raw.size())));
+        finishDownload(true);
+        return;
+    }
+
+    // 206：先校验服务端返回起点与本地断点 offset 一致，再追加写入 .part
+    if (dlStart >= 0 && dlStart != m_dlOffset) {
+        appendLog(QStringLiteral("下载"),
+                  buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(m_dlId)), status, 0,
+                  QStringLiteral("[下载失败] 服务端返回起点 %1 与本地断点 %2 不一致，"
+                                 "终止以免写坏 .part")
+                      .arg(dlStart).arg(m_dlOffset));
+        finishDownload(false);
+        return;
+    }
+    if (dlTotal > 0) {
+        m_dlTotal = dlTotal;   // 以 Content-Range 的 total 为准
+    }
+    QFile part(m_dlPartPath);
+    if (!part.open(QIODevice::WriteOnly)) {
+        appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_dlPartPath), 0, 0,
+                  QStringLiteral("[落盘失败] %1").arg(part.errorString()));
+        finishDownload(false);
+        return;
+    }
+    if (!part.seek(m_dlOffset)) {
+        appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_dlPartPath), 0, 0,
+                  QStringLiteral("[seek 失败] %1").arg(part.errorString()));
+        finishDownload(false);
+        return;
+    }
+    part.write(raw);
+    part.close();
+    m_dlOffset += raw.size();
+
+    const int pct = m_dlTotal > 0 ? static_cast<int>(m_dlOffset * 100LL / m_dlTotal) : 0;
+    m_progressBar->setRange(0, m_dlTotal > 0 ? static_cast<int>(m_dlTotal) : 1);
+    m_progressBar->setValue(static_cast<int>(m_dlOffset));
+    m_progressLabel->setText(QStringLiteral("分块下载进度：%1 / %2（%3%%4）")
+                                 .arg(formatSize(m_dlOffset)).arg(formatSize(m_dlTotal))
+                                 .arg(pct).arg(QLatin1Char('%')));
+
+    if (m_dlTotal > 0 && m_dlOffset >= m_dlTotal) {
+        finalizeDownload();
+    } else {
+        sendDownloadRange(m_dlOffset);   // 继续下一段
+    }
+}
+
+// 校验大小，把 .part 重命名为正式文件
+void MainWindow::finalizeDownload()
+{
+    QFileInfo fi(m_dlPartPath);
+    if (m_dlTotal > 0 && fi.size() != m_dlTotal) {
+        appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_dlPartPath), 0, 0,
+                  QStringLiteral("[大小不符] .part=%1，期望=%2").arg(formatSize(fi.size()))
+                      .arg(formatSize(m_dlTotal)));
+    }
+    if (QFile::exists(m_dlFinalPath)) {
+        QFile::remove(m_dlFinalPath);
+    }
+    QFile::rename(m_dlPartPath, m_dlFinalPath);
+    appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_dlFinalPath), 200, 0,
+              QStringLiteral("已保存 id=%1 到 %2（%3）")
+                  .arg(m_dlId, m_dlFinalPath, formatSize(m_dlOffset)));
+    finishDownload(true);
+}
+
+void MainWindow::finishDownload(bool ok)
+{
+    Q_UNUSED(ok);
+    m_dlActive = false;
+    updateProgress();
+}
+
+// ---------------------------------------------------------------------------
 //  网络
 // ---------------------------------------------------------------------------
 QUrl MainWindow::buildUrl(const QString &path) const
@@ -455,9 +1345,19 @@ QUrl MainWindow::buildUrl(const QString &path) const
 QNetworkReply *MainWindow::sendRequest(const QNetworkRequest &request, const QByteArray &verb,
                                        const QByteArray &body)
 {
-    QNetworkReply *reply = (verb == "GET") ? m_nam->get(request) : m_nam->post(request, body);
+    QNetworkReply *reply = nullptr;
+    if (verb == "GET") {
+        reply = m_nam->get(request);
+    } else if (verb == "PUT") {
+        reply = m_nam->put(request, body);
+    } else if (verb == "DELETE") {
+        reply = m_nam->deleteResource(request);
+    } else {
+        reply = m_nam->post(request, body);
+    }
+    // 记下实际动词，供日志显示（原有的 operation() 只能区分 GET / 非 GET）
+    reply->setProperty("cvVerb", QString::fromUtf8(verb));
 
-    // 记录起始时间，用于统计耗时
     QElapsedTimer timer;
     timer.start();
     m_timers.insert(reply, timer);
@@ -484,10 +1384,49 @@ void MainWindow::handleReply(QNetworkReply *reply, const QByteArray &raw)
 {
     const qint64 elapsed = m_timers.contains(reply) ? m_timers.take(reply).elapsed() : -1;
     const QUrl url = reply->request().url();
-    const QString method =
-        (reply->operation() == QNetworkAccessManager::GetOperation) ? QStringLiteral("GET")
-                                                                    : QStringLiteral("POST");
+    // 实际动词优先取 cvVerb（GET/PUT/DELETE/POST），否则按 operation() 兜底
+    const QString method = reply->property("cvVerb").isValid()
+        ? reply->property("cvVerb").toString()
+        : ((reply->operation() == QNetworkAccessManager::GetOperation) ? QStringLiteral("GET")
+                                                                      : QStringLiteral("POST"));
     const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
+    // 分块上传 / 分块下载的请求统一走这里收口（它们各自带 cvStep 标记）
+    const QString step = reply->property("cvStep").toString();
+    if (!step.isEmpty()) {
+        const bool canceled = (reply->error() == QNetworkReply::OperationCanceledError);
+        if (!canceled) {
+            appendLog(method, url, status, elapsed,
+                      (reply->error() != QNetworkReply::NoError)
+                          ? QStringLiteral("[网络错误] %1").arg(reply->errorString())
+                          : formatBody(raw));
+        }
+        if (canceled) {
+            return;
+        }
+        // 下载响应需要从 Content-Range 解析起点与 total（形如 "bytes 123-456/789"）
+        qint64 dlTotal = 0;
+        qint64 dlStart = -1;   // -1 = 无 Content-Range（200 整文件响应）
+        const QByteArray crh = reply->rawHeader("Content-Range");
+        if (!crh.isEmpty()) {
+            QByteArray spec = crh;
+            if (spec.startsWith("bytes ")) {
+                spec = spec.mid(6);
+            }
+            const int dash = spec.indexOf('-');
+            const int slash = spec.lastIndexOf('/');
+            if (dash > 0) {
+                dlStart = spec.left(dash).trimmed().toLongLong();
+            }
+            if (slash > dash) {
+                dlTotal = spec.mid(slash + 1).toLongLong();
+            }
+        }
+        const int seq = reply->property("cvSeq").toInt();
+        handleChunkedReply(step, seq, status, reply->error() != QNetworkReply::NoError,
+                           reply->errorString(), raw, dlTotal, dlStart);
+        return;
+    }
 
     // 预览请求单独收口：它与下载同 URL，靠动态属性区分，避免被当成下载落盘
     if (reply->property("cvPreview").toBool()) {
@@ -622,11 +1561,14 @@ void MainWindow::setBusy(bool busy)
     m_uploadBtn->setEnabled(!busy);
     m_listBtn->setEnabled(!busy);
     m_downloadBtn->setEnabled(!busy);
+    m_chunkUploadBtn->setEnabled(!busy);
+    m_dlResumeBtn->setEnabled(!busy);
     if (busy) {
         setCursor(Qt::BusyCursor);
     } else {
         unsetCursor();
     }
+    updateCancelButton();   // 会话中保持【取消上传】可用
 }
 
 void MainWindow::appendLog(const QString &method, const QUrl &url, int status, qint64 elapsedMs,
@@ -719,8 +1661,7 @@ QString MainWindow::formatTime(qint64 epoch)
     if (epoch <= 0) {
         return QStringLiteral("-");
     }
-    // 服务端 created_at 写的是 Unix 纪元毫秒（server/src/meta/file_repository.cpp 的
-    // nowMillis），这里统一归一化成秒：超过 1e11（约公元 5138 年）即可认定是毫秒量级
+    // 服务端 created_at 写的是 Unix 纪元毫秒，这里统一归一化成秒：超过 1e11 即可认定是毫秒量级
     if (epoch > 100000000000LL) {
         epoch /= 1000;
     }

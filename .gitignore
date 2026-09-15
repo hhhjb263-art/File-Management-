@@ -83,3 +83,7 @@ CMakeLists.txt.user*
 
 # WorkBuddy local project memory (do not commit)
 .workbuddy/
+
+# 对话归档/流水线产物（非项目代码，不提交）
+/output/
+/*.docx

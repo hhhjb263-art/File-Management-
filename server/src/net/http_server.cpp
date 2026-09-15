@@ -32,10 +32,14 @@ std::string statusText(int code) {
     case 200: return "OK";
     case 201: return "Created";
     case 204: return "No Content";
+    case 206: return "Partial Content";
     case 400: return "Bad Request";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 409: return "Conflict";
     case 413: return "Payload Too Large";
+    case 416: return "Range Not Satisfiable";
+    case 422: return "Unprocessable Entity";
     case 500: return "Internal Server Error";
     default: return "Unknown";
   }
@@ -236,8 +240,11 @@ void HttpServer::handleClient(int fd) {
   std::ostringstream head;
   head << "HTTP/1.1 " << resp.status << ' ' << statusText(resp.status) << "\r\n"
        << "Content-Type: " << resp.contentType << "\r\n"
-       << "Content-Length: " << resp.body.size() << "\r\n"
-       << "Connection: close\r\n\r\n";
+       << "Content-Length: " << resp.body.size() << "\r\n";
+  for (const auto& kv : resp.extraHeaders) {
+    head << kv.first << ": " << kv.second << "\r\n";
+  }
+  head << "Connection: close\r\n\r\n";
   std::string headStr = head.str();
   writeAll(fd, headStr.data(), headStr.size());
   if (!resp.body.empty()) writeAll(fd, resp.body.data(), resp.body.size());
