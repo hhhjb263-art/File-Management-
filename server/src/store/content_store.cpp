@@ -334,4 +334,37 @@ bool ContentStore::materializeFromChunks(const std::vector<std::string>& chunkHa
   return true;
 }
 
+bool ContentStore::putFromFile(const std::string& hex, const std::string& srcPath,
+                               std::string& err) {
+  if (!validHash(hex)) {
+    err = "invalid hash";
+    return false;
+  }
+  if (exists(hex)) {
+    return true;   // 内容已去重命中：源文件由调用方清理
+  }
+  std::error_code ec;
+  fs::path dst = fs::path(pathOf(hex));
+  fs::create_directories(dst.parent_path(), ec);
+  if (ec) {
+    err = "create blob dir failed: " + ec.message();
+    return false;
+  }
+  // 同盘 rename = 零拷贝搬移（tmp → blobs），避免 tmp 与 blob 双份占盘
+  ec.clear();
+  fs::rename(fs::path(srcPath), dst, ec);
+  if (!ec) {
+    return true;
+  }
+  // 跨设备等场景：复制后删源
+  std::error_code cec;
+  fs::copy_file(fs::path(srcPath), dst, fs::copy_options::overwrite_existing, cec);
+  if (cec) {
+    err = "move/copy failed: " + cec.message();
+    return false;
+  }
+  fs::remove(fs::path(srcPath), cec);
+  return true;
+}
+
 }  // namespace cv

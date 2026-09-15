@@ -298,10 +298,17 @@ std::int64_t diskFreeBytes(const std::string& path) {
   return static_cast<std::int64_t>(sp.available);
 }
 
-// 上传前空间预检：上传期间「临时分块」与「内容库」并存，峰值约 2 倍文件大小，
-// 再加一点余量。空间不足 → 507，并给出 need/free 让客户端明确告警。
-constexpr std::int64_t kSpaceSafetyFactor = 2;
+// 上传前空间预检：分块上传的 complete 会把 tmp 分块「同盘 rename 搬进」内容库
+// （ContentStore::putFromFile），不再产生 tmp+blob 双份；因此实际需要 ≈ 1 倍文件大小
+// （另加镜像树 1 倍，若空间不够会跳过镜像）。空间不足 → 507，并给出 need/free。
+constexpr std::int64_t kSpaceSafetyFactor = 1;
 constexpr std::int64_t kSpaceMarginBytes = 64LL * 1024 * 1024;
+
+// 剩余空间是否不足以镜像一份 size 字节的文件（不足则跳过镜像，避免把盘写满）
+bool freeSpaceBelow(const cv::Config& cfg, std::int64_t size) {
+  const std::int64_t freeBytes = diskFreeBytes(cfg.dataDir);
+  return freeBytes >= 0 && freeBytes < size + kSpaceMarginBytes;
+}
 
 bool checkSpaceForUpload(const cv::Config& cfg, std::int64_t size,
                          cv::net::Response& resp) {
@@ -1126,9 +1133,6 @@ int main(int argc, char** argv) {
                    resp.setError(400, "invalid size");
                    return;
                  }
-                 if (!checkSpaceForUpload(cfg, size, resp)) {
-                   return;
-                 }
                  if (size > kMaxChunkedBytes) {
                    json::Value v = json::Value::object();
                    v.set("error", "total size exceeds server chunked-upload limit");
@@ -1225,6 +1229,10 @@ int main(int argc, char** argv) {
                    }
                  }
 
+                 // 新建会话前才做空间预检（秒传命中 / 断点复用都不额外占盘）
+                 if (!checkSpaceForUpload(cfg, size, resp)) {
+                   return;
+                 }
                  // 新建会话
                  std::int64_t newId = 0;
                  if (!up.create(name, size, chunkSize, fileHash, newId, perr)) {
@@ -1414,17 +1422,30 @@ int main(int argc, char** argv) {
                  std::vector<std::string> chunkHashes;
                  std::vector<std::size_t> chunkSizes;
                  for (std::int64_t seq : uploaded) {
-                   std::string p = partPath(cfg, id, seq);
-                   std::string data;
-                   if (!readWholeFile(p, data, perr)) {
-                     resp.setError(500, std::string("read chunk failed: ") + perr);
-                     return;
-                   }
                    UploadChunkRow cr;
                    bool found = false;
                    up.findChunk(id, seq, cr, found, perr);
-                   std::string chash =
-                       (found && !cr.sha256.empty()) ? cr.sha256 : Sha256::of(data);
+                   const std::string part = partPath(cfg, id, seq);
+                   if (found && !cr.sha256.empty()) {
+                     // 正常路径：分块已在上一步校验过，这里直接「搬移」进内容库
+                     // （同盘 rename → 零拷贝，不再 tmp+blob 双份占盘）
+                     std::error_code sec;
+                     const auto fsize = fs::file_size(part, sec);
+                     if (!store.putFromFile(cr.sha256, part, perr)) {
+                       resp.setError(500, std::string("store failed: ") + perr);
+                       return;
+                     }
+                     chunkHashes.push_back(cr.sha256);
+                     chunkSizes.push_back(sec ? 0 : static_cast<std::size_t>(fsize));
+                     continue;
+                   }
+                   // 异常兜底（库中无分块记录）：读出内容算哈希后入库
+                   std::string data;
+                   if (!readWholeFile(part, data, perr)) {
+                     resp.setError(500, std::string("read chunk failed: ") + perr);
+                     return;
+                   }
+                   const std::string chash = Sha256::of(data);
                    if (!store.put(chash, data, perr)) {
                      resp.setError(500, std::string("store failed: ") + perr);
                      return;
@@ -1455,10 +1476,13 @@ int main(int argc, char** argv) {
                    resp.setError(500, std::string("db failed: ") + perr);
                    return;
                  }
-                 // 物理镜像树（尽力而为；失败仅告警，内容仍以 blob + DB 为权威）
+                 // 物理镜像树（尽力而为；空间不足则跳过，失败仅告警，内容仍以 blob + DB 为权威）
                  std::string mirrorErr;
-                 if (!store.materializeFromChunks(chunkHashes, diskFilePath(cfg, dir, s.name),
-                                                  mirrorErr)) {
+                 if (freeSpaceBelow(cfg, static_cast<std::int64_t>(s.size))) {
+                   CV_LOG_WARN("跳过镜像（空间不足）file_id=" << fileId);
+                 } else if (!store.materializeFromChunks(chunkHashes,
+                                                        diskFilePath(cfg, dir, s.name),
+                                                        mirrorErr)) {
                    CV_LOG_WARN("镜像文件树失败 file_id=" << fileId << ": " << mirrorErr);
                  }
                  up.setStatus(id, "completed", perr);

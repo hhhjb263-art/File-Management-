@@ -51,6 +51,11 @@ class ContentStore {
   bool materializeFromChunks(const std::vector<std::string>& chunkHashes,
                             const std::string& targetAbs, std::string& err);
 
+  // 把已有文件「搬移」进内容库（同盘 rename，零拷贝；跨设备退回复制后删源）。
+  // 用于分块上传 complete：避免 tmp 分块与 blob 同时占盘（峰值从 2× 降到 1×）。
+  // 目标 blob 已存在（内容已去重）时直接返回 true，源文件由调用方清理。
+  bool putFromFile(const std::string& hex, const std::string& srcPath, std::string& err);
+
   // 分块拼接镜像：把各分块 blob 依次流式写入 targetAbs（先写 .tmp 再原子 rename）。
   // 用于分块上传的文件——内容库里只有分块 blob，不存在整文件 blob，
   // 故不能用 materialize(整文件哈希)。内存峰值 ≈ 1 个分块。

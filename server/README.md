@@ -317,9 +317,11 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 
 ### 存储空间预检（v0.8）
 
-- 上传前按 **2 倍文件大小 + 64 MiB 余量**（临时分块与内容库并存）预检 `dataDir` 剩余空间，
+- 上传前按 **1 倍文件大小 + 64 MiB 余量**预检 `dataDir` 剩余空间 —— `complete` 会把 tmp 分块
+  **同盘 rename 搬进**内容库（`ContentStore::putFromFile`，零拷贝），因此**不再产生 tmp+blob 双份**；
   不足 → **`507 Insufficient Storage`** `{"error":"insufficient disk space on server","need_bytes","free_bytes","data_dir"}`
-  （整文件上传与分块 `init` 都会拦）。
+  （整文件上传与分块 `init` 都会拦，且**秒传命中 / 断点复用不做空间预检**——它们不额外占盘）。
+- 镜像文件树写入前再查一次空间：不够则**跳过镜像**并 WARN（blob + DB 仍是权威，下载/预览不受影响）。
 - `/healthz` 现在回显 `disk_free_bytes` / `disk_total_bytes`；`GET /api/v1/storage` 专门查询。
 - 启动日志会打印剩余空间，低于 512 MiB 时给 WARN。
 
