@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sys/types.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -49,11 +51,18 @@ using Handler = std::function<void(const Request&, Response&)>;
 
 // POSIX socket + 固定线程池的 HTTP/1.1 服务器。
 // 当前实现：每连接单请求后关闭（Connection: close），足够 MVP 且不易出错。
+// 支持双监听：HTTP（listen）与 HTTPS（listenTls，需编译期启用 OpenSSL）可同时运行，
+// 共享同一套路由。
 class HttpServer {
  public:
   ~HttpServer();
 
   bool listen(const std::string& addr, int port, int workers, std::string& err);
+
+  // 启用 HTTPS 监听（需先/后调用 listen 皆可；证书为 PEM 格式）。
+  // 未编译 TLS 支持（CV_HAVE_OPENSSL 未定义）时返回 false 并在 err 说明。
+  bool listenTls(const std::string& addr, int port, const std::string& certPath,
+                 const std::string& keyPath, int workers, std::string& err);
 
   // 支持路径参数，如 route("GET", "/api/v1/files/:id", handler)
   void route(const std::string& method, const std::string& pattern, Handler h);
@@ -70,23 +79,37 @@ class HttpServer {
     Handler handler;
   };
 
-  void acceptLoop();
+  // 连接描述符 + 可选 TLS 会话（OpenSSL SSL*，以 void* 携带避免头文件污染；
+  // 仅在 http_server.cpp 内部经 CV_HAVE_OPENSSL 守卫使用）
+  struct Conn {
+    int fd = -1;
+    void* ssl = nullptr;
+  };
+
+  void acceptLoop(int listenFd, bool isTls);
   void workerLoop();
-  void handleClient(int fd);
-  bool readRequest(int fd, std::string& raw, std::string& err);
+  void handleClient(const Conn& conn);
+  bool readRequest(const Conn& conn, std::string& raw, std::string& err);
   bool parseRequest(const std::string& raw, Request& req, std::string& err);
   bool dispatch(const Request& req, Response& resp);
-  bool writeAll(int fd, const char* data, std::size_t len);
+  bool writeAll(const Conn& conn, const char* data, std::size_t len);
+  // 连接 IO 原语：conn.ssl 非空走 SSL_read/SSL_write，否则原生 recv/send
+  bool connRead(const Conn& conn, char* buf, std::size_t cap, ssize_t& n, std::string& err);
+  bool connWrite(const Conn& conn, const char* data, std::size_t len, ssize_t& n);
+  void closeConn(const Conn& conn);
 
   int listenFd_ = -1;
+  int listenFdTls_ = -1;        // HTTPS 监听（未启用为 -1）
   int workers_ = 1;
   std::vector<Route> routes_;
 
   std::mutex queueMutex_;
   std::condition_variable queueCv_;
-  std::deque<int> queue_;
+  std::deque<Conn> queue_;
   std::vector<std::thread> threads_;
   std::atomic<bool> running_{false};
+
+  void* sslCtx_ = nullptr;      // OpenSSL SSL_CTX*（TLS 关闭时为空）
 };
 
 }  // namespace net

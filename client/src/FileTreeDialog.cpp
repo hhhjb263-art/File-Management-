@@ -49,9 +49,10 @@ QTreeWidgetItem *findChildDir(QTreeWidgetItem *parent, const QString &path)
 }   // namespace
 
 FileTreeDialog::FileTreeDialog(const QUrl &dirsUrl, const QUrl &filesUrl, Mode mode,
-                               const QString &initialPath, bool allowCreateDir, QWidget *parent)
+                               const QString &initialPath, bool allowCreateDir, QWidget *parent,
+                               bool trustTls)
     : QDialog(parent), m_dirsUrl(dirsUrl), m_filesUrl(filesUrl), m_mode(mode),
-      m_initialPath(initialPath), m_allowCreateDir(allowCreateDir)
+      m_initialPath(initialPath), m_allowCreateDir(allowCreateDir), m_trustTls(trustTls)
 {
     setWindowTitle(m_allowCreateDir
                        ? QStringLiteral("选择上传位置（可在其中新建文件夹）")
@@ -250,6 +251,9 @@ void FileTreeDialog::loadData()
     {
         QNetworkRequest req(m_dirsUrl);
         QNetworkReply *r = m_nam->get(req);
+        connect(r, &QNetworkReply::sslErrors, this, [this, r]() {
+            if (m_trustTls) r->ignoreSslErrors();   // 自签名证书（HTTPS 场景）
+        });
         ++m_pending;
         connect(r, &QNetworkReply::finished, this, [this, r]() {
             const int st = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -264,6 +268,9 @@ void FileTreeDialog::loadData()
     {
         QNetworkRequest req(m_filesUrl);
         QNetworkReply *r = m_nam->get(req);
+        connect(r, &QNetworkReply::sslErrors, this, [this, r]() {
+            if (m_trustTls) r->ignoreSslErrors();   // 自签名证书（HTTPS 场景）
+        });
         ++m_pending;
         connect(r, &QNetworkReply::finished, this, [this, r]() {
             const int st = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();

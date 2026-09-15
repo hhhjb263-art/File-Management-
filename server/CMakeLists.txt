@@ -135,6 +135,22 @@ add_library(cv_net STATIC
 )
 target_include_directories(cv_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(cv_net PUBLIC cv_core Threads::Threads)
+
+# TLS（HTTPS）支持：默认开启，系统装有 OpenSSL（libssl-dev）即自动启用；
+# 找不到 OpenSSL 时优雅降级为纯 HTTP，仅打 WARN，不致构建失败。
+option(CV_ENABLE_TLS "Enable HTTPS support via OpenSSL" ON)
+if(CV_ENABLE_TLS)
+  find_package(OpenSSL QUIET)
+  if(OpenSSL_FOUND)
+    target_compile_definitions(cv_net PUBLIC CV_HAVE_OPENSSL)
+    target_link_libraries(cv_net PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    message(STATUS "CloudVault: TLS support enabled (OpenSSL ${OPENSSL_VERSION})")
+  else()
+    message(WARNING "CloudVault: OpenSSL not found, building WITHOUT TLS (HTTPS disabled)")
+  endif()
+else()
+  message(STATUS "CloudVault: TLS support disabled (CV_ENABLE_TLS=OFF)")
+endif()
 cv_target_setup(cv_net)
 
 # ---------------------------------------------------------------------------

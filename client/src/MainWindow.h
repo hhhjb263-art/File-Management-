@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QCheckBox>
 #include <QElapsedTimer>
 #include <QHash>
 #include <QHash>
@@ -235,6 +236,7 @@ private:
     QPushButton *m_dlResumeBtn = nullptr;       // 【分块下载（断点续传）】
     QLabel *m_statusLabel = nullptr;            // 顶部结果标识（✓ 成功 / ✗ 失败）
     QLabel *m_spaceLabel = nullptr;             // 顶部：服务器剩余空间显示
+    QCheckBox *m_trustTls = nullptr;            // 信任自签名证书（HTTPS 自签场景）
     QTimer *m_spaceTimer = nullptr;             // 空间显示定时刷新
     QProgressBar *m_progressBar = nullptr;     // 分块上传进度：已传块数 / 总块数
     QLabel *m_progressLabel = nullptr;         // 进度文案（含 upload_id / 续传命中）

@@ -17,6 +17,11 @@ struct Config {
   std::size_t chunkSize = 5u * 1024u * 1024u;  // 分块大小，默认 5MB
   std::string logFile;             // 为空则输出到 stdout
   std::string logLevel = "info";
+  // TLS（HTTPS）双模式：tlsPort > 0 且证书/私钥齐全时额外开 HTTPS 监听；
+  // 均不配置则纯 HTTP。HTTP 与 HTTPS 可同时运行，共享同一套路由。
+  int tlsPort = 0;                 // 0 = 关闭 HTTPS
+  std::string tlsCert;             // PEM 证书路径
+  std::string tlsKey;              // PEM 私钥路径
 
   std::string dbPath() const { return dataDir + "/meta/cloudvault.db"; }
   std::string blobRoot() const { return dataDir + "/blobs"; }

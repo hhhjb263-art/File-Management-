@@ -34,6 +34,7 @@
 #include <QDir>
 #include <QJsonArray>
 #include <QMenu>
+#include <QSslError>
 #include <QProgressBar>
 #include <QStandardPaths>
 #include <QTimer>
@@ -206,6 +207,10 @@ QWidget *MainWindow::createTopBar()
     m_progressBar->setRange(0, 1);
     m_progressBar->setValue(0);
     m_progressBar->setMinimumWidth(200);
+    m_trustTls = new QCheckBox(QStringLiteral("信任自签名证书"), row2);
+    m_trustTls->setChecked(true);   // 私有云常见自签名证书；不信任时可手动取消
+    m_trustTls->setToolTip(QStringLiteral(
+        "HTTPS 服务器使用自签名证书时需要勾选；取消后 Qt 将按标准证书链校验（可防中间人）"));
     m_statusLabel = new QLabel(QString(), row2);   // 成功/失败的简化标识
     m_spaceLabel = new QLabel(QStringLiteral("服务器空间：查询中…"), row2);   // 剩余空间
     m_spaceLabel->setToolTip(QStringLiteral("来自 GET /api/v1/storage；每 60 秒自动刷新"));
@@ -214,6 +219,7 @@ QWidget *MainWindow::createTopBar()
     layout2->addWidget(m_progressLabel);
     layout2->addWidget(m_progressBar, 1);
     layout2->addWidget(m_statusLabel);
+    layout2->addWidget(m_trustTls);
     layout2->addWidget(m_spaceLabel);
 
     barLayout->addWidget(row1);
@@ -343,7 +349,7 @@ void MainWindow::onUpload()
     FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
                        buildUrl(QStringLiteral("/api/v1/files")),
                        FileTreeDialog::Mode::SelectDir, m_lastDir,
-                       /*allowCreateDir=*/true, this);
+                       /*allowCreateDir=*/true, this, m_trustTls->isChecked());
     if (dlg.exec() != QDialog::Accepted) {
         return;   // 用户取消
     }
@@ -846,7 +852,7 @@ void MainWindow::onChunkedUpload()
     FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
                        buildUrl(QStringLiteral("/api/v1/files")),
                        FileTreeDialog::Mode::SelectDir, m_lastDir,
-                       /*allowCreateDir=*/false, this);
+                       /*allowCreateDir=*/false, this, m_trustTls->isChecked());
     if (dlg.exec() != QDialog::Accepted) {
         return;   // 用户取消
     }
@@ -2161,6 +2167,14 @@ QNetworkReply *MainWindow::sendRequest(const QNetworkRequest &request, const QBy
     }
     // 记下实际动词，供日志显示（原有的 operation() 只能区分 GET / 非 GET）
     reply->setProperty("cvVerb", QString::fromUtf8(verb));
+
+    // HTTPS 自签名证书：勾选"信任自签名证书"时忽略证书错误（私有云常见场景）；
+    // 未勾选则按标准证书链校验，握手失败表现为 sslErrors -> 网络错误
+    connect(reply, &QNetworkReply::sslErrors, this, [this, reply](const QList<QSslError> &) {
+        if (m_trustTls && m_trustTls->isChecked()) {
+            reply->ignoreSslErrors();
+        }
+    });
 
     QElapsedTimer timer;
     timer.start();

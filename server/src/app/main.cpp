@@ -13,6 +13,8 @@
 //   POST /api/v1/dirs                创建目录（规范化 + 符号链接/越界拒绝）
 //   GET  /api/v1/dirs                列出已登记目录
 //   GET  /api/v1/storage             磁盘空间自查（free/total 字节）
+//
+// TLS：--tls-port/--tls-cert/--tls-key 启用 HTTPS（OpenSSL），与 HTTP 双模式并行；
 //   GET  /api/v1/tree                嵌套文件树（目录在前/文件在后、name 升序；供客户端树选择）
 //   POST /api/v1/uploads/init        分块上传会话初始化（含秒传 / 断点复用；body 可带 dir）
 //   GET  /api/v1/uploads/:id         查询会话状态与已收分块
@@ -699,6 +701,7 @@ int main(int argc, char** argv) {
           static_cast<long long>(sec ? -1 : static_cast<std::int64_t>(sinfo.available)));
     v.set("disk_total_bytes",
           static_cast<long long>(sec ? 0 : static_cast<std::int64_t>(sinfo.capacity)));
+    v.set("tls_port", static_cast<long long>(cfg.tlsPort));
     resp.setJson(200, json::dump(v));
   });
 
@@ -1605,6 +1608,27 @@ int main(int argc, char** argv) {
 
   CV_LOG_INFO("监听 " << cfg.listenAddr << ":" << cfg.port << "  数据目录 " << cfg.dataDir
                       << "  工作线程 " << cfg.workers);
+
+  // TLS 双模式：配置了 --tls-port 且证书/私钥齐全 → 额外开 HTTPS 监听（与 HTTP 并行）。
+  // 用户显式要求 HTTPS 而二进制不支持时直接退出（静默降级是安全 footgun）。
+  if (cfg.tlsPort > 0) {
+#ifdef CV_HAVE_OPENSSL
+    if (cfg.tlsCert.empty() || cfg.tlsKey.empty()) {
+      CV_LOG_ERROR("启用 HTTPS 需要同时提供 --tls-cert 与 --tls-key（或 CV_TLS_CERT/CV_TLS_KEY）");
+      return 1;
+    }
+    std::string tlsErr;
+    if (!server.listenTls(cfg.listenAddr, cfg.tlsPort, cfg.tlsCert, cfg.tlsKey, cfg.workers,
+                          tlsErr)) {
+      CV_LOG_ERROR("HTTPS 监听失败: " << tlsErr);
+      return 1;
+    }
+    CV_LOG_INFO("HTTPS 监听 " << cfg.listenAddr << ":" << cfg.tlsPort << "  证书 " << cfg.tlsCert);
+#else
+    CV_LOG_ERROR("本二进制未编译 TLS 支持（CV_ENABLE_TLS=OFF 或缺少 OpenSSL），无法启用 HTTPS");
+    return 1;
+#endif
+  }
   {
     const std::int64_t freeBytes = diskFreeBytes(cfg.dataDir);
     if (freeBytes >= 0) {

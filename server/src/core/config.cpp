@@ -53,6 +53,9 @@ bool loadFile(const std::string& path, Config& cfg, std::string& err) {
     else if (k == "chunk_size") cfg.chunkSize = toSize(v, cfg.chunkSize);
     else if (k == "log_file") cfg.logFile = v;
     else if (k == "log_level") cfg.logLevel = v;
+    else if (k == "tls_port") cfg.tlsPort = toInt(v, cfg.tlsPort);
+    else if (k == "tls_cert") cfg.tlsCert = v;
+    else if (k == "tls_key") cfg.tlsKey = v;
   }
   return true;
 }
@@ -71,6 +74,9 @@ std::string configUsage(const char* program) {
      << "  --chunk-size=<n>   分块字节数（默认 5242880）\n"
      << "  --log-file=<path>  日志路径（默认输出到 stdout）\n"
      << "  --log-level=<lv>   debug|info|warn|error（默认 info）\n"
+     << "  --tls-port=<n>     HTTPS 监听端口（默认 0 = 关闭；与 HTTP 可同时开）\n"
+     << "  --tls-cert=<path>  PEM 证书路径（启用 HTTPS 必填）\n"
+     << "  --tls-key=<path>   PEM 私钥路径（启用 HTTPS 必填）\n"
      << "  --help             显示帮助\n"
      << "\n环境变量：CV_CONFIG / CV_DATA_DIR / CV_FILES_ROOT / CV_LISTEN / CV_PORT /\n"
      << "          CV_WORKERS / CV_CHUNK_SIZE / CV_LOG_FILE / CV_LOG_LEVEL\n";
@@ -101,6 +107,9 @@ Config loadConfig(int argc, char** argv) {
   cfg.chunkSize = toSize(envOr("CV_CHUNK_SIZE", ""), cfg.chunkSize);
   cfg.logFile = envOr("CV_LOG_FILE", cfg.logFile);
   cfg.logLevel = envOr("CV_LOG_LEVEL", cfg.logLevel);
+  cfg.tlsPort = toInt(envOr("CV_TLS_PORT", ""), cfg.tlsPort);
+  cfg.tlsCert = envOr("CV_TLS_CERT", cfg.tlsCert);
+  cfg.tlsKey = envOr("CV_TLS_KEY", cfg.tlsKey);
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -123,10 +132,14 @@ Config loadConfig(int argc, char** argv) {
     if (!take("chunk-size").empty()) cfg.chunkSize = toSize(take("chunk-size"), cfg.chunkSize);
     if (!take("log-file").empty()) cfg.logFile = take("log-file");
     if (!take("log-level").empty()) cfg.logLevel = take("log-level");
+    if (!take("tls-port").empty()) cfg.tlsPort = toInt(take("tls-port"), cfg.tlsPort);
+    if (!take("tls-cert").empty()) cfg.tlsCert = take("tls-cert");
+    if (!take("tls-key").empty()) cfg.tlsKey = take("tls-key");
   }
 
   if (cfg.workers < 1) cfg.workers = 1;
   if (cfg.port <= 0 || cfg.port > 65535) cfg.port = 8080;
+  if (cfg.tlsPort < 0 || cfg.tlsPort > 65535) cfg.tlsPort = 0;
   if (cfg.chunkSize == 0) cfg.chunkSize = 5u * 1024u * 1024u;
   return cfg;
 }

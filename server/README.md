@@ -319,6 +319,24 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 （比分块拼装少多次 blob 打开/seek/拷贝，且对 OS 预读与页缓存友好）；否则回退分块拼装。
 日志以 `[镜像直读]` / `[分块拼装]` 区分来源，便于确认快路径是否生效。
 
+### TLS / HTTPS（v0.9，双模式）
+
+- **成熟库**：OpenSSL（构建期 `find_package(OpenSSL)` 自动探测；Debian 上 `apt install libssl-dev` 即可）。
+  找不到 OpenSSL 时优雅降级为纯 HTTP（构建打 WARN），**绝不手写加密**。
+- **双模式**：HTTP 与 HTTPS **可同时运行**（两个监听、同一套路由），按需选择：
+  - 纯 HTTP：不配置 `--tls-*`（现状不变）
+  - HTTP + HTTPS 并行：`--port=8080 --tls-port=8443 --tls-cert=... --tls-key=...`
+  - HTTPS 端口独立于 HTTP 端口，二者开关互不影响
+- **配置**（三种方式等价）：
+  - 命令行：`--tls-port=<n>` / `--tls-cert=<pem>` / `--tls-key=<pem>`
+  - 环境变量：`CV_TLS_PORT` / `CV_TLS_CERT` / `CV_TLS_KEY`
+  - 配置文件：`tls_port` / `tls_cert` / `tls_key`
+- **自签名证书**：`bash testdata/gen_cert.sh [CN] [IP]` 一键生成（含 SAN，10 年有效）；
+  客户端需勾选【信任自签名证书】。
+- **安全约束**：最低 TLS 1.2；私钥文件建议 `chmod 600`；用户显式要求 HTTPS 而二进制未编译 TLS 时
+  **启动即报错退出**（静默降级是安全 footgun）。
+- `/healthz` 回显 `tls_port`。
+
 ### 删除与空间回收（v0.8 修正）
 
 `DELETE /api/v1/files/:id` 现在会**真正释放磁盘**：
