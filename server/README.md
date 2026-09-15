@@ -315,6 +315,10 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 
 `GET /api/v1/files/:id/content` 支持 `Range: bytes=start-end` 与 `bytes=start-`（含后缀 `bytes=-N`）：命中返回 `206` + `Accept-Ranges: bytes` + `Content-Range: bytes start-end/total`，并按分块 seek 读取**仅请求区间**（内存只约一个分块），不整文件入内存。
 
+**镜像直读快路径（v0.9）**：若文件树镜像存在且大小与记录一致，Range 响应直接**顺序读镜像文件**
+（比分块拼装少多次 blob 打开/seek/拷贝，且对 OS 预读与页缓存友好）；否则回退分块拼装。
+日志以 `[镜像直读]` / `[分块拼装]` 区分来源，便于确认快路径是否生效。
+
 ### 删除与空间回收（v0.8 修正）
 
 `DELETE /api/v1/files/:id` 现在会**真正释放磁盘**：
