@@ -39,6 +39,13 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget *parent = nullptr);
 
+    // ---- 可被其它模块复用的静态工具（文件树对话框等）----
+    // 客户端侧路径预检（与服务端 sanitizeRelPath 同规则；不做最终裁决）
+    static bool validRelPathInput(const QString &in, QString *why);
+    static QString formatSize(qint64 bytes);   // 字节数转人类可读
+    static QString formatTime(qint64 epoch);   // 时间列格式化：入口把服务端的毫秒归一化成秒，再转本地时间字符串
+    static QString formatBody(const QByteArray &raw);  // 响应原文（过长截断）
+
 private slots:
     void onHealthCheck();   // 【健康检查】 GET /healthz
     void onUpload();        // 【选择文件并上传】 POST /api/v1/files（整文件，保留）
@@ -110,8 +117,6 @@ private:
     void finishDownload(bool ok);
 
     // ---- 目录与按路径下载 ----
-    // 客户端侧路径预检（与服务端 sanitizeRelPath 同规则；不做最终裁决）
-    static bool validRelPathInput(const QString &in, QString *why);
     void handleMkdirReply(int status, const QByteArray &raw);
     void handleDownloadPathReply(int status, bool networkError, const QString &errorString,
                                  const QByteArray &raw);
@@ -138,10 +143,6 @@ private:
     qint64 currentFileSize() const;          // 列表当前选中行的字节数
     qint64 currentFileCreatedAt() const;     // 列表当前选中行的创建时间（created_at 毫秒）
 
-    static QString formatSize(qint64 bytes); // 字节数转人类可读
-    static QString formatBody(const QByteArray &raw);  // 响应原文（过长截断）
-    // 时间列格式化：入口把服务端的毫秒归一化成秒，再转本地时间字符串
-    static QString formatTime(qint64 epoch);
     static bool looksBinary(const QByteArray &data);   // 含 '\0' 或非法 UTF-8 -> 二进制
     static QString toHexDump(const QByteArray &data);  // 16 字节一行的十六进制转储
 

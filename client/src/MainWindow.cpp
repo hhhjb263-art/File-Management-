@@ -22,6 +22,7 @@
 //       未经由本客户端上传过的文件显示为 "-"。
 
 #include "MainWindow.h"
+#include "FileTreeDialog.h"
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -294,21 +295,16 @@ void MainWindow::onUpload()
         return;   // 用户取消
     }
 
-    // 目标目录（相对路径；留空 = 根目录）。客户端预检 + 服务端强校验双层防护
-    bool ok = false;
-    QString dir = QInputDialog::getText(this, QStringLiteral("上传目标目录"),
-                                        QStringLiteral("目标目录（相对路径，'/' 分隔；留空 = 根目录）："),
-                                        QLineEdit::Normal, m_lastDir, &ok).trimmed();
-    if (!ok) {
+    // 目标目录：用远端文件树对话框选（相对路径；根目录 = 空串）。
+    // 对话框并发拉 /api/v1/dirs + /api/v1/files 合成树；initialPath 传 m_lastDir 便于默认选中。
+    FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
+                       buildUrl(QStringLiteral("/api/v1/files")),
+                       FileTreeDialog::Mode::SelectDir, m_lastDir,
+                       /*allowCreateDir=*/false, this);
+    if (dlg.exec() != QDialog::Accepted) {
         return;   // 用户取消
     }
-    if (!dir.isEmpty()) {
-        QString why;
-        if (!validRelPathInput(dir, &why)) {
-            QMessageBox::warning(this, QStringLiteral("目录不合法"), why);
-            return;
-        }
-    }
+    const QString dir = dlg.selectedPath();   // 根目录 = 空串（不带首尾 '/'）
     m_lastDir = dir;
 
     QFile file(path);
@@ -383,21 +379,15 @@ void MainWindow::onChunkedUpload()
         return;   // 用户取消
     }
 
-    // 目标目录（相对路径；留空 = 根目录）。客户端预检 + 服务端强校验双层防护
-    bool dirOk = false;
-    QString dir = QInputDialog::getText(this, QStringLiteral("分块上传目标目录"),
-                                        QStringLiteral("目标目录（相对路径，'/' 分隔；留空 = 根目录）："),
-                                        QLineEdit::Normal, m_lastDir, &dirOk).trimmed();
-    if (!dirOk) {
+    // 目标目录：用远端文件树对话框选（相对路径；根目录 = 空串）
+    FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
+                       buildUrl(QStringLiteral("/api/v1/files")),
+                       FileTreeDialog::Mode::SelectDir, m_lastDir,
+                       /*allowCreateDir=*/false, this);
+    if (dlg.exec() != QDialog::Accepted) {
         return;   // 用户取消
     }
-    if (!dir.isEmpty()) {
-        QString why;
-        if (!validRelPathInput(dir, &why)) {
-            QMessageBox::warning(this, QStringLiteral("目录不合法"), why);
-            return;
-        }
-    }
+    const QString dir = dlg.selectedPath();   // 根目录 = 空串
     m_lastDir = dir;
     m_chunkDir = dir;
 
@@ -1438,32 +1428,13 @@ bool MainWindow::validRelPathInput(const QString &in, QString *why)
 
 void MainWindow::onCreateDir()
 {
-    bool ok = false;
-    const QString dir = QInputDialog::getText(
-                            this, QStringLiteral("创建目录"),
-                            QStringLiteral("输入目录路径（相对路径，'/' 分隔，如 docs/backup）："),
-                            QLineEdit::Normal, m_lastDir, &ok)
-                            .trimmed();
-    if (!ok) {
-        return;   // 用户取消
-    }
-    QString why;
-    if (!validRelPathInput(dir, &why)) {
-        QMessageBox::warning(this, QStringLiteral("目录不合法"), why);
-        return;
-    }
-    m_lastDir = dir;
-
-    QJsonObject body;
-    body.insert(QStringLiteral("path"), dir);
-    const QByteArray payload = QJsonDocument(body).toJson(QJsonDocument::Compact);
-    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/dirs")));
-    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-    req.setHeader(QNetworkRequest::ContentLengthHeader, payload.size());
-    QNetworkReply *r = sendRequest(req, "POST", payload);
-    r->setProperty("cvStep", QStringLiteral("mkdir"));
-    appendLog(QStringLiteral("POST"), req.url(), 0, 0,
-              QStringLiteral("请求创建目录：%1").arg(dir));
+    // 文件树对话框（目录模式 + 新建文件夹按钮）：对话框内自行完成 POST /api/v1/dirs，
+    // 成功后自动刷新树并选中新目录；本模式下以【关闭】结束。
+    FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
+                       buildUrl(QStringLiteral("/api/v1/files")),
+                       FileTreeDialog::Mode::SelectDir, m_lastDir,
+                       /*allowCreateDir=*/true, this);
+    dlg.exec();
 }
 
 void MainWindow::handleMkdirReply(int status, const QByteArray &raw)
@@ -1497,23 +1468,19 @@ void MainWindow::onDownloadByPath()
                                  QStringLiteral("已有按路径下载进行中。"));
         return;
     }
-    bool ok = false;
-    const QString def = m_lastDir.isEmpty() ? QString() : m_lastDir + QStringLiteral("/");
-    const QString path = QInputDialog::getText(
-                             this, QStringLiteral("按路径下载"),
-                             QStringLiteral("输入服务器上文件的相对路径（如 docs/report.txt）："),
-                             QLineEdit::Normal, def, &ok)
-                             .trimmed();
-    if (!ok || path.isEmpty()) {
-        return;   // 用户取消 / 空输入
+    // 用远端文件树对话框选要下载的文件（initialPath 传上次目录 m_lastDir，便于定位）
+    FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
+                       buildUrl(QStringLiteral("/api/v1/files")),
+                       FileTreeDialog::Mode::SelectFile, m_lastDir,
+                       /*allowCreateDir=*/false, this);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;   // 用户取消
     }
-    QString why;
-    if (!validRelPathInput(path, &why)) {
-        QMessageBox::warning(this, QStringLiteral("路径不合法"),
-                             QStringLiteral("本地预检拒绝（最终以服务端裁决为准）：\n%1").arg(why));
-        return;
+    const QString path = dlg.selectedPath();   // 文件的相对路径（如 docs/report.txt）
+    if (path.isEmpty() || !dlg.isFile()) {
+        return;   // 未选文件
     }
-    m_lastDir = path.section(QLatin1Char('/'), 0, -2);
+    m_lastDir = path.section(QLatin1Char('/'), 0, -2);   // 记忆父目录，下次高亮
 
     const QString defName = path.section(QLatin1Char('/'), -1);
     const QString savePath =

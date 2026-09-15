@@ -54,6 +54,8 @@ add_executable(cloudvault-client
   src/main.cpp
   src/MainWindow.h
   src/MainWindow.cpp
+  src/FileTreeDialog.h
+  src/FileTreeDialog.cpp
 )
 
 target_link_libraries(cloudvault-client

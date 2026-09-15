@@ -16,7 +16,9 @@ client/
 ├── src/
 │   ├── main.cpp                   # QApplication 入口
 │   ├── MainWindow.h
-│   └── MainWindow.cpp             # 界面 + 网络请求
+│   ├── MainWindow.cpp             # 界面 + 网络请求
+│   ├── FileTreeDialog.h
+│   └── FileTreeDialog.cpp         # 远端文件树选择对话框（合成 /api/v1/dirs + /api/v1/files 树）
 └── testdata/                      # 测试数据（见第 5 节）
     ├── hello.txt
     ├── 中文文件名测试.txt
@@ -137,14 +139,14 @@ build\cloudvault-client.exe
 | 按钮 | 接口 / 说明 |
 |---|---|
 | 健康检查 | `GET /healthz` |
-| 选择文件并上传 | `POST /api/v1/files`（**整文件**上传；弹窗输入目标目录，头 `X-CV-Dir`） |
+| 选择文件并上传 | `POST /api/v1/files`（**整文件**上传；用**文件树对话框**选目标目录，头 `X-CV-Dir`） |
 | 列出文件 | `GET /api/v1/files` |
 | 下载选中文件 | `GET /api/v1/files/:id/content`（**整文件**下载，保留原有功能） |
-| **分块上传（断点续传）** | `init -> PUT chunk* -> complete`，见第 4.3 节（init body 带 `dir`） |
+| **分块上传（断点续传）** | `init -> PUT chunk* -> complete`，见第 4.3 节（init body 带 `dir`，目录由文件树选） |
 | **取消上传** | `DELETE /api/v1/uploads/:id`，中断当前分块会话 |
 | **分块下载（断点续传）** | `GET /api/v1/files/:id/content` 带 `Range`，见第 4.4 节 |
-| **创建目录** | `POST /api/v1/dirs {path}`，见第 4.5 节（201 新建 / 200 幂等） |
-| **按路径下载** | `GET /api/v1/download?path=dir/name`，见第 4.5 节（越界 403） |
+| **创建目录** | 弹**文件树对话框**（目录模式 + 【新建文件夹】），对话框内 `POST /api/v1/dirs {path}`（201 新建 / 200 幂等 / 400 非法 / 403 越界），成功自动刷新并选中新目录 |
+| **按路径下载** | `GET /api/v1/download?path=dir/name`，见第 4.6 节（**文件树对话框**选文件，越界 403） |
 | 清空日志 | 清空日志区 |
 
 请求进行中会自动禁用网络按钮并把鼠标指针置为忙碌态，响应回来后恢复，避免重复点击。
@@ -304,10 +306,72 @@ mkdir -p /tmp/cvdata
 
 **按路径下载**：`GET /api/v1/download?path=docs/report.txt` → 只服务**已记录且
 位于允许目录树内**的文件；未记录 / 路径被拒 → `404`（区分于越界的 `403`）。
-支持与 id 下载一致的 `Range/206`。
+支持与 id 下载一致的 `Range/206`。路径不再手工输入，改用**文件树对话框**选择（见第 4.6 节）。
 
-**上传指定目录**：整文件上传弹窗输入目标目录（头 `X-CV-Dir`）；分块上传在
-`init` body 带 `dir`（服务端登记到会话，`complete` 时落位）。目录为空 = 根目录。
+**上传指定目录**：整文件上传与分块上传的目标目录都改用**文件树对话框**选择
+（弹窗里点选目录或【根目录】按钮）；选中的目录通过 `X-CV-Dir` / `init` body 的 `dir`
+传给服务端（服务端登记到会话，`complete` 时落位）。目录为空 = 根目录。
+
+### 4.6 远端文件树选择对话框（`FileTreeDialog`）
+
+把原先"手动输入路径/目录"的 `QInputDialog` 改成了一个**模态文件树对话框**，`FileTreeDialog`
+（`QDialog` + `QTreeWidget`）。对话框**独立持有 `QNetworkAccessManager`**，与服务端交互
+不进 MainWindow 的日志区。它服务四个入口：**上传选目录、分块上传选目录、按路径下载选文件、
+创建目录（含新建文件夹）**。
+
+**数据来源（合成树）**：打开即**并发**拉取两个已有接口，在客户端合成目录树：
+- `GET /api/v1/dirs` → `{"total":N,"items":["docs","docs/backup"]}`（扁平规范化相对路径，不含根）
+- `GET /api/v1/files` → `{"total":N,"items":[{id,name,dir,size,hash,chunks,created_at}]}`（`dir=""` 为根）
+
+根节点固定为 **`/（根目录）`**（`path = ""`）。`dirs` 只列了 `a/b` 而没有 `a` 时，**自动补出 `a`**
+（按 `/` 拆分逐级建节点）；文件按其 `dir` 挂到对应目录节点下（`dir=""` 直接挂根）。
+
+**列**：`名称 | 类型 | 大小 | 修改时间`；文件夹显示「目录」、文件显示「文件」；大小用 `formatSize()`、
+时间用 `formatTime(created_at)`（毫秒归一化，与服务端列表一致）；用 `QStyle` 标准图标区分文件夹/文件。
+
+**展开 / 折叠 / 刷新**：
+- 默认展开**根 + 一级目录**；仅含子节点的文件夹才显示展开箭头。
+- 【全部展开】【全部折叠】一键操作；**双击目录**切换其展开状态。
+- 【刷新】会**重新拉取两个列表并重建树**，重建后按 `QSet<QString>` 记录的已展开路径集合
+  **恢复展开状态**（展开/折叠事件实时维护该集合，所以用户手动展开过的节点刷新后仍在）。
+
+**单选（不做多选）**：整棵树为 `QAbstractItemView::SingleSelection` + `SelectRows`。
+下游语义是"单个文件 / 单个目录"，批量选择需要新接口，故刻意不做多选；README 此处明确说明原因。
+
+**选中反馈**：底部状态标签实时显示
+`已选择：docs/backup/note.txt（文件，1.2 KB）` 或 `已选择目录：docs/backup`；
+根目录显示 `已选择目录：/（根目录）`；选错类型时提示原因。
+
+**确定按钮按模式校验**：
+- `Mode::SelectFile` 必须选中**文件**节点（否则【确定】置灰 + 提示）。
+- `Mode::SelectDir` 必须选中**目录**节点（**含根目录**，返回 `""`；选文件则置灰）。
+
+**结果接口**：`exec()` 返回 `Accepted` 时调用方才取值：
+- `selectedPath()`：文件 = `dir/name`、目录 = `dir`、根 = `""`；
+- `isFile()`：当前是否选中文件；`mode()`：当前模式。
+返回 `Rejected` 调用方不做任何动作（取消即不发起请求）。
+
+**加载失败 / 空树**：状态标签显示错误原文（区分网络错误与 HTTP 码），提供【重试】；
+两个列表都成功但都为空时显示「（服务器上没有已记录的目录/文件）」。
+
+**创建目录（对话框内新建文件夹）**：`onCreateDir()` 弹 `FileTreeDialog`
+（`SelectDir` 模式 + `allowCreateDir=true`），该模式下以**【关闭】代替【确定】**并多出
+**【新建文件夹】**按钮。点击后输入**单段**文件夹名 → 复用 `MainWindow::validRelPathInput`
+校验该单段（与服务端 `sanitizeRelPath` 同规则）→ 拼成 `父/名`（父为空即 `名`）→
+对话框用自身 `QNetworkAccessManager` `POST /api/v1/dirs {path}`（等价原 `cvStep="mkdir"`）→
+成功后**自动刷新树并选中新目录**；失败弹窗提示（重名走 `200` 幂等、非法名被客户端预检拦截、
+越界 403）。
+
+**结果如何应用到三个消费点**：
+- **【选择文件并上传】 / 【分块上传（断点续传）】**：弹 `SelectDir` 对话框，取 `selectedPath()`
+  作目标目录（根 = `""`）；整文件写请求头 `X-CV-Dir`（百分号编码），分块上传写入 `init` body 的 `dir`。
+- **【按路径下载】**：弹 `SelectFile` 对话框（`initialPath = m_lastDir`），取 `selectedPath()`
+  作文件路径，再走 `QFileDialog::getSaveFileName`（默认文件名 = 路径最后一段）→
+  `GET /api/v1/download?path=`（沿用现有 `cvStep="dlpath"` 处理与错误弹窗）。
+- **【创建目录】**：如上，对话框内完成建目录，不向 MainWindow 回传选择。
+
+三个消费点都把上次的 `m_lastDir` 作为 `initialPath` 传入，便于默认选中/展开；选完/建完之后
+用结果回写 `m_lastDir`（下载按父目录回写）。
 
 ### 客户端请求的接口契约
 
