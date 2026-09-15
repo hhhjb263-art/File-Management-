@@ -38,6 +38,18 @@ struct DlItem
     QString targetPath;
 };
 
+// 文件列表行数据（客户端侧数据模型：排序 / 渲染都基于它）
+struct RowData
+{
+    QString id;
+    QString name;
+    QString hash;
+    QString instantText;   // 是否秒传（本地记录）
+    QString dir;           // 所属目录（'' = 根目录）
+    qint64 size = 0;
+    qint64 createdAt = 0;
+};
+
 // 云匣 CloudVault 的 Qt 6 测试客户端主窗口。
 // 用一组按钮直接驱动服务端接口：健康检查 / 整文件上传 / 列表 / 整文件下载 /
 // 分块上传（断点续传）/ 分块下载（断点续传），并把每次请求的方法、URL、状态码、
@@ -66,6 +78,12 @@ private slots:
     void onChunkedUpload(); // 【分块上传（断点续传）】 init -> PUT chunk* -> complete
     void onCancelUpload();  // 【取消上传】 DELETE /api/v1/uploads/:id
     void onResumableDownload();  // 【分块下载（断点续传）】 GET /content 带 Range
+    // 文件列表右键菜单动作
+    void onTableContextMenu(const QPoint &pos);
+    void onCreateFile();     // 新建空文件（POST /api/v1/files/new）
+    void onRenameFile();     // 重命名选中文件（POST /api/v1/files/:id/rename）
+    void onDeleteFile();     // 删除选中文件（DELETE /api/v1/files/:id）
+    void onUploadToDir();    // 上传到选中行所在目录
     void onSelectionChanged();   // 列表选中行变化 -> 拉取并渲染预览
     void onForcePreview();       // 【仍要预览】超过体积上限时由用户显式确认
     void onReplyFinished(QNetworkReply *reply);
@@ -85,7 +103,7 @@ private:
                                const QByteArray &body = QByteArray());
     // 请求完成后的统一收口：写日志 + 按 cvStep（分块会话）或 URL 分派业务处理
     void handleReply(QNetworkReply *reply, const QByteArray &raw);
-    void handleUploadReply(const QByteArray &raw);
+    void handleUploadReply(int status, const QByteArray &raw);
     void handleListReply(const QByteArray &raw);
 
     // ---- 分块上传（断点续传）----
@@ -130,6 +148,17 @@ private:
     void showStatus(const QString &text, bool ok);   // 顶部 ✓/✗ 简化结果标识
     // 建立一次分块上传会话（流式：5MiB/块，绝不整文件入内存）；失败时 err 非空
     bool beginChunkedUploadFor(const QString &path, const QString &dir, QString *err);
+    // 发送单个小文件（整文件 POST）；overwrite=true 时带 X-CV-Overwrite 覆盖同名
+    void sendWholeFile(const QString &path, bool overwrite);
+    // 同名冲突：返回 true = 用户选择覆盖，false = 跳过
+    bool askOverwrite(const QString &dir, const QString &name);
+
+    // ---- 文件列表数据模型与排序 ----
+    void renderRows();                  // 按 m_rows 重建表格
+    void applySort(int key, bool asc);  // key: 0=名称 1=大小 2=时间
+    void handleNewFileReply(int status, const QByteArray &raw);
+    void handleRenameReply(int status, const QByteArray &raw);
+    void handleDeleteReply(int status, const QByteArray &raw);
 
     // ---- 预览 ----
     void cancelPreview();                                   // 中止并丢弃在途的预览请求
@@ -147,7 +176,8 @@ private:
                    const QString &body);
     // doSelect=false：插完行不改选中，避免刷新列表 / 上传完成时顺带拉一次预览
     void addRow(const QString &id, const QString &name, qint64 size, const QString &hash,
-                const QString &instantText, qint64 createdAt, bool doSelect = false);
+                const QString &instantText, qint64 createdAt, bool doSelect = false,
+                const QString &dir = QString());
     QString currentFileId() const;           // 列表当前选中行的 id
     QString currentFileName() const;         // 列表当前选中行的文件名
     qint64 currentFileSize() const;          // 列表当前选中行的字节数
@@ -219,6 +249,8 @@ private:
     // ---- 批量上传 / 下载队列（多选）----
     QStringList m_upQueue;        // 待上传的本地文件绝对路径
     QString m_upDir;              // 本次批量上传的目标目录（'' = 根目录）
+    QString m_upCurrentPath;      // 当前正在上传的本地文件（同名冲突重发用）
+    bool m_chunkOverwrite = false;  // 分块上传是否已确认覆盖同名
     int m_upOk = 0;
     int m_upFail = 0;
     bool m_upBatch = false;       // 是否处于批量上传中（响应回来后推进队列）
@@ -227,4 +259,10 @@ private:
     int m_dlOk = 0;
     int m_dlFail = 0;
     bool m_dlBatch = false;       // 是否处于批量下载中
+
+    // ---- 文件列表数据模型 ----
+    QList<RowData> m_rows;        // 表格数据源（排序后重建渲染）
+    QString m_ctxDir;             // 右键菜单所在行的目录（'' = 根目录）
+    int m_sortKey = 2;            // 当前排序键：0=名称 1=大小 2=时间
+    bool m_sortAsc = false;       // 升/降序
 };

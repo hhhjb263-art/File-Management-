@@ -6,6 +6,9 @@
 //   GET  /api/v1/files               文件列表（含 dir）
 //   GET  /api/v1/files/:id           文件元数据
 //   GET  /api/v1/files/:id/content   下载（按分块重组，支持 Range/206）
+//   POST /api/v1/files/new           新建空文件 {dir,name}（同名 409）
+//   POST /api/v1/files/:id/rename    重命名 {name}（同名 409）
+//   DELETE /api/v1/files/:id         软删除（移除镜像文件）
 //   GET  /api/v1/download?path=      按路径下载（仅限已记录文件，严格越界校验）
 //   POST /api/v1/dirs                创建目录（规范化 + 符号链接/越界拒绝）
 //   GET  /api/v1/dirs                列出已登记目录
@@ -618,6 +621,22 @@ int main(int argc, char** argv) {
     std::string dir;
     if (!sanitizeDirParam(util::urlDecode(req.header("x-cv-dir")), dir, resp)) return;
 
+    // 同名检测：同目录下已有同名文件 → 未声明覆盖则 409，让客户端询问用户
+    // （X-CV-Overwrite: 1 表示用户已确认覆盖）
+    const bool overwrite = !req.header("x-cv-overwrite").empty();
+    FileRow sameName;
+    const bool nameTaken = repo.findByPath(dir, name, sameName, err);
+    if (nameTaken && !overwrite) {
+      json::Value v = json::Value::object();
+      v.set("error", "name exists in target directory");
+      v.set("exists", true);
+      v.set("file_id", static_cast<long long>(sameName.id));
+      v.set("name", name);
+      v.set("dir", dir);
+      resp.setJson(409, json::dump(v));
+      return;
+    }
+
     const std::string& data = req.body;
     std::string contentHash = Sha256::of(data);
 
@@ -633,8 +652,16 @@ int main(int argc, char** argv) {
     }
 
     std::int64_t id = 0;
-    if (!repo.insertFile(name, dir, static_cast<std::int64_t>(data.size()), contentHash,
-                         chunkHashes, chunkSizes, id, err)) {
+    if (nameTaken) {
+      // 覆盖：保留原 id 与名称，替换内容与分块清单
+      id = sameName.id;
+      if (!repo.replaceContent(id, static_cast<std::int64_t>(data.size()), contentHash,
+                               chunkHashes, chunkSizes, err)) {
+        resp.setError(500, std::string("db failed: ") + err);
+        return;
+      }
+    } else if (!repo.insertFile(name, dir, static_cast<std::int64_t>(data.size()), contentHash,
+                                chunkHashes, chunkSizes, id, err)) {
       resp.setError(500, std::string("db failed: ") + err);
       return;
     }
@@ -653,10 +680,181 @@ int main(int argc, char** argv) {
     v.set("hash", contentHash);
     v.set("chunks", static_cast<long long>(chunkHashes.size()));
     v.set("instant", instant);
-    resp.setJson(201, json::dump(v));
+    v.set("overwritten", nameTaken);
+    resp.setJson(nameTaken ? 200 : 201, json::dump(v));
     CV_LOG_INFO("上传 id=" << id << " dir=" << dir << " name=" << name << " size=" << data.size()
+                           << (nameTaken ? " [覆盖同名]" : "")
                            << (instant ? " [秒传命中]" : ""));
   });
+
+  // ---- POST /api/v1/files/new （新建空文件；含同名检测）----
+  server.route("POST", "/api/v1/files/new", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    json::Value body = parseJsonBody(req.body, perr);
+    if (!perr.empty()) {
+      resp.setError(400, "invalid json: " + perr);
+      return;
+    }
+    const json::Value* pname = body.find("name");
+    if (!pname || pname->type() != json::Value::Type::String || pname->stringValue().empty()) {
+      resp.setError(400, "missing name");
+      return;
+    }
+    // 名称必须是单个合法路径段（复用统一清洗规则）
+    std::string rel;
+    const cv::PathStatus st = cv::sanitizeRelPath(pname->stringValue(), rel);
+    if (st != cv::PathStatus::Ok || rel.find('/') != std::string::npos) {
+      resp.setError(400, std::string("invalid file name: ") + cv::pathStatusText(st));
+      return;
+    }
+    const std::string name = rel;
+
+    const json::Value* pdir = body.find("dir");
+    std::string dir;
+    if (!sanitizeDirParam(pdir && pdir->type() == json::Value::Type::String
+                              ? pdir->stringValue()
+                              : std::string(),
+                          dir, resp)) {
+      return;
+    }
+
+    FileRow same;
+    if (repo.findByPath(dir, name, same, perr)) {
+      json::Value v = json::Value::object();
+      v.set("error", "name exists in target directory");
+      v.set("exists", true);
+      v.set("file_id", static_cast<long long>(same.id));
+      v.set("name", name);
+      v.set("dir", dir);
+      resp.setJson(409, json::dump(v));
+      return;
+    }
+
+    // 空文件内容：sha256("") 作为内容哈希，落一个 0 字节 blob
+    const std::string emptyData;
+    const std::string emptyHash = Sha256::of(emptyData);
+    if (!store.put(emptyHash, emptyData, perr)) {
+      resp.setError(500, std::string("store failed: ") + perr);
+      return;
+    }
+    std::int64_t id = 0;
+    if (!repo.insertFile(name, dir, 0, emptyHash, {}, {}, id, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    std::string mirrorErr;
+    if (!store.materialize(emptyHash, diskFilePath(cfg, dir, name), mirrorErr)) {
+      CV_LOG_WARN("镜像文件树失败 id=" << id << ": " << mirrorErr);
+    }
+    json::Value v = json::Value::object();
+    v.set("id", static_cast<long long>(id));
+    v.set("name", name);
+    v.set("dir", dir);
+    v.set("size", static_cast<long long>(0));
+    v.set("hash", emptyHash);
+    v.set("chunks", static_cast<long long>(0));
+    resp.setJson(201, json::dump(v));
+    CV_LOG_INFO("新建空文件 id=" << id << " dir=" << dir << " name=" << name);
+  });
+
+  // ---- POST /api/v1/files/:id/rename （重命名；含同名检测）----
+  server.route("POST", "/api/v1/files/:id/rename",
+               [&](const net::Request& req, net::Response& resp) {
+                 std::string perr;
+                 std::int64_t id = 0;
+                 if (!parseId(req.param("id"), id)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 FileRow row;
+                 if (!repo.findById(id, row, perr)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 json::Value body = parseJsonBody(req.body, perr);
+                 if (!perr.empty()) {
+                   resp.setError(400, "invalid json: " + perr);
+                   return;
+                 }
+                 const json::Value* pname = body.find("name");
+                 if (!pname || pname->type() != json::Value::Type::String ||
+                     pname->stringValue().empty()) {
+                   resp.setError(400, "missing name");
+                   return;
+                 }
+                 std::string rel;
+                 const cv::PathStatus st = cv::sanitizeRelPath(pname->stringValue(), rel);
+                 if (st != cv::PathStatus::Ok || rel.find('/') != std::string::npos) {
+                   resp.setError(400, std::string("invalid file name: ") + cv::pathStatusText(st));
+                   return;
+                 }
+                 const std::string newName = rel;
+                 if (newName == row.name) {
+                   json::Value v = json::Value::object();
+                   v.set("id", static_cast<long long>(id));
+                   v.set("name", row.name);
+                   v.set("dir", row.dir);
+                   resp.setJson(200, json::dump(v));   // 同名 → 幂等成功
+                   return;
+                 }
+                 bool exists = false;
+                 if (!repo.nameExists(row.dir, newName, id, exists, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 if (exists) {
+                   json::Value v = json::Value::object();
+                   v.set("error", "name exists in target directory");
+                   v.set("exists", true);
+                   v.set("name", newName);
+                   v.set("dir", row.dir);
+                   resp.setJson(409, json::dump(v));
+                   return;
+                 }
+                 if (!repo.renameFile(id, newName, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 // 物理镜像同步改名（尽力而为；失败则按新名重建）
+                 std::error_code rec;
+                 fs::rename(diskFilePath(cfg, row.dir, row.name),
+                            diskFilePath(cfg, row.dir, newName), rec);
+                 if (rec) {
+                   std::string mirrorErr;
+                   store.materialize(row.contentHash, diskFilePath(cfg, row.dir, newName),
+                                     mirrorErr);
+                 }
+                 json::Value v = json::Value::object();
+                 v.set("id", static_cast<long long>(id));
+                 v.set("name", newName);
+                 v.set("dir", row.dir);
+                 resp.setJson(200, json::dump(v));
+                 CV_LOG_INFO("重命名 id=" << id << " " << row.name << " -> " << newName);
+               });
+
+  // ---- DELETE /api/v1/files/:id （软删除 + 删镜像）----
+  server.route("DELETE", "/api/v1/files/:id",
+               [&](const net::Request& req, net::Response& resp) {
+                 std::string perr;
+                 std::int64_t id = 0;
+                 if (!parseId(req.param("id"), id)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 FileRow row;
+                 if (!repo.findById(id, row, perr)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 if (!repo.softDelete(id, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 std::error_code rec;
+                 fs::remove(diskFilePath(cfg, row.dir, row.name), rec);
+                 resp.status = 204;
+                 CV_LOG_INFO("删除文件 id=" << id << " dir=" << row.dir << " name=" << row.name);
+               });
 
   // ---- GET /api/v1/files ----
   server.route("GET", "/api/v1/files", [&](const net::Request&, net::Response& resp) {
@@ -902,6 +1100,26 @@ int main(int argc, char** argv) {
                    return v;
                  };
 
+                 // 同名检测：目标目录下已存在同名文件 → 未声明覆盖则 409（客户端询问用户后重发）
+                 bool overwrite = false;
+                 const json::Value* pov = body.find("overwrite");
+                 if (pov && pov->type() == json::Value::Type::Bool) {
+                   overwrite = pov->boolValue();
+                 }
+                 {
+                   FileRow same;
+                   if (repo.findByPath(dir, name, same, perr) && !overwrite) {
+                     json::Value v = json::Value::object();
+                     v.set("error", "name exists in target directory");
+                     v.set("exists", true);
+                     v.set("file_id", static_cast<long long>(same.id));
+                     v.set("name", name);
+                     v.set("dir", dir);
+                     resp.setJson(409, json::dump(v));
+                     return;
+                   }
+                 }
+
                  // 秒传：file_hash 已在内容库命中 → 直接返回已存在文件
                  if (!fileHash.empty()) {
                    FileRow existing;
@@ -939,6 +1157,7 @@ int main(int argc, char** argv) {
                    return;
                  }
                  up.setDir(newId, dir, perr);   // 登记目标目录，complete 时取用
+                 up.setOverwrite(newId, overwrite, perr);   // 登记覆盖标志
                  std::error_code msec;
                  fs::create_directories(uploadTmpDir(cfg, newId), msec);
                  json::Value v = json::Value::object();
@@ -1142,9 +1361,22 @@ int main(int argc, char** argv) {
                  // 目标目录：init 时登记（upload_dir 表），读取失败按根目录兜底
                  std::string dir;
                  up.getDir(id, dir, perr);
+                 bool overwrite = false;
+                 up.getOverwrite(id, overwrite, perr);
                  perr.clear();
-                 if (!repo.insertFile(s.name, dir, s.size, computed, chunkHashes, chunkSizes,
-                                      fileId, perr)) {
+                 // 覆盖：同目录同名已存在且会话声明了 overwrite → 替换原记录内容
+                 FileRow sameName;
+                 bool replace = overwrite && repo.findByPath(dir, s.name, sameName, perr);
+                 perr.clear();
+                 if (replace) {
+                   fileId = sameName.id;
+                   if (!repo.replaceContent(fileId, s.size, computed, chunkHashes, chunkSizes,
+                                            perr)) {
+                     resp.setError(500, std::string("db failed: ") + perr);
+                     return;
+                   }
+                 } else if (!repo.insertFile(s.name, dir, s.size, computed, chunkHashes,
+                                            chunkSizes, fileId, perr)) {
                    resp.setError(500, std::string("db failed: ") + perr);
                    return;
                  }

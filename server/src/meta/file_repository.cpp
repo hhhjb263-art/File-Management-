@@ -166,6 +166,119 @@ bool FileRepository::chunkHashesOf(std::int64_t fileId, std::vector<std::string>
   return true;
 }
 
+bool FileRepository::nameExists(const std::string& dir, const std::string& name,
+                                std::int64_t excludeId, bool& exists, std::string& err) {
+  exists = false;
+  Stmt stmt(db_.handle(),
+            "SELECT COUNT(*) FROM file_node f LEFT JOIN file_dir d ON d.file_id = f.id "
+            "WHERE f.deleted = 0 AND COALESCE(d.dir, '') = ? AND f.name = ? AND f.id != ?",
+            err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, dir) || !stmt.bind(2, name) || !stmt.bind(3, excludeId)) {
+    err = "bind failed";
+    return false;
+  }
+  if (stmt.step(err) != SQLITE_ROW) return false;
+  exists = stmt.int64(0) > 0;
+  return true;
+}
+
+bool FileRepository::renameFile(std::int64_t id, const std::string& newName,
+                                std::string& err) {
+  Stmt stmt(db_.handle(), "UPDATE file_node SET name = ? WHERE id = ?", err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, newName) || !stmt.bind(2, id)) {
+    err = "bind failed";
+    return false;
+  }
+  return stmt.step(err) == SQLITE_DONE;
+}
+
+bool FileRepository::softDelete(std::int64_t id, std::string& err) {
+  if (!db_.exec("BEGIN IMMEDIATE", err)) return false;
+  {
+    // 先递减引用计数（blob 保留，交由后续 GC 回收）
+    Stmt dec(db_.handle(),
+             "UPDATE chunk SET ref_count = ref_count - 1 WHERE hash IN "
+             "(SELECT chunk_hash FROM file_chunk WHERE file_id = ?)",
+             err);
+    if (!dec.ok() || !dec.bind(1, id) || dec.step(err) != SQLITE_DONE) {
+      err = err.empty() ? "chunk ref decrement failed" : err;
+      db_.exec("ROLLBACK", err);
+      return false;
+    }
+    Stmt stmt(db_.handle(), "UPDATE file_node SET deleted = 1 WHERE id = ?", err);
+    if (!stmt.ok() || !stmt.bind(1, id) || stmt.step(err) != SQLITE_DONE) {
+      err = err.empty() ? "mark deleted failed" : err;
+      db_.exec("ROLLBACK", err);
+      return false;
+    }
+  }
+  if (!db_.exec("COMMIT", err)) {
+    db_.exec("ROLLBACK", err);
+    return false;
+  }
+  return true;
+}
+
+bool FileRepository::replaceContent(std::int64_t id, std::int64_t size,
+                                    const std::string& contentHash,
+                                    const std::vector<std::string>& chunkHashes,
+                                    const std::vector<std::size_t>& chunkSizes,
+                                    std::string& err) {
+  if (!db_.exec("BEGIN IMMEDIATE", err)) return false;
+  {
+    Stmt dec(db_.handle(),
+             "UPDATE chunk SET ref_count = ref_count - 1 WHERE hash IN "
+             "(SELECT chunk_hash FROM file_chunk WHERE file_id = ?)",
+             err);
+    if (!dec.ok() || !dec.bind(1, id) || dec.step(err) != SQLITE_DONE) {
+      err = err.empty() ? "chunk ref decrement failed" : err;
+      db_.exec("ROLLBACK", err);
+      return false;
+    }
+    Stmt del(db_.handle(), "DELETE FROM file_chunk WHERE file_id = ?", err);
+    if (!del.ok() || !del.bind(1, id) || del.step(err) != SQLITE_DONE) {
+      err = err.empty() ? "clear file_chunk failed" : err;
+      db_.exec("ROLLBACK", err);
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < chunkHashes.size(); ++i) {
+    std::int64_t chunkSize =
+        i < chunkSizes.size() ? static_cast<std::int64_t>(chunkSizes[i]) : 0;
+    if (!addChunkIfAbsent(chunkHashes[i], chunkSize, err)) {
+      db_.exec("ROLLBACK", err);
+      return false;
+    }
+    Stmt link(db_.handle(),
+              "INSERT INTO file_chunk (file_id, seq, chunk_hash) VALUES (?, ?, ?)", err);
+    if (!link.ok() || !link.bind(1, id) || !link.bind(2, static_cast<std::int64_t>(i)) ||
+        !link.bind(3, chunkHashes[i]) || link.step(err) != SQLITE_DONE) {
+      err = err.empty() ? "link chunk failed" : err;
+      db_.exec("ROLLBACK", err);
+      return false;
+    }
+  }
+  {
+    Stmt upd(db_.handle(),
+             "UPDATE file_node SET content_hash = ?, size = ?, chunk_count = ? WHERE id = ?",
+             err);
+    if (!upd.ok() || !upd.bind(1, contentHash) || !upd.bind(2, size) ||
+        !upd.bind(3, static_cast<std::int64_t>(chunkHashes.size())) ||
+        !upd.bind(4, id) || upd.step(err) != SQLITE_DONE) {
+      err = err.empty() ? "update file_node failed" : err;
+      db_.exec("ROLLBACK", err);
+      return false;
+    }
+  }
+  if (!db_.exec("COMMIT", err)) {
+    db_.exec("ROLLBACK", err);
+    return false;
+  }
+  return true;
+}
+
 bool FileRepository::addChunkIfAbsent(const std::string& hash, std::int64_t size,
                                       std::string& err) {
   {

@@ -234,6 +234,16 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke.sh   # 指定其他端口
 | GET | `/api/v1/dirs` | 列出已登记目录 |
 | GET | `/api/v1/tree` | 嵌套文件树（目录在前/文件在后、name 升序；供客户端树选择） |
 | GET | `/api/v1/download` | 按路径下载（仅限已记录文件，严格越界校验） |
+| POST | `/api/v1/files/new` | 新建空文件 `{dir,name}`；同目录同名 → **409** |
+| POST | `/api/v1/files/:id/rename` | 重命名 `{name}`；同名 → **409**；同名幂等返回 200 |
+| DELETE | `/api/v1/files/:id` | 软删除（置 `deleted=1`、递减分块引用计数、移除镜像文件）→ **204** |
+
+**同名检测与覆盖**：
+- 整文件上传 `POST /api/v1/files`、新建文件、重命名、分块 `init` 都会做**同目录同名检测**；
+  已存在且未声明覆盖 → **`409 {"error":"name exists in target directory","exists":true,"name","dir","file_id"}`**，
+  客户端据此询问用户。
+- 用户确认覆盖后重发：整文件上传带请求头 **`X-CV-Overwrite: 1`**；分块上传在 `init` body 带 **`"overwrite": true`**
+  （会话记在 `upload_flags` 表，`complete` 时替换同名记录内容）。覆盖成功返回 **200**（非 201）并带 `"overwritten": true`。
 
 ```bash
 # 1) 健康检查

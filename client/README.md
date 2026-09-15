@@ -393,12 +393,37 @@ mkdir -p /tmp/cvdata
 > 完整设计（适用场景、传输流程、内存策略、异常与中断处理、阈值总览）见
 > [`docs/大文件传输设计.md`](../docs/大文件传输设计.md)。
 
+### 4.8 文件列表右键菜单、排序与同名检测（v0.8）
+
+**右键菜单**（在文件列表上右键，右键会先选中该行）：
+
+| 菜单项 | 行为 |
+|---|---|
+| 新建文件 | `POST /api/v1/files/new {dir,name}` 在**右键行所在目录**新建空文件；同名 → 弹「文件已存在」 |
+| 重命名「xxx」 | `POST /api/v1/files/:id/rename {name}`；同名 → 弹「名称冲突」，不做改动 |
+| 删除「xxx」 | 二次确认后 `DELETE /api/v1/files/:id`（软删除 + 移除镜像文件） |
+| 下载 | 复用多选下载（右键已选中该行） |
+| 上传到此目录 | 选本地文件（可多选）上传到该行所在目录；**同名 → 询问是否覆盖** |
+| 排序 ▸ | 按名称 / 按大小 / 按时间，及升序 / 降序 |
+
+**排序**：点击表头也可排序（点「大小」「时间」列按数值，其他列按名称）；升/降在同列重复点击切换。
+排序只重排客户端数据模型，不请求服务端。
+
+**同名检测（两端联动）**：上传 / 新建 / 重命名 都会命中服务端 `409`；客户端弹窗询问
+「是否覆盖？」——选覆盖，整文件上传带 `X-CV-Overwrite: 1`、分块上传在 `init` 带
+`"overwrite": true` 重发（覆盖成功返回 `200` + `overwritten:true`）；选否即跳过该项，批量上传继续下一个。
+
+**列表未显示目录列**：`dir` 存在每行「名称」单元格的 `Qt::UserRole+1` 里，供「新建文件 / 上传到此目录」使用。
+
 ### 客户端请求的接口契约
 
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
-| GET | `/healthz` | — | `{"status","version","data_dir"}` |
-| POST | `/api/v1/files` | body = 文件原始字节；请求头 `X-CV-Name` / `X-CV-Dir` = 百分号编码 | `201 {"id","name","dir","size","hash","chunks","instant"}` |
+| GET | `/healthz` | — | `{"status","version","data_dir","files_root"}` |
+| POST | `/api/v1/files` | body = 文件原始字节；请求头 `X-CV-Name` / `X-CV-Dir` = 百分号编码；覆盖时加 `X-CV-Overwrite: 1` | `201` 新建 / `200` 覆盖（均 `{id,name,dir,size,hash,chunks,instant[,overwritten]}`）；同名未覆盖 → `409 {exists:true,...}` |
+| POST | `/api/v1/files/new` | JSON `{dir,name}` | `201 {id,name,dir,size:0,hash}`；同名 → `409 {exists:true,...}`；名称非法 → `400` |
+| POST | `/api/v1/files/:id/rename` | JSON `{name}` | `200 {id,name,dir}`；同名 → `409 {exists:true,...}`；与原同名 → `200`（幂等） |
+| DELETE | `/api/v1/files/:id` | — | `204`（软删除 + 移除镜像文件） |
 | GET | `/api/v1/files` | — | `{"total":N,"items":[{id,name,dir,size,hash,chunks,created_at}]}` |
 | GET | `/api/v1/files/{id}/content` | 可选 `Range: bytes=start-` | `200` 全文 / `206 + Content-Range`，`application/octet-stream` |
 | GET | `/api/v1/download` | `?path=dir/name`（百分号编码） | `200` 全文 / `206`（同上）；未记录 `404`；非法 `400`；越界 `403` |
