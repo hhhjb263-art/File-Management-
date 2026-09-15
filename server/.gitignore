@@ -1,2 +1,6 @@
 build/
 .localcheck/
+
+# TLS 私钥/证书（本地生成，严禁入库）
+testdata/tls_key*.pem
+testdata/tls_cert*.pem

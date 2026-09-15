@@ -46,12 +46,24 @@ QTreeWidgetItem *findChildDir(QTreeWidgetItem *parent, const QString &path)
     return nullptr;
 }
 
+// 给请求追加 Bearer 令牌头（token 非空时）；与 MainWindow 的 sendRequest 行为一致
+void applyAuthToken(QNetworkRequest &req, const QString &token)
+{
+    const QString t = token.trimmed();
+    if (!t.isEmpty()) {
+        req.setRawHeader(QByteArrayLiteral("Authorization"),
+                         QByteArrayLiteral("Bearer ") + t.toUtf8());
+    }
+}
+
 }   // namespace
 
 FileTreeDialog::FileTreeDialog(const QUrl &dirsUrl, const QUrl &filesUrl, Mode mode,
-                               const QString &initialPath, bool allowCreateDir, QWidget *parent)
+                               const QString &initialPath, bool allowCreateDir, QWidget *parent,
+                               bool trustTls, const QString &authToken)
     : QDialog(parent), m_dirsUrl(dirsUrl), m_filesUrl(filesUrl), m_mode(mode),
-      m_initialPath(initialPath), m_allowCreateDir(allowCreateDir)
+      m_initialPath(initialPath), m_allowCreateDir(allowCreateDir), m_trustTls(trustTls),
+      m_authToken(authToken)
 {
     setWindowTitle(m_allowCreateDir
                        ? QStringLiteral("选择上传位置（可在其中新建文件夹）")
@@ -222,7 +234,11 @@ void FileTreeDialog::onCreateFolder()
     QNetworkRequest req(m_dirsUrl);
     req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
     req.setHeader(QNetworkRequest::ContentLengthHeader, payload.size());
+    applyAuthToken(req, m_authToken);
     QNetworkReply *r = m_nam->post(req, payload);
+    connect(r, &QNetworkReply::sslErrors, this, [this, r](const QList<QSslError> &errors) {
+        MainWindow::applyCertPinning(r, errors, m_trustTls, this);
+    });
     connect(r, &QNetworkReply::finished, this, [this, r, full]() {
         const int st = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const bool ne = (r->error() != QNetworkReply::NoError);
@@ -249,7 +265,12 @@ void FileTreeDialog::loadData()
     // GET /api/v1/dirs
     {
         QNetworkRequest req(m_dirsUrl);
+        applyAuthToken(req, m_authToken);
         QNetworkReply *r = m_nam->get(req);
+        connect(r, &QNetworkReply::sslErrors, this,
+                [this, r](const QList<QSslError> &errors) {
+            MainWindow::applyCertPinning(r, errors, m_trustTls, this);   // TOFU 指纹固定
+        });
         ++m_pending;
         connect(r, &QNetworkReply::finished, this, [this, r]() {
             const int st = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -263,7 +284,12 @@ void FileTreeDialog::loadData()
     // GET /api/v1/files
     {
         QNetworkRequest req(m_filesUrl);
+        applyAuthToken(req, m_authToken);
         QNetworkReply *r = m_nam->get(req);
+        connect(r, &QNetworkReply::sslErrors, this,
+                [this, r](const QList<QSslError> &errors) {
+            MainWindow::applyCertPinning(r, errors, m_trustTls, this);   // TOFU 指纹固定
+        });
         ++m_pending;
         connect(r, &QNetworkReply::finished, this, [this, r]() {
             const int st = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
