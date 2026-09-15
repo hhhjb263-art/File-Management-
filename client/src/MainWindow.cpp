@@ -71,6 +71,10 @@ constexpr int kDefaultPort = 8080;
 // 分块大小：5 MiB（与服务端契约一致；整文件哈希也按此切分块表）
 constexpr qint64 kChunkSize = 5 * 1024 * 1024;
 
+// 大文件阈值：超过该大小的文件不再"整文件读进内存"，改走流式/分块路径
+constexpr qint64 kStreamUploadThreshold = 8 * 1024 * 1024;   // 上传 > 8MiB → 分块上传（5MiB/块）
+constexpr qint64 kDownloadChunkSize = 4 * 1024 * 1024;       // 下载每次 Range 只拉 4MiB
+
 // 流式算哈希 / 读块时的缓冲大小（1 MiB），避免整文件入内存
 constexpr qint64 kHashBufferSize = 1024 * 1024;
 
@@ -328,6 +332,23 @@ void MainWindow::startNextUpload()
         return;
     }
     const QString path = m_upQueue.takeFirst();
+    const qint64 fileSize = QFileInfo(path).size();
+
+    // 内存控制：大文件走分块上传（流式，5MiB/块），绝不 readAll() 整文件入内存
+    if (fileSize > kStreamUploadThreshold) {
+        appendLog(QStringLiteral("POST"), buildUrl(QStringLiteral("/api/v1/uploads/init")), 0, 0,
+                  QStringLiteral("大文件 %1（%2 > %3）转分块流式上传")
+                      .arg(path, formatSize(fileSize), formatSize(kStreamUploadThreshold)));
+        QString err;
+        if (!beginChunkedUploadFor(path, m_upDir, &err)) {
+            appendLog(QStringLiteral("init"), buildUrl(QStringLiteral("/api/v1/uploads/init")), 0, 0,
+                      QStringLiteral("✗ 无法开始分块上传：%1（%2）").arg(path, err));
+            ++m_upFail;
+            QTimer::singleShot(0, this, [this] { startNextUpload(); });
+        }
+        return;   // 分块会话结束后由 finishChunkSession 推进队列
+    }
+
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
         appendLog(QStringLiteral("POST"), buildUrl(QStringLiteral("/api/v1/files")), 0, 0,
@@ -336,7 +357,7 @@ void MainWindow::startNextUpload()
         QTimer::singleShot(0, this, [this] { startNextUpload(); });
         return;
     }
-    const QByteArray data = file.readAll();
+    const QByteArray data = file.readAll();   // 仅小文件（≤ 8MiB）
     file.close();
     const QString name = QFileInfo(path).fileName();
 
@@ -374,52 +395,53 @@ void MainWindow::onDownload()
         return;
     }
 
-    QList<QPair<QString, QString>> picked;
+    QList<DlItem> picked;
     for (const QModelIndex &idx : rows) {
-        const QString id = m_table->item(idx.row(), 0) ? m_table->item(idx.row(), 0)->text() : QString();
-        const QString name =
-            m_table->item(idx.row(), 1) ? m_table->item(idx.row(), 1)->text() : QString();
-        if (!id.isEmpty()) {
-            picked.append(qMakePair(id, name.isEmpty() ? id : name));
+        DlItem it;
+        it.id = m_table->item(idx.row(), 0) ? m_table->item(idx.row(), 0)->text() : QString();
+        it.name = m_table->item(idx.row(), 1) ? m_table->item(idx.row(), 1)->text() : QString();
+        const QTableWidgetItem *sizeCell = m_table->item(idx.row(), 2);
+        it.size = sizeCell ? sizeCell->data(Qt::UserRole).toLongLong() : 0;
+        if (it.name.isEmpty()) {
+            it.name = it.id;
+        }
+        if (!it.id.isEmpty()) {
+            picked.append(it);
         }
     }
     if (picked.isEmpty()) {
         return;
     }
 
-    // 单个文件：沿用"另存为"选文件名；多个文件：选一个保存目录，逐个落盘
+    // 单个文件：先用"另存为"指定完整保存路径；多个文件：选一个保存目录，逐个落盘
     if (picked.size() == 1) {
         const QString savePath =
-            QFileDialog::getSaveFileName(this, QStringLiteral("保存到"), picked.first().second);
+            QFileDialog::getSaveFileName(this, QStringLiteral("保存到"), picked.first().name);
         if (savePath.isEmpty()) {
             return;   // 用户取消
         }
+        picked.first().targetPath = savePath;
+        m_dlDir.clear();
         m_dlBatch = false;
-        m_dlQueue.clear();
-        m_downloading = true;
-        m_downloadId = picked.first().first;
-        m_downloadPath = savePath;
-        QNetworkRequest req(
-            buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(m_downloadId)));
-        sendRequest(req, "GET");
-        return;
+    } else {
+        const QString dir = QFileDialog::getExistingDirectory(
+            this, QStringLiteral("选择保存目录（%1 个文件）").arg(picked.size()));
+        if (dir.isEmpty()) {
+            return;   // 用户取消
+        }
+        m_dlDir = dir;
+        m_dlBatch = true;
     }
 
-    const QString dir = QFileDialog::getExistingDirectory(
-        this, QStringLiteral("选择保存目录（%1 个文件）").arg(picked.size()));
-    if (dir.isEmpty()) {
-        return;   // 用户取消
-    }
     m_dlQueue = picked;
-    m_dlDir = dir;
     m_dlOk = 0;
     m_dlFail = 0;
-    m_dlBatch = true;
     showStatus(QStringLiteral("… 下载中 0/%1").arg(picked.size()), true);
     startNextDownload();
 }
 
-// 顺序下载：取队列首元素发 GET；全部完成后给 ✓/✗ 汇总标识
+// 顺序下载：**统一走 Range 分段**（每次 4MiB），内存占用与文件大小无关；
+// 大文件不会一次性载入内存，中断后凭 .part 断点续传。全部完成后给 ✓/✗ 汇总标识
 void MainWindow::startNextDownload()
 {
     if (m_dlQueue.isEmpty()) {
@@ -431,12 +453,31 @@ void MainWindow::startNextDownload()
                    m_dlFail == 0);
         return;
     }
-    const QPair<QString, QString> item = m_dlQueue.takeFirst();
-    m_downloadId = item.first;
-    m_downloadPath = m_dlDir + QLatin1Char('/') + item.second;
-    m_downloading = true;
-    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(m_downloadId)));
-    sendRequest(req, "GET");
+    const DlItem item = m_dlQueue.takeFirst();
+    const QString finalPath = item.targetPath.isEmpty()
+        ? (m_dlDir + QLatin1Char('/') + item.name)
+        : item.targetPath;
+    const QString partPath = finalPath + QStringLiteral(".part");
+
+    qint64 offset = 0;
+    if (QFile::exists(partPath)) {
+        offset = QFileInfo(partPath).size();   // 断点：已下载字节数 = .part 当前大小
+    }
+
+    m_dlActive = true;
+    m_dlId = item.id;
+    m_dlFinalPath = finalPath;
+    m_dlPartPath = partPath;
+    m_dlTotal = item.size;
+    m_dlOffset = offset;
+
+    appendLog(QStringLiteral("下载"),
+              buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(item.id)), 0, 0,
+              QStringLiteral("开始分段下载 %1（%2）%3")
+                  .arg(item.name, formatSize(item.size),
+                       offset > 0 ? QStringLiteral("，从 offset=%1 续传").arg(offset) : QString()));
+
+    sendDownloadRange(offset);
 }
 
 void MainWindow::onChunkedUpload()
@@ -462,13 +503,32 @@ void MainWindow::onChunkedUpload()
     }
     const QString dir = dlg.selectedPath();   // 根目录 = 空串
     m_lastDir = dir;
-    m_chunkDir = dir;
 
     QString err;
-    if (!prepareChunkPlan(path, &err)) {
-        QMessageBox::warning(this, QStringLiteral("无法读取文件"), err);
-        return;
+    if (!beginChunkedUploadFor(path, dir, &err)) {
+        QMessageBox::warning(this, QStringLiteral("无法开始分块上传"), err);
     }
+}
+
+// 建立一次分块上传会话（流式：按 5MiB 逐块 seek+read，绝不整文件入内存）。
+// 供【分块上传】按钮与批量上传中的大文件共用；失败时返回 false 且 err 非空。
+bool MainWindow::beginChunkedUploadFor(const QString &path, const QString &dir, QString *err)
+{
+    if (m_chunkActive) {
+        if (err) {
+            *err = QStringLiteral("已有分块上传会话进行中");
+        }
+        return false;
+    }
+
+    QString perr;
+    if (!prepareChunkPlan(path, &perr)) {
+        if (err) {
+            *err = perr;
+        }
+        return false;
+    }
+    m_chunkDir = dir;
 
     // 本地即可算出总分块数（chunk_size 固定为 kChunkSize），保证所有分支（含 GET 会话续传）
     // 在传块前都已知道 m_totalChunks
@@ -504,6 +564,7 @@ void MainWindow::onChunkedUpload()
     } else {
         sendInit();
     }
+    return true;
 }
 
 void MainWindow::onCancelUpload()
@@ -1320,19 +1381,37 @@ void MainWindow::finishChunkSession(bool ok)
         m_totalChunks = 0;
     }
     // 失败（ok=false）：保留 m_uploadId / m_chunkPath / m_doneSeq，供下次续传
+
+    // 批量上传：一个文件（分块大文件）结束后推进队列
+    if (m_upBatch) {
+        if (ok) {
+            ++m_upOk;
+        } else {
+            ++m_upFail;
+        }
+        if (m_cancelRequested) {
+            m_upQueue.clear();   // 用户取消 → 终止整批
+        }
+        QTimer::singleShot(0, this, [this] { startNextUpload(); });
+    }
 }
 
 // ---------------------------------------------------------------------------
 //  分块下载（断点续传）
 // ---------------------------------------------------------------------------
+// 拉取 [offset, offset+kDownloadChunkSize) 这一段（有界 Range）。
+// 有界是关键：只发 `bytes=start-` 会让服务端把从 start 到文件尾全部回发，大文件同样会撑爆内存。
+// 空文件（total==0）不发 Range，让服务端走 200 空响应。
 void MainWindow::sendDownloadRange(qint64 offset)
 {
     QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(m_dlId)));
-    if (offset > 0) {
-        req.setRawHeader("Range", QStringLiteral("bytes=%1-").arg(offset).toUtf8());
+    if (m_dlTotal != 0) {
+        const qint64 end = offset + kDownloadChunkSize - 1;
+        req.setRawHeader("Range", QStringLiteral("bytes=%1-%2").arg(offset).arg(end).toUtf8());
     }
     QNetworkReply *r = sendRequest(req, "GET");
     r->setProperty("cvStep", QStringLiteral("dlchunk"));
+    r->setProperty("cvOffset", offset);
 }
 
 void MainWindow::handleDownloadChunkReply(int status, bool networkError, const QString &errorString,
@@ -1400,8 +1479,9 @@ void MainWindow::handleDownloadChunkReply(int status, bool networkError, const Q
     m_dlOffset += raw.size();
 
     const int pct = m_dlTotal > 0 ? static_cast<int>(m_dlOffset * 100LL / m_dlTotal) : 0;
-    m_progressBar->setRange(0, m_dlTotal > 0 ? static_cast<int>(m_dlTotal) : 1);
-    m_progressBar->setValue(static_cast<int>(m_dlOffset));
+    // 进度条用 0..1000 千分比：直接 setRange(0, m_dlTotal) 在 >2GiB 时会 int 溢出
+    m_progressBar->setRange(0, 1000);
+    m_progressBar->setValue(pct * 10);
     m_progressLabel->setText(QStringLiteral("分块下载进度：%1 / %2（%3%%4）")
                                  .arg(formatSize(m_dlOffset)).arg(formatSize(m_dlTotal))
                                  .arg(pct).arg(QLatin1Char('%')));
@@ -1434,9 +1514,23 @@ void MainWindow::finalizeDownload()
 
 void MainWindow::finishDownload(bool ok)
 {
-    Q_UNUSED(ok);
     m_dlActive = false;
     updateProgress();
+
+    if (m_dlBatch) {
+        if (ok) {
+            ++m_dlOk;
+        } else {
+            ++m_dlFail;
+        }
+        showStatus(QStringLiteral("… 下载中 %1/%2")
+                       .arg(m_dlOk + m_dlFail)
+                       .arg(m_dlOk + m_dlFail + m_dlQueue.size()),
+                   true);
+        QTimer::singleShot(0, this, [this] { startNextDownload(); });
+        return;
+    }
+    showStatus(ok ? QStringLiteral("✓ 下载完成") : QStringLiteral("✗ 下载失败"), ok);
 }
 
 // ---------------------------------------------------------------------------
@@ -1624,27 +1718,20 @@ void MainWindow::handleReply(QNetworkReply *reply, const QByteArray &raw)
     if (reply->error() != QNetworkReply::NoError) {
         appendLog(method, url, status, elapsed,
                   QStringLiteral("✗ 网络错误：%1").arg(reply->errorString()));
-        if (m_upBatch) {   // 批量上传：记失败并继续下一个
+        // 下载的网络错误由 handleDownloadChunkReply 统一收尾（它带 cvStep="dlchunk"，
+        // 在更早的步骤分派里已经处理），这里只需推进批量上传队列
+        if (m_upBatch) {
             ++m_upFail;
             QTimer::singleShot(0, this, [this] { startNextUpload(); });
-        }
-        if (m_downloading) {
-            m_downloading = false;   // 下载失败时清掉待落盘状态
-            if (m_dlBatch) {
-                ++m_dlFail;
-                QTimer::singleShot(0, this, [this] { startNextDownload(); });
-            }
         }
         return;
     }
 
     appendLog(method, url, status, elapsed, formatBody(raw));
 
-    // 按路径把响应分派给对应的处理逻辑
+    // 按路径把响应分派给对应的处理逻辑（下载走 cvStep=dlchunk，在更早处已分派）
     const QString path = url.path();
-    if (m_downloading && path.endsWith(QStringLiteral("/content"))) {
-        handleDownloadReply(raw);
-    } else if (path.endsWith(QStringLiteral("/api/v1/files")) && method == QStringLiteral("POST")) {
+    if (path.endsWith(QStringLiteral("/api/v1/files")) && method == QStringLiteral("POST")) {
         handleUploadReply(raw);
     } else if (path.endsWith(QStringLiteral("/api/v1/files"))) {
         handleListReply(raw);
@@ -1722,36 +1809,6 @@ void MainWindow::handleListReply(const QByteArray &raw)
         cancelPreview();
         m_previewId.clear();
         resetPreview();
-    }
-}
-
-void MainWindow::handleDownloadReply(const QByteArray &raw)
-{
-    m_downloading = false;
-
-    QFile out(m_downloadPath);
-    if (!out.open(QIODevice::WriteOnly)) {
-        appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_downloadPath), 0, 0,
-                  QStringLiteral("✗ 落盘失败：%1").arg(out.errorString()));
-        if (m_dlBatch) {
-            ++m_dlFail;
-            QTimer::singleShot(0, this, [this] { startNextDownload(); });
-        }
-        return;
-    }
-    const qint64 written = out.write(raw);
-    out.close();
-
-    appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_downloadPath), 200, 0,
-              QStringLiteral("✓ 已保存 id=%1 到 %2（%3）")
-                  .arg(m_downloadId, m_downloadPath, formatSize(written)));
-
-    if (m_dlBatch) {
-        ++m_dlOk;
-        if (m_dlOk == 1 && m_dlQueue.isEmpty()) {
-            // 单元素队列兜底：直接收尾
-        }
-        startNextDownload();
     }
 }
 

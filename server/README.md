@@ -278,7 +278,7 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 - 若 `hash` 已在内容库命中 → 秒传：返回 `{"upload_id":0,"done":true,"file_id":<已存在id>,...}`。
 - 若同 `(hash,size,chunk_size)` 存在**未完成**会话 → 复用，返回其 `upload_id` 与 `uploaded` 列表（跨重启续传的关键）。
 - 否则新建会话：返回 `{"upload_id","name","size","chunk_size","hash","uploaded":[],"received_bytes":0}`。
-- 错误：`400` 参数非法（含 size<0、hash 非 64-hex）/ `413` 总量超过 2GiB 上限。
+- 错误：`400` 参数非法（含 size<0、hash 非 64-hex）/ `413` 总量超过上限（默认 1 TiB sanity 上限）。
 
 **`GET /api/v1/uploads/:id`**　返回 `{"upload_id","size","chunk_size","uploaded":[seq...],"received_bytes","status"}`；`404` 会话不存在。
 
@@ -302,7 +302,22 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 
 ### 下载 Range 支持
 
-`GET /api/v1/files/:id/content` 支持 `Range: bytes=start-` 与 `bytes=start-end`：命中返回 `206` + `Accept-Ranges: bytes` + `Content-Range: bytes start-end/total`，并按分块 seek 读取**仅请求区间**（内存只约一个分块），不整文件入内存；无 Range 时保持 `200` 全文（沿用 `getChunked`）。
+`GET /api/v1/files/:id/content` 支持 `Range: bytes=start-end` 与 `bytes=start-`（含后缀 `bytes=-N`）：命中返回 `206` + `Accept-Ranges: bytes` + `Content-Range: bytes start-end/total`，并按分块 seek 读取**仅请求区间**（内存只约一个分块），不整文件入内存。
+
+### 大文件传输与内存保护（v0.7）
+
+内存占用与文件大小**解耦**：服务端任何路径都不一次性加载整个文件。
+
+| 规则 | 行为 |
+|---|---|
+| 整文件上传 `POST /api/v1/files` | 请求体 **> 64 MiB → `413`**，报文提示改用分块上传 `/api/v1/uploads/*` |
+| 无 Range 的整文件下载 | 文件 **> 8 MiB → `409`**（`{"error":"...use Range requests","size":N,"max_single_shot":8388608}`），要求客户端分段拉取 |
+| 分块上传 | 单请求体 = 1 个分块（默认 5 MiB，服务端 clamp 到 64 KiB~64 MiB）；总量上限 1 TiB（sanity 上限） |
+| `complete` 合并 | 逐块读取拼接 + 流式算哈希，峰值 ≈ 1 个分块 |
+| 带 Range 的下载 | `readRange` 按分块 seek，只读请求区间，峰值 ≈ 1 个分块 |
+
+> 完整设计（适用场景 / 传输流程 / 内存策略 / 异常与中断处理 / 阈值总览）见
+> [`docs/大文件传输设计.md`](../docs/大文件传输设计.md)。
 
 ### 跑分块冒烟脚本
 
@@ -357,7 +372,6 @@ curl -s localhost:8080/api/v1/tree
 ```
 
 **边界与校验规则**（`sanitizeRelPath` 统一裁决）：
-
 - 拒绝 `.` / `..` 路径段（穿越）、绝对路径（`/` 开头）、盘符 / 冒号、反斜杠 → **403**
 - 拒绝非法字符 `< > : " | ? *` 与控制字符、空路径段（`a//b`）、段尾 `.`/空格、
   Windows 保留设备名（`CON`/`NUL`/`COM1-9`/…，含 `CON.txt` 形态）→ **400**

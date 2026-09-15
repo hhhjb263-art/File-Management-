@@ -45,8 +45,17 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr const char* kVersion = "0.5.0";
-constexpr std::size_t kMaxUploadBytes = 256u * 1024u * 1024u;         // 整文件单请求上限
-constexpr std::int64_t kMaxChunkedBytes = 2LL * 1024 * 1024 * 1024;   // 分块总量上限 2GiB
+// 整文件单请求上限：再大请走分块上传（/api/v1/uploads/*），避免服务端把整个 body 读进内存
+constexpr std::size_t kMaxUploadBytes = 64u * 1024u * 1024u;
+// 单次响应（无 Range 的整文件下载）上限：超过则要求客户端用 Range 分段拉取，
+// 避免服务端 getChunked 把整个文件拼进内存（内存占用与文件大小同阶 → OOM 风险）
+constexpr std::int64_t kMaxSingleShotDownload = 8LL * 1024 * 1024;
+// 单次 Range 响应跨度上限：即使客户端发 `bytes=0-`（开到文件尾），
+// 也只回这么多字节，避免一次把 4GiB+ 文件读进内存；客户端按段继续拉取即可。
+constexpr std::int64_t kMaxRangeSpan = 16LL * 1024 * 1024;
+// 分块总量上限：1 TiB（仅作 sanity 上限；单块 5 MiB、seq 与 size 全程 int64，
+// 故 4 GiB+ 的文件可正常传输。实际瓶颈是磁盘空间与文件系统，而非本上限）
+constexpr std::int64_t kMaxChunkedBytes = 1LL * 1024 * 1024 * 1024 * 1024;
 constexpr std::int64_t kMinChunk = 64 * 1024;                         // 最小分块 64KiB
 constexpr std::int64_t kMaxChunk = 64 * 1024 * 1024;                  // 最大分块 64MiB
 constexpr std::int64_t kGcIdleMillis = 24LL * 3600 * 1000;            // 会话 GC 闲置阈值 24h
@@ -328,6 +337,10 @@ void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const c
       resp.setError(416, "range not satisfiable");
       return;
     }
+    // 跨度保护：`bytes=0-` 这类开放区间也只回 kMaxRangeSpan 字节（客户端按段续拉）
+    if (rend - rstart + 1 > kMaxRangeSpan) {
+      rend = rstart + kMaxRangeSpan - 1;
+    }
     std::int64_t len = rend - rstart + 1;
     std::string slice;
     if (!store.readRange(hashes, rstart, len, slice, err)) {
@@ -344,7 +357,16 @@ void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const c
     return;
   }
 
-  // 无 Range：全文下载（沿用 getChunked，行为不变）
+  // 无 Range：整文件下载。大文件拒绝一次性回发，要求客户端用 Range 分段拉取，
+  // 否则服务端 getChunked 会把整个文件拼进内存（内存占用 ~ 文件大小）。
+  if (total > kMaxSingleShotDownload) {
+    cv::json::Value v = cv::json::Value::object();
+    v.set("error", "file too large for single-shot download; use Range requests");
+    v.set("size", static_cast<long long>(total));
+    v.set("max_single_shot", static_cast<long long>(kMaxSingleShotDownload));
+    resp.setJson(409, cv::json::dump(v));
+    return;
+  }
   std::string content;
   if (!store.getChunked(hashes, content, err)) {
     resp.setError(500, std::string("store failed: ") + err);
@@ -582,7 +604,10 @@ int main(int argc, char** argv) {
   server.route("POST", "/api/v1/files", [&](const net::Request& req, net::Response& resp) {
     std::string err;
     if (req.body.size() > kMaxUploadBytes) {
-      resp.setError(413, "file too large");
+      json::Value v = json::Value::object();
+      v.set("error", "file too large for single-shot upload; use POST /api/v1/uploads/init (chunked)");
+      v.set("max_single_shot", static_cast<long long>(kMaxUploadBytes));
+      resp.setJson(413, json::dump(v));
       return;
     }
     std::string name = util::baseName(util::urlDecode(req.header("x-cv-name")));
@@ -832,7 +857,11 @@ int main(int argc, char** argv) {
                    return;
                  }
                  if (size > kMaxChunkedBytes) {
-                   resp.setError(413, "total size exceeds 2GiB limit");
+                   json::Value v = json::Value::object();
+                   v.set("error", "total size exceeds server chunked-upload limit");
+                   v.set("size", static_cast<long long>(size));
+                   v.set("max_chunked_bytes", static_cast<long long>(kMaxChunkedBytes));
+                   resp.setJson(413, json::dump(v));
                    return;
                  }
                  // chunk_size 缺省用服务端配置，并 clamp 到 [64KiB, 64MiB]

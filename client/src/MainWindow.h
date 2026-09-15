@@ -29,6 +29,15 @@ struct ChunkPlan
     qint64 length = 0;   // 分块字节数（最后一块可能不足 chunk_size）
 };
 
+// 批量下载队列项（id + 名称 + 大小；targetPath 非空表示单文件指定了保存路径）
+struct DlItem
+{
+    QString id;
+    QString name;
+    qint64 size = 0;
+    QString targetPath;
+};
+
 // 云匣 CloudVault 的 Qt 6 测试客户端主窗口。
 // 用一组按钮直接驱动服务端接口：健康检查 / 整文件上传 / 列表 / 整文件下载 /
 // 分块上传（断点续传）/ 分块下载（断点续传），并把每次请求的方法、URL、状态码、
@@ -78,7 +87,6 @@ private:
     void handleReply(QNetworkReply *reply, const QByteArray &raw);
     void handleUploadReply(const QByteArray &raw);
     void handleListReply(const QByteArray &raw);
-    void handleDownloadReply(const QByteArray &raw);   // 把整文件下载内容写到用户选择的路径
 
     // ---- 分块上传（断点续传）----
     // 流式算整文件 SHA-256，同时按 chunk_size 切出分块表（不把整文件读进内存）
@@ -117,9 +125,11 @@ private:
     void finishDownload(bool ok);
 
     // ---- 批量上传 / 下载（多选）----
-    void startNextUpload();      // 顺序上传队列中的下一个本地文件
-    void startNextDownload();    // 顺序下载队列中的下一个服务器文件
+    void startNextUpload();      // 顺序处理队列中的下一个本地文件（小文件整传、大文件分块）
+    void startNextDownload();    // 顺序下载队列中的下一个服务器文件（Range 分段）
     void showStatus(const QString &text, bool ok);   // 顶部 ✓/✗ 简化结果标识
+    // 建立一次分块上传会话（流式：5MiB/块，绝不整文件入内存）；失败时 err 非空
+    bool beginChunkedUploadFor(const QString &path, const QString &dir, QString *err);
 
     // ---- 预览 ----
     void cancelPreview();                                   // 中止并丢弃在途的预览请求
@@ -176,10 +186,7 @@ private:
     QNetworkReply *m_previewReply = nullptr; // 在途的预览请求（切换选中行时先中止它）
     QString m_previewId;                     // 当前正在预览 / 待预览的文件 id
 
-    // 整文件下载是"先把用户选的保存路径记下来，响应回来再落盘"
-    bool m_downloading = false;
-    QString m_downloadId;
-    QString m_downloadPath;
+    // 下载统一走 Range 分段（见分块下载会话状态）；不再有"整文件读进内存再落盘"的路径
 
     // ---- 分块上传会话状态 ----
     QString m_chunkPath;          // 本地文件绝对路径
@@ -215,7 +222,7 @@ private:
     int m_upOk = 0;
     int m_upFail = 0;
     bool m_upBatch = false;       // 是否处于批量上传中（响应回来后推进队列）
-    QList<QPair<QString, QString>> m_dlQueue;  // (file_id, name) 待下载
+    QList<DlItem> m_dlQueue;      // 待下载（含大小，用于判定走不分段）
     QString m_dlDir;              // 批量下载的保存目录
     int m_dlOk = 0;
     int m_dlFail = 0;

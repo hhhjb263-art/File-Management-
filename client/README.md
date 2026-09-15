@@ -372,16 +372,26 @@ mkdir -p /tmp/cvdata
 成功后**自动刷新树并选中新目录**；失败弹窗提示（重名走 `200` 幂等、非法名被客户端预检拦截、
 越界 403）。
 
-**结果如何应用到三个消费点**：
-- **【选择文件并上传】 / 【分块上传（断点续传）】**：弹 `SelectDir` 对话框，取 `selectedPath()`
-  作目标目录（根 = `""`）；整文件写请求头 `X-CV-Dir`（百分号编码），分块上传写入 `init` body 的 `dir`。
-- **【按路径下载】**：弹 `SelectFile` 对话框（`initialPath = m_lastDir`），取 `selectedPath()`
-  作文件路径，再走 `QFileDialog::getSaveFileName`（默认文件名 = 路径最后一段）→
-  `GET /api/v1/download?path=`（沿用现有 `cvStep="dlpath"` 处理与错误弹窗）。
-- **【创建目录】**：如上，对话框内完成建目录，不向 MainWindow 回传选择。
+**结果如何应用到消费点**（v0.7 起只剩两个入口）：
+- **【选择文件并上传（可多选）】**：弹 `SelectDir`（`allowCreateDir=true`，标题「选择上传位置」），
+  取 `selectedPath()` 作目标目录（根 = `""`）；小文件整传写请求头 `X-CV-Dir`（百分号编码），
+  > 8 MiB 的大文件自动转分块上传、写入 `init` body 的 `dir`。
+- **【分块上传（断点续传）】**：同一对话框选目标目录，写入 `init` body 的 `dir`。
 
-三个消费点都把上次的 `m_lastDir` 作为 `initialPath` 传入，便于默认选中/展开；选完/建完之后
-用结果回写 `m_lastDir`（下载按父目录回写）。
+两个入口都把上次的 `m_lastDir` 作为 `initialPath` 传入，便于默认选中/展开；选完之后用结果回写
+`m_lastDir`。
+
+### 4.7 大文件传输（流式 / 分块，内存与文件大小解耦）
+
+- **上传 > 8 MiB 自动转分块**：`prepareChunkPlan` 用 1 MiB 缓冲流式算哈希 + 建分块表（不载入文件），
+  逐块 `seek+read` 5 MiB 发送；内存峰值 ≈ 1 个分块。
+- **下载一律 Range 分段**：每次只请求 `bytes=offset-(offset+4MiB-1)`（**有界**），收 206 后追加写
+  `<目标>.part`，中断后凭 `.part` 大小续传；内存峰值 ≈ 4 MiB。
+- **服务端兜底**：整文件上传 > 64 MiB → `413`；无 Range 的整文件下载 > 8 MiB → `409`（提示用 Range），
+  确保任一端都不会因为一次大 body / 一次全文回发而吃满内存。
+
+> 完整设计（适用场景、传输流程、内存策略、异常与中断处理、阈值总览）见
+> [`docs/大文件传输设计.md`](../docs/大文件传输设计.md)。
 
 ### 客户端请求的接口契约
 
