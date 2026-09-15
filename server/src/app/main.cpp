@@ -349,7 +349,8 @@ std::int64_t dropOrphanBlobs(cv::ContentStore& store,
 }
 
 // 按文件行提供内容（整文件 / Range 分块复用）。调用方已完成鉴权与存在性检查。
-void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const cv::FileRow& row,
+void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const cv::Config& cfg,
+                      const cv::FileRow& row,
                       const cv::net::Request& req, cv::net::Response& resp) {
   std::string err;
   std::vector<std::string> hashes;
@@ -410,10 +411,36 @@ void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const c
       rend = rstart + kMaxRangeSpan - 1;
     }
     std::int64_t len = rend - rstart + 1;
+
+    // 快路径：文件树镜像存在且大小吻合 → 直接顺序读该文件。
+    // 镜像是完整连续文件，比分块拼装（开多个 blob、seek、拷贝拼接）快得多，
+    // 也对操作系统预读 / 页缓存友好。镜像可能缺失（空间不足被跳过 / 旧版本上传），
+    // 此时回退到按分块拼装，行为不变。
     std::string slice;
-    if (!store.readRange(hashes, rstart, len, slice, err)) {
-      resp.setError(500, std::string("store failed: ") + err);
-      return;
+    bool servedFromMirror = false;
+    {
+      const std::string mirrorPath = diskFilePath(cfg, row.dir, row.name);
+      std::error_code mec;
+      if (fs::file_size(mirrorPath, mec) == static_cast<std::uintmax_t>(total) && !mec) {
+        std::ifstream in(mirrorPath, std::ios::binary);
+        if (in.is_open()) {
+          in.seekg(rstart);
+          slice.resize(static_cast<std::size_t>(len));
+          in.read(slice.data(), len);   // C++17：data() 可写
+          const auto got = in.gcount();
+          if (got == len) {
+            servedFromMirror = true;
+          } else {
+            slice.clear();   // 读取不完整（镜像被动过？）→ 回退分块拼装
+          }
+        }
+      }
+    }
+    if (!servedFromMirror) {
+      if (!store.readRange(hashes, rstart, len, slice, err)) {
+        resp.setError(500, std::string("store failed: ") + err);
+        return;
+      }
     }
     resp.status = 206;
     resp.extraHeaders["Accept-Ranges"] = "bytes";
@@ -421,7 +448,8 @@ void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const c
         "bytes " + std::to_string(rstart) + "-" + std::to_string(rend) + "/" +
         std::to_string(total);
     resp.setBinary(206, slice, "application/octet-stream");
-    CV_LOG_INFO("分块下载 id=" << row.id << " range=" << rstart << "-" << rend);
+    CV_LOG_INFO("分块下载 id=" << row.id << " range=" << rstart << "-" << rend
+                               << (servedFromMirror ? " [镜像直读]" : " [分块拼装]"));
     return;
   }
 
@@ -1019,7 +1047,7 @@ int main(int argc, char** argv) {
                    resp.setError(404, "file not found");
                    return;
                  }
-                 serveFileContent(repo, store, row, req, resp);
+                 serveFileContent(repo, store, cfg, row, req, resp);
                });
 
   // ---- GET /api/v1/download?path=dir/name （按路径下载，严格越界校验）----
@@ -1068,7 +1096,7 @@ int main(int argc, char** argv) {
                      }
                    }
                  }
-                 serveFileContent(repo, store, row, req, resp);
+                 serveFileContent(repo, store, cfg, row, req, resp);
                  CV_LOG_INFO("按路径下载 " << norm << " -> file_id=" << row.id);
                });
 

@@ -81,7 +81,7 @@ constexpr qint64 kChunkSize = 5 * 1024 * 1024;
 // 大文件阈值：超过该大小的文件不再"整文件读进内存"，改走流式/分块路径
 constexpr qint64 kStreamUploadThreshold = 8 * 1024 * 1024;   // 上传 > 8MiB → 分块上传（5MiB/块）
 constexpr qint64 kDownloadChunkSize = 8 * 1024 * 1024;       // 下载每次 Range 拉 8MiB
-constexpr int kDownloadConcurrency = 3;                      // 下载并发段数（与上传对齐）
+constexpr int kDownloadConcurrency = 4;                      // 下载并发段数（服务端 4 工作线程）
 
 // 流式算哈希 / 读块时的缓冲大小（1 MiB），避免整文件入内存
 constexpr qint64 kHashBufferSize = 1024 * 1024;
