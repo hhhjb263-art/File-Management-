@@ -250,6 +250,7 @@ private:
     QStringList m_upQueue;        // 待上传的本地文件绝对路径
     QString m_upDir;              // 本次批量上传的目标目录（'' = 根目录）
     QString m_upCurrentPath;      // 当前正在上传的本地文件（同名冲突重发用）
+    bool m_upSpaceWarned = false;   // 批量上传中空间不足只告警一次
     bool m_chunkOverwrite = false;  // 分块上传是否已确认覆盖同名
     int m_upOk = 0;
     int m_upFail = 0;

@@ -233,6 +233,7 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke.sh   # 指定其他端口
 | POST | `/api/v1/dirs` | 创建目录（规范化 + 符号链接/越界拒绝） |
 | GET | `/api/v1/dirs` | 列出已登记目录 |
 | GET | `/api/v1/tree` | 嵌套文件树（目录在前/文件在后、name 升序；供客户端树选择） |
+| GET | `/api/v1/storage` | 磁盘空间自查：`{data_dir,files_root,free_bytes,total_bytes,upload_safety_factor}` |
 | GET | `/api/v1/download` | 按路径下载（仅限已记录文件，严格越界校验） |
 | POST | `/api/v1/files/new` | 新建空文件 `{dir,name}`；同目录同名 → **409** |
 | POST | `/api/v1/files/:id/rename` | 重命名 `{name}`；同名 → **409**；同名幂等返回 200 |
@@ -313,6 +314,21 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 ### 下载 Range 支持
 
 `GET /api/v1/files/:id/content` 支持 `Range: bytes=start-end` 与 `bytes=start-`（含后缀 `bytes=-N`）：命中返回 `206` + `Accept-Ranges: bytes` + `Content-Range: bytes start-end/total`，并按分块 seek 读取**仅请求区间**（内存只约一个分块），不整文件入内存。
+
+### 存储空间预检（v0.8）
+
+- 上传前按 **2 倍文件大小 + 64 MiB 余量**（临时分块与内容库并存）预检 `dataDir` 剩余空间，
+  不足 → **`507 Insufficient Storage`** `{"error":"insufficient disk space on server","need_bytes","free_bytes","data_dir"}`
+  （整文件上传与分块 `init` 都会拦）。
+- `/healthz` 现在回显 `disk_free_bytes` / `disk_total_bytes`；`GET /api/v1/storage` 专门查询。
+- 启动日志会打印剩余空间，低于 512 MiB 时给 WARN。
+
+### 文件树镜像（v0.8 修复）
+
+内容寻址存储里**只有分块 blob、没有「整文件 blob」**，因此镜像文件树必须按分块序列拼接：
+`ContentStore::materializeFromChunks()`（先写 `.tmp` 再 rename，逐块读入，内存只约一个分块）。
+旧实现用整文件哈希去 `materialize()` 必然失败（日志 `镜像文件树失败 ... blob missing: <整文件hash>`），
+现已修复——整文件上传 / 分块 `complete` / 新建空文件 / 重命名兜底四处都走分块拼接。
 
 ### 大文件传输与内存保护（v0.7）
 

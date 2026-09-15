@@ -424,6 +424,10 @@ mkdir -p /tmp/cvdata
 | POST | `/api/v1/files/new` | JSON `{dir,name}` | `201 {id,name,dir,size:0,hash}`；同名 → `409 {exists:true,...}`；名称非法 → `400` |
 | POST | `/api/v1/files/:id/rename` | JSON `{name}` | `200 {id,name,dir}`；同名 → `409 {exists:true,...}`；与原同名 → `200`（幂等） |
 | DELETE | `/api/v1/files/:id` | — | `204`（软删除 + 移除镜像文件） |
+| GET | `/api/v1/storage` | — | `{data_dir,files_root,free_bytes,total_bytes,upload_safety_factor}` |
+
+> **服务器空间不足**：上传（整文件 / 分块 `init`）会先做空间预检，不足返回 **507**；
+> 客户端弹「服务器拒绝上传（507）」并原样展示 `need_bytes`/`free_bytes`；批量上传时只提示一次。
 | GET | `/api/v1/files` | — | `{"total":N,"items":[{id,name,dir,size,hash,chunks,created_at}]}` |
 | GET | `/api/v1/files/{id}/content` | 可选 `Range: bytes=start-` | `200` 全文 / `206 + Content-Range`，`application/octet-stream` |
 | GET | `/api/v1/download` | `?path=dir/name`（百分号编码） | `200` 全文 / `206`（同上）；未记录 `404`；非法 `400`；越界 `403` |

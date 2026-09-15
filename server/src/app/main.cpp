@@ -12,6 +12,7 @@
 //   GET  /api/v1/download?path=      按路径下载（仅限已记录文件，严格越界校验）
 //   POST /api/v1/dirs                创建目录（规范化 + 符号链接/越界拒绝）
 //   GET  /api/v1/dirs                列出已登记目录
+//   GET  /api/v1/storage             磁盘空间自查（free/total 字节）
 //   GET  /api/v1/tree                嵌套文件树（目录在前/文件在后、name 升序；供客户端树选择）
 //   POST /api/v1/uploads/init        分块上传会话初始化（含秒传 / 断点复用；body 可带 dir）
 //   GET  /api/v1/uploads/:id         查询会话状态与已收分块
@@ -278,6 +279,46 @@ bool ensureRealDirUnder(const std::string& rootAbs, const std::string& relDir,
   const std::string rs = canonRoot.string();
   if (cs != rs && cs.rfind(rs + "/", 0) != 0) {
     err = "path escapes allowed root: " + relDir;
+    return false;
+  }
+  return true;
+}
+
+// 磁盘剩余空间（字节）；拿不到返回 -1。
+// 目录可能尚不存在，向上找最近存在的祖先再取 space()。
+std::int64_t diskFreeBytes(const std::string& path) {
+  std::error_code ec;
+  fs::path p(path);
+  while (!p.empty() && !fs::exists(p, ec)) {
+    p = p.parent_path();
+  }
+  if (p.empty()) return -1;
+  const fs::space_info sp = fs::space(p, ec);
+  if (ec) return -1;
+  return static_cast<std::int64_t>(sp.available);
+}
+
+// 上传前空间预检：上传期间「临时分块」与「内容库」并存，峰值约 2 倍文件大小，
+// 再加一点余量。空间不足 → 507，并给出 need/free 让客户端明确告警。
+constexpr std::int64_t kSpaceSafetyFactor = 2;
+constexpr std::int64_t kSpaceMarginBytes = 64LL * 1024 * 1024;
+
+bool checkSpaceForUpload(const cv::Config& cfg, std::int64_t size,
+                         cv::net::Response& resp) {
+  const std::int64_t need = size * kSpaceSafetyFactor + kSpaceMarginBytes;
+  const std::int64_t freeBytes = diskFreeBytes(cfg.dataDir);
+  if (freeBytes < 0) {
+    return true;   // 拿不到空间信息就不拦，交给实际写入报错
+  }
+  if (freeBytes < need) {
+    cv::json::Value v = cv::json::Value::object();
+    v.set("error", "insufficient disk space on server");
+    v.set("need_bytes", static_cast<long long>(need));
+    v.set("free_bytes", static_cast<long long>(freeBytes));
+    v.set("data_dir", cfg.dataDir);
+    resp.setJson(507, cv::json::dump(v));
+    CV_LOG_WARN("空间不足：需要 " << need << " 字节，剩余 " << freeBytes << " 字节（"
+                                 << cfg.dataDir << "）");
     return false;
   }
   return true;
@@ -600,6 +641,12 @@ int main(int argc, char** argv) {
     v.set("version", kVersion);
     v.set("data_dir", cfg.dataDir);
     v.set("files_root", filesRoot(cfg));   // 客户端可操作的目录树根（便于自查）
+    std::error_code sec;
+    const fs::space_info sinfo = fs::space(cfg.dataDir, sec);
+    v.set("disk_free_bytes",
+          static_cast<long long>(sec ? -1 : static_cast<std::int64_t>(sinfo.available)));
+    v.set("disk_total_bytes",
+          static_cast<long long>(sec ? 0 : static_cast<std::int64_t>(sinfo.capacity)));
     resp.setJson(200, json::dump(v));
   });
 
@@ -611,6 +658,9 @@ int main(int argc, char** argv) {
       v.set("error", "file too large for single-shot upload; use POST /api/v1/uploads/init (chunked)");
       v.set("max_single_shot", static_cast<long long>(kMaxUploadBytes));
       resp.setJson(413, json::dump(v));
+      return;
+    }
+    if (!checkSpaceForUpload(cfg, static_cast<std::int64_t>(req.body.size()), resp)) {
       return;
     }
     std::string name = util::baseName(util::urlDecode(req.header("x-cv-name")));
@@ -668,7 +718,7 @@ int main(int argc, char** argv) {
 
     // 物理镜像树（尽力而为；内容仍以 blob + DB 为权威，失败仅告警）
     std::string mirrorErr;
-    if (!store.materialize(contentHash, diskFilePath(cfg, dir, name), mirrorErr)) {
+    if (!store.materializeFromChunks(chunkHashes, diskFilePath(cfg, dir, name), mirrorErr)) {
       CV_LOG_WARN("镜像文件树失败 id=" << id << ": " << mirrorErr);
     }
 
@@ -743,7 +793,7 @@ int main(int argc, char** argv) {
       return;
     }
     std::string mirrorErr;
-    if (!store.materialize(emptyHash, diskFilePath(cfg, dir, name), mirrorErr)) {
+    if (!store.materializeFromChunks({}, diskFilePath(cfg, dir, name), mirrorErr)) {
       CV_LOG_WARN("镜像文件树失败 id=" << id << ": " << mirrorErr);
     }
     json::Value v = json::Value::object();
@@ -821,8 +871,12 @@ int main(int argc, char** argv) {
                             diskFilePath(cfg, row.dir, newName), rec);
                  if (rec) {
                    std::string mirrorErr;
-                   store.materialize(row.contentHash, diskFilePath(cfg, row.dir, newName),
-                                     mirrorErr);
+                   std::vector<std::string> chunkHashes;
+                   if (repo.chunkHashesOf(row.id, chunkHashes, perr)) {
+                     store.materializeFromChunks(chunkHashes,
+                                                 diskFilePath(cfg, row.dir, newName),
+                                                 mirrorErr);
+                   }
                  }
                  json::Value v = json::Value::object();
                  v.set("id", static_cast<long long>(id));
@@ -855,6 +909,24 @@ int main(int argc, char** argv) {
                  resp.status = 204;
                  CV_LOG_INFO("删除文件 id=" << id << " dir=" << row.dir << " name=" << row.name);
                });
+
+  // ---- GET /api/v1/storage （磁盘空间自查）----
+  server.route("GET", "/api/v1/storage", [&](const net::Request&, net::Response& resp) {
+    std::error_code ec;
+    const std::int64_t freeBytes = diskFreeBytes(cfg.dataDir);
+    std::int64_t totalBytes = 0;
+    const fs::space_info sp = fs::space(cfg.dataDir, ec);
+    if (!ec) {
+      totalBytes = static_cast<std::int64_t>(sp.capacity);
+    }
+    json::Value v = json::Value::object();
+    v.set("data_dir", cfg.dataDir);
+    v.set("files_root", filesRoot(cfg));
+    v.set("free_bytes", static_cast<long long>(freeBytes));
+    v.set("total_bytes", static_cast<long long>(totalBytes));
+    v.set("upload_safety_factor", static_cast<long long>(kSpaceSafetyFactor));
+    resp.setJson(200, json::dump(v));
+  });
 
   // ---- GET /api/v1/files ----
   server.route("GET", "/api/v1/files", [&](const net::Request&, net::Response& resp) {
@@ -1052,6 +1124,9 @@ int main(int argc, char** argv) {
                  std::int64_t size = static_cast<std::int64_t>(psize->numberValue());
                  if (size < 0) {
                    resp.setError(400, "invalid size");
+                   return;
+                 }
+                 if (!checkSpaceForUpload(cfg, size, resp)) {
                    return;
                  }
                  if (size > kMaxChunkedBytes) {
@@ -1382,7 +1457,8 @@ int main(int argc, char** argv) {
                  }
                  // 物理镜像树（尽力而为；失败仅告警，内容仍以 blob + DB 为权威）
                  std::string mirrorErr;
-                 if (!store.materialize(computed, diskFilePath(cfg, dir, s.name), mirrorErr)) {
+                 if (!store.materializeFromChunks(chunkHashes, diskFilePath(cfg, dir, s.name),
+                                                  mirrorErr)) {
                    CV_LOG_WARN("镜像文件树失败 file_id=" << fileId << ": " << mirrorErr);
                  }
                  up.setStatus(id, "completed", perr);
@@ -1433,7 +1509,16 @@ int main(int argc, char** argv) {
 
   CV_LOG_INFO("监听 " << cfg.listenAddr << ":" << cfg.port << "  数据目录 " << cfg.dataDir
                       << "  工作线程 " << cfg.workers);
-  CV_LOG_INFO("接口就绪：GET /healthz · POST /api/v1/files · 分块上传 /api/v1/uploads/*");
+  {
+    const std::int64_t freeBytes = diskFreeBytes(cfg.dataDir);
+    if (freeBytes >= 0) {
+      CV_LOG_INFO("磁盘剩余 " << freeBytes << " 字节（" << cfg.dataDir << "）");
+      if (freeBytes < 512LL * 1024 * 1024) {
+        CV_LOG_WARN("磁盘剩余空间不足 512MiB，上传可能失败（GET /api/v1/storage 可查）");
+      }
+    }
+  }
+  CV_LOG_INFO("接口就绪：GET /healthz · POST /api/v1/files · 分块上传 /api/v1/uploads/* · GET /api/v1/storage");
   server.runForever();
 
   CV_LOG_INFO("服务端已停止");

@@ -45,6 +45,18 @@ class ContentStore {
   // 父目录由调用方创建并完成越界校验；本方法只保证 blob 存在与落位。
   bool materialize(const std::string& hex, const std::string& targetAbs, std::string& err);
 
+  // 按分块序列把内容拼接写入 targetAbs（先写 .tmp 再 rename）。
+  // ⚠️ 内容寻址存储里只有「分块 blob」没有「整文件 blob」，所以镜像必须走本方法；
+  // 传空序列即创建一个 0 字节文件。内存占用只约一个分块。
+  bool materializeFromChunks(const std::vector<std::string>& chunkHashes,
+                            const std::string& targetAbs, std::string& err);
+
+  // 分块拼接镜像：把各分块 blob 依次流式写入 targetAbs（先写 .tmp 再原子 rename）。
+  // 用于分块上传的文件——内容库里只有分块 blob，不存在整文件 blob，
+  // 故不能用 materialize(整文件哈希)。内存峰值 ≈ 1 个分块。
+  bool materializeChunked(const std::vector<std::string>& chunkHashes,
+                          const std::string& targetAbs, std::string& err);
+
  private:
   std::string root_;
 };

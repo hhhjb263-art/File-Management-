@@ -41,6 +41,7 @@ std::string statusText(int code) {
     case 416: return "Range Not Satisfiable";
     case 422: return "Unprocessable Entity";
     case 500: return "Internal Server Error";
+    case 507: return "Insufficient Storage";
     default: return "Unknown";
   }
 }

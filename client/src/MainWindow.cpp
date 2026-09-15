@@ -334,6 +334,7 @@ void MainWindow::onUpload()
     m_upDir = dir;
     m_upOk = 0;
     m_upFail = 0;
+    m_upSpaceWarned = false;
     m_upBatch = true;
     showStatus(QStringLiteral("… 上传中 0/%1").arg(paths.size()), true);
     startNextUpload();
@@ -682,6 +683,7 @@ void MainWindow::onUploadToDir()
     m_lastDir = m_ctxDir;
     m_upOk = 0;
     m_upFail = 0;
+    m_upSpaceWarned = false;
     m_upBatch = true;
     showStatus(QStringLiteral("… 上传中 0/%1").arg(paths.size()), true);
     startNextUpload();
@@ -1426,6 +1428,12 @@ void MainWindow::handleInitReply(int status, const QByteArray &raw)
     if (status != 200) {
         appendLog(QStringLiteral("init"), buildUrl(QStringLiteral("/api/v1/uploads/init")), status, 0,
                   QStringLiteral("init 失败：%1").arg(formatBody(raw)));
+        if (status == 507 || status == 413) {
+            QMessageBox::warning(
+                this, QStringLiteral("服务器拒绝上传（%1）").arg(status),
+                QStringLiteral("%1\n\n可用 GET /api/v1/storage 查看服务器剩余空间。")
+                    .arg(formatBody(raw)));
+        }
         finishChunkSession(false);
         return;
     }
@@ -2051,6 +2059,8 @@ void MainWindow::handleReply(QNetworkReply *reply, const QByteArray &raw)
 
 void MainWindow::handleUploadReply(int status, const QByteArray &raw)
 {
+    const bool okStatus = (status == 200 || status == 201);
+
     // 同名冲突（409）→ 询问用户；选择覆盖则带 X-CV-Overwrite 重发同一个文件，不推进队列
     if (status == 409) {
         const QJsonObject o = QJsonDocument::fromJson(raw).object();
@@ -2066,7 +2076,16 @@ void MainWindow::handleUploadReply(int status, const QByteArray &raw)
         return;
     }
 
-    if (status == 200 || status == 201) {
+    // 服务端空间不足（507）/ 超出单次上限（413）：明确告警（批量时只提示一次）
+    if (!okStatus && (status == 507 || status == 413) && !m_upSpaceWarned) {
+        m_upSpaceWarned = true;
+        QMessageBox::warning(
+            this, QStringLiteral("服务器拒绝上传（%1）").arg(status),
+            QStringLiteral("%1\n\n可用 GET /api/v1/storage 查看服务器剩余空间。")
+                .arg(formatBody(raw)));
+    }
+
+    if (okStatus) {
         const QJsonDocument doc = QJsonDocument::fromJson(raw);
         if (doc.isObject()) {
             const QJsonObject obj = doc.object();
@@ -2092,7 +2111,11 @@ void MainWindow::handleUploadReply(int status, const QByteArray &raw)
     }
 
     if (m_upBatch) {
-        ++m_upOk;
+        if (okStatus) {
+            ++m_upOk;
+        } else {
+            ++m_upFail;   // 非 2xx 必须计失败（此前一律计成功，是 bug）
+        }
         showStatus(QStringLiteral("… 上传中 %1/%2")
                        .arg(m_upOk + m_upFail)
                        .arg(m_upOk + m_upFail + m_upQueue.size()),
