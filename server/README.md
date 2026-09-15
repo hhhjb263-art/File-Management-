@@ -126,6 +126,24 @@ cmake --install build
 
 ### 2.7 可配置项一览
 
+**运行时选项（`--xxx` / 环境变量 `CV_XXX` / 配置文件 key）**
+
+| 选项 | 默认值 | 说明 |
+|---|---|---|
+| `--data-dir` / `CV_DATA_DIR` / `data_dir` | `/var/lib/cloudvault` | 数据根目录（元数据库 / 内容库 / 临时分块） |
+| `--files-root` / `CV_FILES_ROOT` / `files_root` | `<data-dir>/files` | **文件树允许根**：客户端只能在该目录内建目录 / 上传 / 下载。显式配置，**不随服务端启动目录（cwd）变化**；相对路径会按 cwd 转成绝对路径 |
+| `--listen` / `CV_LISTEN` / `listen` | `0.0.0.0` | 监听地址 |
+| `--port` / `CV_PORT` / `port` | `8080` | 监听端口 |
+| `--workers` / `CV_WORKERS` / `workers` | `4` | HTTP 工作线程数 |
+| `--chunk-size` / `CV_CHUNK_SIZE` / `chunk_size` | `5242880` | 分块大小（字节） |
+| `--log-file` / `CV_LOG_FILE` / `log_file` | 空（stdout） | 日志文件 |
+| `--log-level` / `CV_LOG_LEVEL` / `log_level` | `info` | `debug` / `info` / `warn` / `error` |
+
+> 想把文件树落到别处（如独立数据盘）：`--files-root=/mnt/data/cvfiles`。
+> `/healthz` 会回显当前生效的 `data_dir` 与 `files_root`，便于核对。
+
+**构建选项（CMake）**
+
 | 选项 | 默认值 | 说明 |
 |---|---|---|
 | `CMAKE_BUILD_TYPE` | `Release` | `Release` / `Debug` / `RelWithDebInfo` / `MinSizeRel` |
@@ -212,6 +230,21 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke.sh   # 指定其他端口
 | PUT | `/api/v1/uploads/:id/chunk/:seq` | 上传单个分块（幂等，可带 `X-Chunk-SHA256`） |
 | POST | `/api/v1/uploads/:id/complete` | 合并分块落库 |
 | DELETE | `/api/v1/uploads/:id` | 取消会话 |
+| POST | `/api/v1/dirs` | 创建目录（规范化 + 符号链接/越界拒绝） |
+| GET | `/api/v1/dirs` | 列出已登记目录 |
+| GET | `/api/v1/tree` | 嵌套文件树（目录在前/文件在后、name 升序；供客户端树选择） |
+| GET | `/api/v1/storage` | 磁盘空间自查：`{data_dir,files_root,free_bytes,total_bytes,upload_safety_factor}` |
+| GET | `/api/v1/download` | 按路径下载（仅限已记录文件，严格越界校验） |
+| POST | `/api/v1/files/new` | 新建空文件 `{dir,name}`；同目录同名 → **409** |
+| POST | `/api/v1/files/:id/rename` | 重命名 `{name}`；同名 → **409**；同名幂等返回 200 |
+| DELETE | `/api/v1/files/:id` | 删除并**回收空间** → `200 {deleted:true,file_id,name,dir,freed_bytes,blobs_removed,disk_free_bytes}` |
+
+**同名检测与覆盖**：
+- 整文件上传 `POST /api/v1/files`、新建文件、重命名、分块 `init` 都会做**同目录同名检测**；
+  已存在且未声明覆盖 → **`409 {"error":"name exists in target directory","exists":true,"name","dir","file_id"}`**，
+  客户端据此询问用户。
+- 用户确认覆盖后重发：整文件上传带请求头 **`X-CV-Overwrite: 1`**；分块上传在 `init` body 带 **`"overwrite": true`**
+  （会话记在 `upload_flags` 表，`complete` 时替换同名记录内容）。覆盖成功返回 **200**（非 201）并带 `"overwritten": true`。
 
 ```bash
 # 1) 健康检查
@@ -256,7 +289,7 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 - 若 `hash` 已在内容库命中 → 秒传：返回 `{"upload_id":0,"done":true,"file_id":<已存在id>,...}`。
 - 若同 `(hash,size,chunk_size)` 存在**未完成**会话 → 复用，返回其 `upload_id` 与 `uploaded` 列表（跨重启续传的关键）。
 - 否则新建会话：返回 `{"upload_id","name","size","chunk_size","hash","uploaded":[],"received_bytes":0}`。
-- 错误：`400` 参数非法（含 size<0、hash 非 64-hex）/ `413` 总量超过 2GiB 上限。
+- 错误：`400` 参数非法（含 size<0、hash 非 64-hex）/ `413` 总量超过上限（默认 1 TiB sanity 上限）。
 
 **`GET /api/v1/uploads/:id`**　返回 `{"upload_id","size","chunk_size","uploaded":[seq...],"received_bytes","status"}`；`404` 会话不存在。
 
@@ -280,7 +313,53 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 
 ### 下载 Range 支持
 
-`GET /api/v1/files/:id/content` 支持 `Range: bytes=start-` 与 `bytes=start-end`：命中返回 `206` + `Accept-Ranges: bytes` + `Content-Range: bytes start-end/total`，并按分块 seek 读取**仅请求区间**（内存只约一个分块），不整文件入内存；无 Range 时保持 `200` 全文（沿用 `getChunked`）。
+`GET /api/v1/files/:id/content` 支持 `Range: bytes=start-end` 与 `bytes=start-`（含后缀 `bytes=-N`）：命中返回 `206` + `Accept-Ranges: bytes` + `Content-Range: bytes start-end/total`，并按分块 seek 读取**仅请求区间**（内存只约一个分块），不整文件入内存。
+
+### 删除与空间回收（v0.8 修正）
+
+`DELETE /api/v1/files/:id` 现在会**真正释放磁盘**：
+
+1. `file_node.deleted = 1`（标记删除，列表不再返回）
+2. 删除该文件的 `file_chunk` 链接行 + `file_dir` 归属行（不留悬空引用）
+3. 逐个递减 `chunk.ref_count`；**引用计数归零且无任何 `file_chunk` 引用**的分块行被清理
+   （安全网：即使计数漂移也不会误删仍在使用的 blob）
+4. 删除这些分块的 blob 文件（`blobs/xx/<hash>`）+ 删除镜像文件
+5. 响应返回实际释放字节数 `freed_bytes`、删除的 blob 数 `blobs_removed` 与当前 `disk_free_bytes`
+
+> 去重共享的内容不会被误删：只要还有别的文件引用该分块，`ref_count > 0`，blob 保留。
+> 覆盖上传（同名覆盖）走 `replaceContent`，同样会回收旧内容中归零的分块。
+
+### 存储空间预检（v0.8）
+
+- 上传前按 **1 倍文件大小 + 64 MiB 余量**预检 `dataDir` 剩余空间 —— `complete` 会把 tmp 分块
+  **同盘 rename 搬进**内容库（`ContentStore::putFromFile`，零拷贝），因此**不再产生 tmp+blob 双份**；
+  不足 → **`507 Insufficient Storage`** `{"error":"insufficient disk space on server","need_bytes","free_bytes","data_dir"}`
+  （整文件上传与分块 `init` 都会拦，且**秒传命中 / 断点复用不做空间预检**——它们不额外占盘）。
+- 镜像文件树写入前再查一次空间：不够则**跳过镜像**并 WARN（blob + DB 仍是权威，下载/预览不受影响）。
+- `/healthz` 现在回显 `disk_free_bytes` / `disk_total_bytes`；`GET /api/v1/storage` 专门查询。
+- 启动日志会打印剩余空间，低于 512 MiB 时给 WARN。
+
+### 文件树镜像（v0.8 修复）
+
+内容寻址存储里**只有分块 blob、没有「整文件 blob」**，因此镜像文件树必须按分块序列拼接：
+`ContentStore::materializeFromChunks()`（先写 `.tmp` 再 rename，逐块读入，内存只约一个分块）。
+旧实现用整文件哈希去 `materialize()` 必然失败（日志 `镜像文件树失败 ... blob missing: <整文件hash>`），
+现已修复——整文件上传 / 分块 `complete` / 新建空文件 / 重命名兜底四处都走分块拼接。
+
+### 大文件传输与内存保护（v0.7）
+
+内存占用与文件大小**解耦**：服务端任何路径都不一次性加载整个文件。
+
+| 规则 | 行为 |
+|---|---|
+| 整文件上传 `POST /api/v1/files` | 请求体 **> 64 MiB → `413`**，报文提示改用分块上传 `/api/v1/uploads/*` |
+| 无 Range 的整文件下载 | 文件 **> 8 MiB → `409`**（`{"error":"...use Range requests","size":N,"max_single_shot":8388608}`），要求客户端分段拉取 |
+| 分块上传 | 单请求体 = 1 个分块（默认 5 MiB，服务端 clamp 到 64 KiB~64 MiB）；总量上限 1 TiB（sanity 上限） |
+| `complete` 合并 | 逐块读取拼接 + 流式算哈希，峰值 ≈ 1 个分块 |
+| 带 Range 的下载 | `readRange` 按分块 seek，只读请求区间，峰值 ≈ 1 个分块 |
+
+> 完整设计（适用场景 / 传输流程 / 内存策略 / 异常与中断处理 / 阈值总览）见
+> [`docs/大文件传输设计.md`](../docs/大文件传输设计.md)。
 
 ### 跑分块冒烟脚本
 
@@ -307,10 +386,34 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke_chunked.sh   # 指定端口
 |---|---|---|---|
 | POST | `/api/v1/dirs` | JSON `{path}` | `201 {path,created:true}` 新建 / `200 {path,exists:true}` 幂等 |
 | GET | `/api/v1/dirs` | — | `{"total":N,"items":[path,...]}` |
+| GET | `/api/v1/tree` | — | `{"total_dirs":N,"total_files":M,"root":[<node>...]}`（见下） |
 | GET | `/api/v1/download` | `?path=dir/name`（百分号编码）或头 `X-CV-Path` | `200` 全文 / `206` Range；未记录 `404`；非法 `400`；越界 `403` |
 
-**边界与校验规则**（`sanitizeRelPath` 统一裁决）：
+#### `GET /api/v1/tree`　嵌套文件树（供客户端文件树选择对话框）
 
+不分页、不鉴权。把 `dir_node` 的全部目录路径 + `file_node` 的 `(dir,name,size,id)` 在内存里按路径段建树（**不写递归 SQL**）：
+
+- 目录节点：`{"type":"dir","name","path","children":[...]}`；`path` 为规范化相对路径（`/` 分隔，根目录为空串不出现在树中）。
+- 文件节点：`{"type":"file","name","path","size","id"}`；`path` 为 `dir/name`（根目录文件即 `name`）。
+- **排序**：每层的子节点**目录在前、文件在后**，同类内按 `name` 字典序升序。
+- **空目录必须出现**：无文件的目录以 `children:[]` 呈现（已被 `dir_node` 登记或仅含文件目录的祖先均会展开）。
+- 统计：`total_dirs` = 非根目录节点数；`total_files` = 文件数（受 `listFiles` 的 500 条上限约束）。
+
+建树数据源：`FileRepository::listDirsAll()`（已登记目录 + 文件所属目录及其全部祖先，去重后返回）与 `listFiles()`；目录/文件的父关系在 C++ 侧按路径段推导，key 上用 `"D:"`/`"F:"` 前缀隔离命名空间，避免同名目录与文件冲突。
+
+```bash
+curl -s localhost:8080/api/v1/tree
+# 返回示例：
+# {"total_dirs":2,"total_files":3,"root":[
+#   {"type":"dir","name":"docs","path":"docs","children":[
+#     {"type":"dir","name":"backup","path":"docs/backup","children":[]},
+#     {"type":"file","name":"readme.txt","path":"docs/readme.txt","size":1234,"id":3}
+#   ]},
+#   {"type":"file","name":"a.txt","path":"a.txt","size":56,"id":1}
+# ]}
+```
+
+**边界与校验规则**（`sanitizeRelPath` 统一裁决）：
 - 拒绝 `.` / `..` 路径段（穿越）、绝对路径（`/` 开头）、盘符 / 冒号、反斜杠 → **403**
 - 拒绝非法字符 `< > : " | ? *` 与控制字符、空路径段（`a//b`）、段尾 `.`/空格、
   Windows 保留设备名（`CON`/`NUL`/`COM1-9`/…，含 `CON.txt` 形态）→ **400**
@@ -348,7 +451,7 @@ curl -s "localhost:8080/api/v1/download?path=..%2Fsecret" -o -              # 40
 - 整文件上传 / 列表 / 下载（下载支持 `Range: bytes=` → `206`）
 - 分块上传协议 + 断点续传 + 秒传：`init` → `PUT chunk` → `complete` → `DELETE`，含会话复用、DB+磁盘双重校验自愈、闲置会话 GC
 - 端到端冒烟脚本 `testdata/smoke_chunked.sh`（覆盖续传 / 秒传 / 空文件 / Range）
-- 边界受限目录树：`POST/GET /api/v1/dirs` + 按路径下载 `GET /api/v1/download`
+- 边界受限目录树：`POST/GET /api/v1/dirs`、嵌套文件树 `GET /api/v1/tree`、按路径下载 `GET /api/v1/download`
   （路径规范化清洗、`..`/绝对路径/符号链接拒绝、越界 403）
 
 **明确未实现（后续模块）**

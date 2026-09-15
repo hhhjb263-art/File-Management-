@@ -97,6 +97,12 @@ CREATE TABLE IF NOT EXISTS upload_dir (
   upload_id INTEGER PRIMARY KEY,
   dir       TEXT NOT NULL DEFAULT ''
 );
+
+-- 分块上传会话的附加标志：overwrite=1 表示 complete 时覆盖同目录同名文件
+CREATE TABLE IF NOT EXISTS upload_flags (
+  upload_id INTEGER PRIMARY KEY,
+  overwrite INTEGER NOT NULL DEFAULT 0
+);
 )SQL";
 
 }  // namespace cv

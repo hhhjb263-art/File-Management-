@@ -7,7 +7,10 @@ namespace cv {
 
 // 服务端配置。优先级：命令行 > 环境变量 > 配置文件 > 内置默认值。
 struct Config {
-  std::string dataDir = "/var/lib/cloudvault";  // 数据根目录
+  std::string dataDir = "/var/lib/cloudvault";  // 数据根目录（元数据/临时/内容库）
+  // 文件树允许根（客户端可见的目录树根）。为空则取 <dataDir>/files。
+  // 显式配置而非由进程运行目录推导 —— 服务端从任何 cwd 启动，落点都一致。
+  std::string filesRoot = "";
   std::string listenAddr = "0.0.0.0";
   int port = 8080;
   int workers = 4;                 // HTTP 工作线程数
@@ -18,6 +21,10 @@ struct Config {
   std::string dbPath() const { return dataDir + "/meta/cloudvault.db"; }
   std::string blobRoot() const { return dataDir + "/blobs"; }
   std::string tmpRoot() const { return dataDir + "/tmp"; }
+  // 文件树允许根（唯一可被客户端创建目录 / 上传 / 下载的物理目录）
+  std::string filesRootDir() const {
+    return filesRoot.empty() ? dataDir + "/files" : filesRoot;
+  }
 };
 
 // 解析 argc/argv、环境变量（CV_*）与 --config 指定的 key=value 文件。

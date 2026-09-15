@@ -208,10 +208,37 @@ bool UploadRepository::getDir(std::int64_t id, std::string& out, std::string& er
   return true;  // 无行 = 未登记目录，返回空串即可
 }
 
+bool UploadRepository::setOverwrite(std::int64_t id, bool overwrite, std::string& err) {
+  Stmt stmt(db_.handle(),
+            "INSERT INTO upload_flags (upload_id, overwrite) VALUES (?, ?) "
+            "ON CONFLICT(upload_id) DO UPDATE SET overwrite = excluded.overwrite",
+            err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, id) || !stmt.bind(2, static_cast<std::int64_t>(overwrite ? 1 : 0))) {
+    err = "bind failed";
+    return false;
+  }
+  return stmt.step(err) == SQLITE_DONE;
+}
+
+bool UploadRepository::getOverwrite(std::int64_t id, bool& out, std::string& err) {
+  out = false;
+  Stmt stmt(db_.handle(), "SELECT overwrite FROM upload_flags WHERE upload_id = ?", err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, id)) {
+    err = "bind failed";
+    return false;
+  }
+  if (stmt.step(err) == SQLITE_ROW) out = stmt.int64(0) != 0;
+  return true;   // 无行 = 未登记，按 false 处理
+}
+
 bool UploadRepository::removeSession(std::int64_t id, std::string& err) {
   if (!deleteChunks(id, err)) return false;
   Stmt dir(db_.handle(), "DELETE FROM upload_dir WHERE upload_id = ?", err);
   if (dir.ok() && dir.bind(1, id)) dir.step(err);
+  Stmt flg(db_.handle(), "DELETE FROM upload_flags WHERE upload_id = ?", err);
+  if (flg.ok() && flg.bind(1, id)) flg.step(err);
   Stmt stmt(db_.handle(), "DELETE FROM upload_session WHERE upload_id = ?", err);
   if (!stmt.ok()) return false;
   if (!stmt.bind(1, id)) {

@@ -221,4 +221,150 @@ bool ContentStore::materialize(const std::string& hex, const std::string& target
   return true;
 }
 
+bool ContentStore::materializeChunked(const std::vector<std::string>& chunkHashes,
+                                      const std::string& targetAbs, std::string& err) {
+  for (const std::string& h : chunkHashes) {
+    if (!validHash(h)) {
+      err = "invalid chunk hash";
+      return false;
+    }
+    if (!exists(h)) {
+      err = "blob missing: " + h;
+      return false;
+    }
+  }
+  std::error_code ec;
+  fs::path dst = fs::path(targetAbs);
+  fs::path tmp = dst;
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+      err = "cannot open tmp for write: " + tmp.string();
+      return false;
+    }
+    for (const std::string& h : chunkHashes) {
+      std::ifstream in(pathOf(h), std::ios::binary);
+      if (!in.is_open()) {
+        err = "cannot open blob: " + h;
+        fs::remove(tmp, ec);
+        return false;
+      }
+      out << in.rdbuf();   // 逐块流式拼接：峰值 ≈ 1 个分块，不整文件入内存
+      if (!out.good()) {
+        err = "write failed: " + tmp.string();
+        fs::remove(tmp, ec);
+        return false;
+      }
+    }
+    out.flush();
+    if (!out.good()) {
+      err = "flush failed: " + tmp.string();
+      fs::remove(tmp, ec);
+      return false;
+    }
+  }
+  fs::remove(dst, ec);
+  fs::rename(tmp, dst, ec);
+  if (ec) {
+    fs::remove(tmp, ec);
+    err = "rename failed: " + ec.message();
+    return false;
+  }
+  return true;
+}
+
+bool ContentStore::materializeFromChunks(const std::vector<std::string>& chunkHashes,
+                                        const std::string& targetAbs, std::string& err) {
+  if (targetAbs.empty()) {
+    err = "empty target path";
+    return false;
+  }
+  const std::string tmp = targetAbs + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+      err = "cannot open tmp for write: " + tmp;
+      return false;
+    }
+    // 逐块读入写出：任何时刻内存里只有一个分块
+    for (const std::string& h : chunkHashes) {
+      if (!validHash(h)) {
+        out.close();
+        std::error_code rec;
+        fs::remove(tmp, rec);
+        err = "invalid chunk hash";
+        return false;
+      }
+      std::ifstream in(pathOf(h), std::ios::binary);
+      if (!in.is_open()) {
+        out.close();
+        std::error_code rec;
+        fs::remove(tmp, rec);
+        err = "chunk blob missing: " + h;
+        return false;
+      }
+      out << in.rdbuf();
+      if (!out.good()) {
+        out.close();
+        std::error_code rec;
+        fs::remove(tmp, rec);
+        err = "write failed: " + tmp;
+        return false;
+      }
+    }
+    out.flush();
+    if (!out.good()) {
+      out.close();
+      std::error_code rec;
+      fs::remove(tmp, rec);
+      err = "flush failed: " + tmp;
+      return false;
+    }
+  }
+  std::error_code ec;
+  fs::remove(targetAbs, ec);
+  fs::rename(tmp, targetAbs, ec);
+  if (ec) {
+    std::error_code rec;
+    fs::remove(tmp, rec);
+    err = "rename failed: " + ec.message();
+    return false;
+  }
+  return true;
+}
+
+bool ContentStore::putFromFile(const std::string& hex, const std::string& srcPath,
+                               std::string& err) {
+  if (!validHash(hex)) {
+    err = "invalid hash";
+    return false;
+  }
+  if (exists(hex)) {
+    return true;   // 内容已去重命中：源文件由调用方清理
+  }
+  std::error_code ec;
+  fs::path dst = fs::path(pathOf(hex));
+  fs::create_directories(dst.parent_path(), ec);
+  if (ec) {
+    err = "create blob dir failed: " + ec.message();
+    return false;
+  }
+  // 同盘 rename = 零拷贝搬移（tmp → blobs），避免 tmp 与 blob 双份占盘
+  ec.clear();
+  fs::rename(fs::path(srcPath), dst, ec);
+  if (!ec) {
+    return true;
+  }
+  // 跨设备等场景：复制后删源
+  std::error_code cec;
+  fs::copy_file(fs::path(srcPath), dst, fs::copy_options::overwrite_existing, cec);
+  if (cec) {
+    err = "move/copy failed: " + cec.message();
+    return false;
+  }
+  fs::remove(fs::path(srcPath), cec);
+  return true;
+}
+
 }  // namespace cv

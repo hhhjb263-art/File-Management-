@@ -66,6 +66,10 @@ class UploadRepository {
   bool setDir(std::int64_t id, const std::string& dir, std::string& err);
   bool getDir(std::int64_t id, std::string& out, std::string& err);
 
+  // 会话覆盖标志：complete 时是否覆盖同目录同名文件
+  bool setOverwrite(std::int64_t id, bool overwrite, std::string& err);
+  bool getOverwrite(std::int64_t id, bool& out, std::string& err);
+
   // 删除会话及其全部分块记录（取消 / GC 用）
   bool removeSession(std::int64_t id, std::string& err);
 

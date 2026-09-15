@@ -45,9 +45,38 @@ class FileRepository {
   bool createDir(const std::string& path, bool& created, std::string& err);
   bool listDirs(std::vector<std::string>& out, std::string& err);
 
+  // 同目录下是否已存在同名文件（excludeId > 0 时排除自身，用于重命名自检）
+  bool nameExists(const std::string& dir, const std::string& name,
+                  std::int64_t excludeId, bool& exists, std::string& err);
+
+  // 重命名（只改 file_node.name；物理镜像由调用方处理）
+  bool renameFile(std::int64_t id, const std::string& newName, std::string& err);
+
+  // 删除：置 deleted=1、删除 file_chunk 链接、递减分块引用计数，并清掉引用计数归零的
+  // 分块行——它们的 hash 通过 orphanHashes 返回，由调用方删除 blob（真正释放磁盘空间）。
+  bool softDelete(std::int64_t id, std::vector<std::string>& orphanHashes, std::string& err);
+
+  // 列出/删除引用计数归零的分块行（GC 用：回收历史残留）
+  bool listOrphanChunkHashes(std::vector<std::string>& out, std::string& err);
+  bool deleteChunkRows(const std::vector<std::string>& hashes, std::string& err);
+
+  // 覆盖内容：保留 id 与名称，替换 content_hash/size 与分块清单（引用计数同步增减）；
+  // 旧内容中引用计数归零的分块 hash 通过 orphanHashes 返回，由调用方删 blob。
+  bool replaceContent(std::int64_t id, std::int64_t size, const std::string& contentHash,
+                      const std::vector<std::string>& chunkHashes,
+                      const std::vector<std::size_t>& chunkSizes,
+                      std::vector<std::string>& orphanHashes, std::string& err);
+
+  // 全部目录路径（已登记目录 dir_node + 文件所属目录 file_dir 及其所有祖先，
+  // 含根 ''），用于文件树建树。祖先展开在 C++ 侧完成，不写递归 SQL。
+  bool listDirsAll(std::vector<std::string>& out, std::string& err);
+
   bool addChunkIfAbsent(const std::string& hash, std::int64_t size, std::string& err);
 
  private:
+  // 清理 ref_count <= 0 的分块行，返回其 hash（调用方删 blob）
+  bool purgeZeroRefChunks(std::vector<std::string>& orphans, std::string& err);
+
   Db& db_;
 };
 
