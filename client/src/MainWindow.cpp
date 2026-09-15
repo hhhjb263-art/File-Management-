@@ -27,6 +27,8 @@
 #include <algorithm>
 
 #include <QCryptographicHash>
+#include <QDesktopServices>
+#include <QProcess>
 #include <QPointer>
 #include <QThreadPool>
 #include <QDir>
@@ -78,7 +80,8 @@ constexpr qint64 kChunkSize = 5 * 1024 * 1024;
 
 // 大文件阈值：超过该大小的文件不再"整文件读进内存"，改走流式/分块路径
 constexpr qint64 kStreamUploadThreshold = 8 * 1024 * 1024;   // 上传 > 8MiB → 分块上传（5MiB/块）
-constexpr qint64 kDownloadChunkSize = 4 * 1024 * 1024;       // 下载每次 Range 只拉 4MiB
+constexpr qint64 kDownloadChunkSize = 8 * 1024 * 1024;       // 下载每次 Range 拉 8MiB
+constexpr int kDownloadConcurrency = 3;                      // 下载并发段数（与上传对齐）
 
 // 流式算哈希 / 读块时的缓冲大小（1 MiB），避免整文件入内存
 constexpr qint64 kHashBufferSize = 1024 * 1024;
@@ -529,11 +532,17 @@ void MainWindow::startNextDownload()
 
     appendLog(QStringLiteral("下载"),
               buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(item.id)), 0, 0,
-              QStringLiteral("开始分段下载 %1（%2）%3")
-                  .arg(item.name, formatSize(item.size),
+              QStringLiteral("开始分段下载 %1（%2，%3 路并发）%4")
+                  .arg(item.name, formatSize(item.size), QString::number(kDownloadConcurrency),
                        offset > 0 ? QStringLiteral("，从 offset=%1 续传").arg(offset) : QString()));
 
-    sendDownloadRange(offset);
+    // 滑动窗口：先填满 N 路在途请求，之后每写完一段补一段
+    m_dlReady.clear();
+    m_dlWriteQueue.clear();
+    m_dlInflight = 0;
+    m_dlWriting = false;
+    m_dlNextReq = offset;
+    pumpDownload();
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +572,7 @@ void MainWindow::onTableContextMenu(const QPoint &pos)
     QAction *aDelete = menu.addAction(QStringLiteral("删除"));
     menu.addSeparator();
     QAction *aDownload = menu.addAction(QStringLiteral("下载"));
+    QAction *aOpenFolder = menu.addAction(QStringLiteral("打开文件夹"));
     QAction *aUpload = menu.addAction(QStringLiteral("上传到此目录"));
     menu.addSeparator();
     QMenu *sortMenu = menu.addMenu(QStringLiteral("排序"));
@@ -577,6 +587,7 @@ void MainWindow::onTableContextMenu(const QPoint &pos)
     aRename->setEnabled(hasRow);
     aDelete->setEnabled(hasRow);
     aDownload->setEnabled(hasRow);
+    aOpenFolder->setEnabled(!m_lastSaveDir.isEmpty() || !m_localPathById.isEmpty());
     if (hasRow) {
         aRename->setText(QStringLiteral("重命名「%1」").arg(name));
         aDelete->setText(QStringLiteral("删除「%1」").arg(name));
@@ -594,6 +605,8 @@ void MainWindow::onTableContextMenu(const QPoint &pos)
         onDeleteFile();
     } else if (picked == aDownload) {
         onDownload();          // 复用多选下载（右键已选中该行）
+    } else if (picked == aOpenFolder) {
+        onOpenFolder();
     } else if (picked == aUpload) {
         onUploadToDir();       // 上传到该行所在目录
     } else if (picked == sName) {
@@ -691,6 +704,32 @@ void MainWindow::onDeleteFile()
     QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/files/%1").arg(id)));
     QNetworkReply *r = sendRequest(req, "DELETE");
     r->setProperty("cvStep", QStringLiteral("delete"));
+}
+
+// 打开本地保存文件夹：优先定位选中行已下载的文件（Windows 资源管理器高亮），
+// 否则打开最近一次下载目录；从未下载过则打开系统"下载"文件夹
+void MainWindow::onOpenFolder()
+{
+    const QString id = currentFileId();
+    const QString file = id.isEmpty() ? QString() : m_localPathById.value(id);
+    if (!file.isEmpty() && QFile::exists(file)) {
+#ifdef Q_OS_WIN
+        QProcess::startDetached(QStringLiteral("explorer.exe"),
+                                {QStringLiteral("/select,") + QDir::toNativeSeparators(file)});
+        return;
+#else
+        QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(file).absolutePath()));
+        return;
+#endif
+    }
+    QString dir = m_lastSaveDir;
+    if (dir.isEmpty() || !QDir(dir).exists()) {
+        dir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+        if (!QDir(dir).exists()) {
+            QDir().mkpath(dir);   // 系统下载文件夹不存在就创建
+        }
+    }
+    QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
 }
 
 // 上传到右键行所在目录（复用批量上传流程，仅把目标目录固定为 m_ctxDir）
@@ -980,7 +1019,13 @@ void MainWindow::onResumableDownload()
                       .arg(partPath).arg(offset));
     }
 
-    sendDownloadRange(offset);
+    // 滑动窗口（与批量下载同一套）
+    m_dlReady.clear();
+    m_dlWriteQueue.clear();
+    m_dlInflight = 0;
+    m_dlWriting = false;
+    m_dlNextReq = offset;
+    pumpDownload();
 }
 
 void MainWindow::onClearLog()
@@ -1850,21 +1895,69 @@ void MainWindow::handleDownloadChunkReply(int status, bool networkError, const Q
         return;
     }
 
-    // 206：先校验服务端返回起点与本地断点 offset 一致，再追加写入 .part
-    if (dlStart >= 0 && dlStart != m_dlOffset) {
-        appendLog(QStringLiteral("下载"),
-                  buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(m_dlId)), status, 0,
-                  QStringLiteral("[下载失败] 服务端返回起点 %1 与本地断点 %2 不一致，"
-                                 "终止以免写坏 .part")
-                      .arg(dlStart).arg(m_dlOffset));
-        finishDownload(false);
-        return;
+    // 206：并发窗口 —— 段到达后先缓存，按序写盘（保证 .part 顺序追加，断点续传语义不变）
+    if (m_dlInflight > 0) {
+        --m_dlInflight;
     }
     if (dlTotal > 0) {
         m_dlTotal = dlTotal;   // 以 Content-Range 的 total 为准
     }
-    // 落盘放到线程池（每段 4MiB 写盘不该阻塞 UI）；写完回主线程推进进度/下一段
-    appendDownloadSegmentAsync(raw, m_dlOffset);
+    const qint64 segStart = dlStart;
+    if (segStart < 0 || segStart < m_dlOffset || m_dlReady.contains(segStart)) {
+        // 过期/重复段（起点低于已写位置）：直接丢弃，不动 .part
+    } else {
+        m_dlReady.insert(segStart, raw);
+    }
+    drainDownloadReady();
+    maybeStartWrite();
+    pumpDownload();      // 写盘进行中也不闲着，补满请求窗口
+    checkDownloadDone();
+}
+
+// 补发在途请求，把下载窗口填满（kDownloadConcurrency 路）
+void MainWindow::pumpDownload()
+{
+    while (m_dlActive && !m_cancelRequested && m_dlInflight < kDownloadConcurrency
+           && (m_dlTotal <= 0 || m_dlNextReq < m_dlTotal)) {
+        sendDownloadRange(m_dlNextReq);
+        ++m_dlInflight;
+        m_dlNextReq += kDownloadChunkSize;
+    }
+}
+
+// 把「起点恰好等于待写位置」的连续段移入写盘队列（乱序到达的先缓存）
+void MainWindow::drainDownloadReady()
+{
+    for (auto it = m_dlReady.begin(); it != m_dlReady.end();) {
+        if (it.key() != m_dlOffset) {
+            break;   // 段序还没接上
+        }
+        m_dlWriteQueue.append(qMakePair(it.key(), it.value()));
+        it = m_dlReady.erase(it);
+    }
+}
+
+// 写盘串行化：一次只写一段（防乱序写坏 .part），写完由回调推进
+void MainWindow::maybeStartWrite()
+{
+    if (m_dlWriting || m_dlWriteQueue.isEmpty() || !m_dlActive) {
+        return;
+    }
+    const auto seg = m_dlWriteQueue.takeFirst();
+    m_dlWriting = true;
+    appendDownloadSegmentAsync(seg.second, seg.first);
+}
+
+// 全部段都写完（且没有在途请求）→ 收尾
+void MainWindow::checkDownloadDone()
+{
+    if (!m_dlActive || m_dlWriting || m_dlInflight > 0 || !m_dlReady.isEmpty()
+        || !m_dlWriteQueue.isEmpty()) {
+        return;
+    }
+    if (m_dlTotal > 0 && m_dlOffset >= m_dlTotal) {
+        finalizeDownload();
+    }
 }
 
 // 后台追加写下载段（先 seek 到 offset 再写，支持断点续传语义）
@@ -1921,11 +2014,15 @@ void MainWindow::onDownloadSegmentWritten(bool ok, const QString &err, qint64 by
                                  .arg(formatSize(m_dlOffset)).arg(formatSize(m_dlTotal))
                                  .arg(pct).arg(QLatin1Char('%')));
 
+    m_dlWriting = false;
     if (m_dlTotal > 0 && m_dlOffset >= m_dlTotal) {
-        finalizeDownload();
-    } else {
-        sendDownloadRange(m_dlOffset);   // 继续下一段
+        finalizeDownload();   // 全部写完（在途段不会越过 total）
+        return;
     }
+    drainDownloadReady();
+    maybeStartWrite();
+    pumpDownload();
+    checkDownloadDone();
 }
 
 // 校验大小，把 .part 重命名为正式文件
@@ -1941,6 +2038,8 @@ void MainWindow::finalizeDownload()
         QFile::remove(m_dlFinalPath);
     }
     QFile::rename(m_dlPartPath, m_dlFinalPath);
+    m_localPathById.insert(m_dlId, m_dlFinalPath);   // 供右键"打开文件夹"定位
+    m_lastSaveDir = QFileInfo(m_dlFinalPath).absolutePath();
     appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_dlFinalPath), 200, 0,
               QStringLiteral("已保存 id=%1 到 %2（%3）")
                   .arg(m_dlId, m_dlFinalPath, formatSize(m_dlOffset)));
@@ -1950,6 +2049,10 @@ void MainWindow::finalizeDownload()
 void MainWindow::finishDownload(bool ok)
 {
     m_dlActive = false;
+    m_dlReady.clear();
+    m_dlWriteQueue.clear();
+    m_dlInflight = 0;
+    m_dlWriting = false;
     updateProgress();
 
     if (m_dlBatch) {

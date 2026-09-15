@@ -2,8 +2,10 @@
 
 #include <QElapsedTimer>
 #include <QHash>
+#include <QHash>
 #include <QList>
 #include <QMainWindow>
+#include <QMap>
 #include <QPair>
 #include <QSet>
 #include <QString>
@@ -107,6 +109,7 @@ private slots:
     void onRenameFile();     // 重命名选中文件（POST /api/v1/files/:id/rename）
     void onDeleteFile();     // 删除选中文件（DELETE /api/v1/files/:id）
     void onUploadToDir();    // 上传到选中行所在目录
+    void onOpenFolder();     // 打开本地保存文件夹（定位已下载文件）
     void onSelectionChanged();   // 列表选中行变化 -> 拉取并渲染预览
     void onForcePreview();       // 【仍要预览】超过体积上限时由用户显式确认
     void onReplyFinished(QNetworkReply *reply);
@@ -164,6 +167,11 @@ private:
     // ---- 批量上传 / 下载（多选）----
     void startNextUpload();      // 顺序处理队列中的下一个本地文件（小文件整传、大文件分块）
     void startNextDownload();    // 顺序下载队列中的下一个服务器文件（Range 分段）
+    // 下载滑动窗口（并发拉取多段，按序落盘；.part 追加语义不变，断点续传仍有效）
+    void pumpDownload();          // 补发在途请求，保持窗口满
+    void drainDownloadReady();    // 把按序就绪的段移入写盘队列
+    void maybeStartWrite();       // 写盘队列空闲则启动下一段写
+    void checkDownloadDone();     // 全部段写完 → finalize
     void showStatus(const QString &text, bool ok);   // 顶部 ✓/✗ 简化结果标识
     void refreshStorage();       // GET /api/v1/storage：刷新"服务器剩余空间"显示
     void applyStorageInfo(const QByteArray &raw);   // 解析并更新空间标签
@@ -297,6 +305,15 @@ private:
     int m_dlOk = 0;
     int m_dlFail = 0;
     bool m_dlBatch = false;       // 是否处于批量下载中
+    // ---- 下载滑动窗口状态 ----
+    QMap<qint64, QByteArray> m_dlReady;      // 已到达、等待按序写盘的段（起点 → 数据）
+    QList<QPair<qint64, QByteArray>> m_dlWriteQueue;  // 按序写盘队列（保证 .part 顺序）
+    int m_dlInflight = 0;         // 在途请求数
+    qint64 m_dlNextReq = 0;       // 下一段请求起点
+    bool m_dlWriting = false;     // 是否有写盘任务在途（写盘串行化，防乱序）
+    // ---- 本地保存位置记录（右键"打开文件夹"用）----
+    QString m_lastSaveDir;        // 最近一次下载目录
+    QHash<QString, QString> m_localPathById;   // file_id → 本地已下载路径
 
     // ---- 文件列表数据模型 ----
     QList<RowData> m_rows;        // 表格数据源（排序后重建渲染）
