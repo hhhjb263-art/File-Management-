@@ -146,6 +146,8 @@ private:
     void startNextUpload();      // 顺序处理队列中的下一个本地文件（小文件整传、大文件分块）
     void startNextDownload();    // 顺序下载队列中的下一个服务器文件（Range 分段）
     void showStatus(const QString &text, bool ok);   // 顶部 ✓/✗ 简化结果标识
+    void refreshStorage();       // GET /api/v1/storage：刷新"服务器剩余空间"显示
+    void applyStorageInfo(const QByteArray &raw);   // 解析并更新空间标签
     // 建立一次分块上传会话（流式：5MiB/块，绝不整文件入内存）；失败时 err 非空
     bool beginChunkedUploadFor(const QString &path, const QString &dir, QString *err);
     // 发送单个小文件（整文件 POST）；overwrite=true 时带 X-CV-Overwrite 覆盖同名
@@ -197,6 +199,8 @@ private:
     QPushButton *m_cancelUploadBtn = nullptr;  // 【取消上传】
     QPushButton *m_dlResumeBtn = nullptr;       // 【分块下载（断点续传）】
     QLabel *m_statusLabel = nullptr;            // 顶部结果标识（✓ 成功 / ✗ 失败）
+    QLabel *m_spaceLabel = nullptr;             // 顶部：服务器剩余空间显示
+    QTimer *m_spaceTimer = nullptr;             // 空间显示定时刷新
     QProgressBar *m_progressBar = nullptr;     // 分块上传进度：已传块数 / 总块数
     QLabel *m_progressLabel = nullptr;         // 进度文案（含 upload_id / 续传命中）
     QTableWidget *m_table = nullptr;

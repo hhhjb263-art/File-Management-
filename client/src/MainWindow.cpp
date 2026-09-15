@@ -132,6 +132,13 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     mainLayout->addWidget(m_log, 1);
 
     setCentralWidget(center);
+
+    // 服务器剩余空间：启动即查询一次，之后每 60 秒自动刷新
+    m_spaceTimer = new QTimer(this);
+    m_spaceTimer->setInterval(60 * 1000);
+    connect(m_spaceTimer, &QTimer::timeout, this, &MainWindow::refreshStorage);
+    m_spaceTimer->start();
+    QTimer::singleShot(0, this, [this] { refreshStorage(); });
 }
 
 // ---------------------------------------------------------------------------
@@ -190,11 +197,14 @@ QWidget *MainWindow::createTopBar()
     m_progressBar->setValue(0);
     m_progressBar->setMinimumWidth(200);
     m_statusLabel = new QLabel(QString(), row2);   // 成功/失败的简化标识
+    m_spaceLabel = new QLabel(QStringLiteral("服务器空间：查询中…"), row2);   // 剩余空间
+    m_spaceLabel->setToolTip(QStringLiteral("来自 GET /api/v1/storage；每 60 秒自动刷新"));
     QHBoxLayout *layout2 = new QHBoxLayout(row2);
     layout2->setContentsMargins(0, 0, 0, 0);
     layout2->addWidget(m_progressLabel);
     layout2->addWidget(m_progressBar, 1);
     layout2->addWidget(m_statusLabel);
+    layout2->addWidget(m_spaceLabel);
 
     barLayout->addWidget(row1);
     barLayout->addWidget(row2);
@@ -350,6 +360,7 @@ void MainWindow::startNextUpload()
                                        .arg(m_upOk)
                                        .arg(m_upFail),
                    m_upFail == 0);
+        refreshStorage();   // 上传占用了空间，刷新显示
         return;
     }
     const QString path = m_upQueue.takeFirst();
@@ -735,11 +746,19 @@ void MainWindow::handleRenameReply(int status, const QByteArray &raw)
 
 void MainWindow::handleDeleteReply(int status, const QByteArray &raw)
 {
-    if (status == 204) {
+    if (status == 200 || status == 204) {
+        qint64 freed = 0;
+        if (status == 200) {
+            const QJsonObject o = QJsonDocument::fromJson(raw).object();
+            freed = o.value(QStringLiteral("freed_bytes")).toVariant().toLongLong();
+        }
         appendLog(QStringLiteral("删除"), buildUrl(QStringLiteral("/api/v1/files")), status, 0,
-                  QStringLiteral("✓ 已删除"));
-        showStatus(QStringLiteral("✓ 删除成功"), true);
+                  QStringLiteral("✓ 已删除（释放 %1）").arg(formatSize(freed)));
+        showStatus(freed > 0 ? QStringLiteral("✓ 删除成功，释放 %1").arg(formatSize(freed))
+                             : QStringLiteral("✓ 删除成功"),
+                   true);
         onListFiles();
+        refreshStorage();   // 空间变化了，刷新显示
         return;
     }
     showStatus(QStringLiteral("✗ 删除失败"), false);
@@ -1347,6 +1366,10 @@ void MainWindow::handleChunkedReply(const QString &step, int seq, int status, bo
     if (step == QStringLiteral("dlchunk")) {
         // 分块下载必须在取消守卫之前分派：下载会话与上传会话互不相干
         handleDownloadChunkReply(status, networkError, errorString, raw, dlTotal, dlStart);
+        return;
+    }
+    if (step == QStringLiteral("storage")) {
+        applyStorageInfo(raw);
         return;
     }
     if (step == QStringLiteral("newfile")) {
@@ -2160,6 +2183,33 @@ void MainWindow::handleListReply(const QByteArray &raw)
         m_previewId.clear();
         resetPreview();
     }
+}
+
+// 查询服务器剩余空间并更新顶部标签（GET /api/v1/storage）
+void MainWindow::refreshStorage()
+{
+    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/storage")));
+    QNetworkReply *r = sendRequest(req, "GET");
+    r->setProperty("cvStep", QStringLiteral("storage"));
+}
+
+void MainWindow::applyStorageInfo(const QByteArray &raw)
+{
+    const QJsonObject o = QJsonDocument::fromJson(raw).object();
+    const qint64 freeB = o.value(QStringLiteral("free_bytes")).toVariant().toLongLong();
+    const qint64 totalB = o.value(QStringLiteral("total_bytes")).toVariant().toLongLong();
+    if (freeB < 0) {
+        m_spaceLabel->setText(QStringLiteral("服务器空间：不可用"));
+        return;
+    }
+    const int pct = totalB > 0 ? static_cast<int>(freeB * 100LL / totalB) : 0;
+    m_spaceLabel->setText(QStringLiteral("服务器剩余：%1 / %2（%3%%4）")
+                              .arg(formatSize(freeB), formatSize(totalB))
+                              .arg(pct).arg(QLatin1Char('%')));
+    // 低于 10%（或不足 512MiB）标红提示
+    const bool low = (totalB > 0 && pct < 10) || (freeB < 512LL * 1024 * 1024);
+    m_spaceLabel->setStyleSheet(low ? QStringLiteral("color:#cf222e; font-weight:bold;")
+                                    : QStringLiteral("color:#57606a;"));
 }
 
 // 顶部结果标识：✓ 绿色 / ✗ 红色（简化反馈，不用看日志也能判断成败）

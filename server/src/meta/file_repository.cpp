@@ -194,22 +194,121 @@ bool FileRepository::renameFile(std::int64_t id, const std::string& newName,
   return stmt.step(err) == SQLITE_DONE;
 }
 
-bool FileRepository::softDelete(std::int64_t id, std::string& err) {
-  if (!db_.exec("BEGIN IMMEDIATE", err)) return false;
+// 清理 ref_count <= 0 的分块行，返回其 hash（blob 由调用方删除）
+bool FileRepository::purgeZeroRefChunks(std::vector<std::string>& orphans, std::string& err) {
+  orphans.clear();
   {
-    // 先递减引用计数（blob 保留，交由后续 GC 回收）
-    Stmt dec(db_.handle(),
-             "UPDATE chunk SET ref_count = ref_count - 1 WHERE hash IN "
-             "(SELECT chunk_hash FROM file_chunk WHERE file_id = ?)",
+    // 安全网：只回收「引用计数归零 且 已无任何 file_chunk 引用」的分块，
+    // 防止引用计数万一漂移时误删仍在被使用的 blob
+    Stmt sel(db_.handle(),
+             "SELECT hash FROM chunk WHERE ref_count <= 0 "
+             "AND hash NOT IN (SELECT chunk_hash FROM file_chunk)",
              err);
-    if (!dec.ok() || !dec.bind(1, id) || dec.step(err) != SQLITE_DONE) {
-      err = err.empty() ? "chunk ref decrement failed" : err;
-      db_.exec("ROLLBACK", err);
+    if (!sel.ok()) return false;
+    while (true) {
+      const int rc = sel.step(err);
+      if (rc == SQLITE_DONE) break;
+      if (rc != SQLITE_ROW) return false;
+      orphans.push_back(sel.text(0));
+    }
+  }
+  if (orphans.empty()) return true;
+  Stmt del(db_.handle(),
+           "DELETE FROM chunk WHERE ref_count <= 0 "
+           "AND hash NOT IN (SELECT chunk_hash FROM file_chunk)",
+           err);
+  if (!del.ok()) return false;
+  return del.step(err) == SQLITE_DONE;
+}
+
+bool FileRepository::listOrphanChunkHashes(std::vector<std::string>& out, std::string& err) {
+  out.clear();
+  Stmt sel(db_.handle(),
+           "SELECT hash FROM chunk WHERE ref_count <= 0 "
+           "AND hash NOT IN (SELECT chunk_hash FROM file_chunk)",
+           err);
+  if (!sel.ok()) return false;
+  while (true) {
+    const int rc = sel.step(err);
+    if (rc == SQLITE_DONE) break;
+    if (rc != SQLITE_ROW) return false;
+    out.push_back(sel.text(0));
+  }
+  return true;
+}
+
+bool FileRepository::deleteChunkRows(const std::vector<std::string>& hashes,
+                                     std::string& err) {
+  for (const std::string& h : hashes) {
+    Stmt del(db_.handle(), "DELETE FROM chunk WHERE hash = ?", err);
+    if (!del.ok() || !del.bind(1, h) || del.step(err) != SQLITE_DONE) {
+      err = err.empty() ? "delete chunk row failed" : err;
       return false;
     }
-    Stmt stmt(db_.handle(), "UPDATE file_node SET deleted = 1 WHERE id = ?", err);
-    if (!stmt.ok() || !stmt.bind(1, id) || stmt.step(err) != SQLITE_DONE) {
-      err = err.empty() ? "mark deleted failed" : err;
+  }
+  return true;
+}
+
+bool FileRepository::softDelete(std::int64_t id, std::vector<std::string>& orphanHashes,
+                                std::string& err) {
+  orphanHashes.clear();
+  if (!db_.exec("BEGIN IMMEDIATE", err)) return false;
+  {
+    // 1) 收集该文件的分块 hash
+    std::vector<std::string> hashes;
+    {
+      Stmt sel(db_.handle(), "SELECT chunk_hash FROM file_chunk WHERE file_id = ?", err);
+      if (!sel.ok() || !sel.bind(1, id)) {
+        err = err.empty() ? "select file_chunk failed" : err;
+        db_.exec("ROLLBACK", err);
+        return false;
+      }
+      while (true) {
+        const int rc = sel.step(err);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+          db_.exec("ROLLBACK", err);
+          return false;
+        }
+        hashes.push_back(sel.text(0));
+      }
+    }
+    // 2) 删除 file_chunk 链接（否则引用计数/GC 会重复处理同一批分块）
+    {
+      Stmt del(db_.handle(), "DELETE FROM file_chunk WHERE file_id = ?", err);
+      if (!del.ok() || !del.bind(1, id) || del.step(err) != SQLITE_DONE) {
+        err = err.empty() ? "delete file_chunk failed" : err;
+        db_.exec("ROLLBACK", err);
+        return false;
+      }
+    }
+    // 3) 逐个递减引用计数
+    for (const std::string& h : hashes) {
+      Stmt dec(db_.handle(), "UPDATE chunk SET ref_count = ref_count - 1 WHERE hash = ?",
+               err);
+      if (!dec.ok() || !dec.bind(1, h) || dec.step(err) != SQLITE_DONE) {
+        err = err.empty() ? "chunk ref decrement failed" : err;
+        db_.exec("ROLLBACK", err);
+        return false;
+      }
+    }
+    // 4) 标记文件删除 + 清理所属目录关联行
+    {
+      Stmt stmt(db_.handle(), "UPDATE file_node SET deleted = 1 WHERE id = ?", err);
+      if (!stmt.ok() || !stmt.bind(1, id) || stmt.step(err) != SQLITE_DONE) {
+        err = err.empty() ? "mark deleted failed" : err;
+        db_.exec("ROLLBACK", err);
+        return false;
+      }
+      Stmt dirDel(db_.handle(), "DELETE FROM file_dir WHERE file_id = ?", err);
+      if (!dirDel.ok() || !dirDel.bind(1, id) || dirDel.step(err) != SQLITE_DONE) {
+        err = err.empty() ? "delete file_dir failed" : err;
+        db_.exec("ROLLBACK", err);
+        return false;
+      }
+    }
+    // 5) 清理引用计数归零的分块行 → hash 交调用方删 blob（真正释放磁盘空间）
+    if (!purgeZeroRefChunks(orphanHashes, err)) {
       db_.exec("ROLLBACK", err);
       return false;
     }
@@ -225,7 +324,9 @@ bool FileRepository::replaceContent(std::int64_t id, std::int64_t size,
                                     const std::string& contentHash,
                                     const std::vector<std::string>& chunkHashes,
                                     const std::vector<std::size_t>& chunkSizes,
+                                    std::vector<std::string>& orphanHashes,
                                     std::string& err) {
+  orphanHashes.clear();
   if (!db_.exec("BEGIN IMMEDIATE", err)) return false;
   {
     Stmt dec(db_.handle(),

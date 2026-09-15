@@ -237,7 +237,7 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke.sh   # 指定其他端口
 | GET | `/api/v1/download` | 按路径下载（仅限已记录文件，严格越界校验） |
 | POST | `/api/v1/files/new` | 新建空文件 `{dir,name}`；同目录同名 → **409** |
 | POST | `/api/v1/files/:id/rename` | 重命名 `{name}`；同名 → **409**；同名幂等返回 200 |
-| DELETE | `/api/v1/files/:id` | 软删除（置 `deleted=1`、递减分块引用计数、移除镜像文件）→ **204** |
+| DELETE | `/api/v1/files/:id` | 删除并**回收空间** → `200 {deleted:true,file_id,name,dir,freed_bytes,blobs_removed,disk_free_bytes}` |
 
 **同名检测与覆盖**：
 - 整文件上传 `POST /api/v1/files`、新建文件、重命名、分块 `init` 都会做**同目录同名检测**；
@@ -314,6 +314,20 @@ sha256sum /tmp/demo.bin /tmp/out.bin        # 两个哈希必须相同
 ### 下载 Range 支持
 
 `GET /api/v1/files/:id/content` 支持 `Range: bytes=start-end` 与 `bytes=start-`（含后缀 `bytes=-N`）：命中返回 `206` + `Accept-Ranges: bytes` + `Content-Range: bytes start-end/total`，并按分块 seek 读取**仅请求区间**（内存只约一个分块），不整文件入内存。
+
+### 删除与空间回收（v0.8 修正）
+
+`DELETE /api/v1/files/:id` 现在会**真正释放磁盘**：
+
+1. `file_node.deleted = 1`（标记删除，列表不再返回）
+2. 删除该文件的 `file_chunk` 链接行 + `file_dir` 归属行（不留悬空引用）
+3. 逐个递减 `chunk.ref_count`；**引用计数归零且无任何 `file_chunk` 引用**的分块行被清理
+   （安全网：即使计数漂移也不会误删仍在使用的 blob）
+4. 删除这些分块的 blob 文件（`blobs/xx/<hash>`）+ 删除镜像文件
+5. 响应返回实际释放字节数 `freed_bytes`、删除的 blob 数 `blobs_removed` 与当前 `disk_free_bytes`
+
+> 去重共享的内容不会被误删：只要还有别的文件引用该分块，`ref_count > 0`，blob 保留。
+> 覆盖上传（同名覆盖）走 `replaceContent`，同样会回收旧内容中归零的分块。
 
 ### 存储空间预检（v0.8）
 

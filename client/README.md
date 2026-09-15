@@ -127,7 +127,9 @@ build\cloudvault-client.exe
 ### 界面
 
 - **顶部**：服务器地址输入框（默认 `http://172.20.32.231:8080`）+ 七个按钮 +
-  第二行的 **进度条 + 进度文案 + ✓/✗ 结果标识**
+  第二行的 **进度条 + 进度文案 + ✓/✗ 结果标识 + 服务器剩余空间**
+  （空间来自 `GET /api/v1/storage`，启动即查、每 60 秒自动刷新、上传/删除后立即刷新；
+  低于 10% 或不足 512 MiB 时标红）
 - **中部**：由一条可拖拽的分隔条分成左右两栏
   - **左**：文件列表，列为 `ID / 名称 / 大小 / 时间 / Hash 前 8 位 / 是否秒传`（**支持多选**）
   - **右**：**预览侧边栏**（详见第 4.1 节），选中一行即预览该文件内容
@@ -423,7 +425,7 @@ mkdir -p /tmp/cvdata
 | POST | `/api/v1/files` | body = 文件原始字节；请求头 `X-CV-Name` / `X-CV-Dir` = 百分号编码；覆盖时加 `X-CV-Overwrite: 1` | `201` 新建 / `200` 覆盖（均 `{id,name,dir,size,hash,chunks,instant[,overwritten]}`）；同名未覆盖 → `409 {exists:true,...}` |
 | POST | `/api/v1/files/new` | JSON `{dir,name}` | `201 {id,name,dir,size:0,hash}`；同名 → `409 {exists:true,...}`；名称非法 → `400` |
 | POST | `/api/v1/files/:id/rename` | JSON `{name}` | `200 {id,name,dir}`；同名 → `409 {exists:true,...}`；与原同名 → `200`（幂等） |
-| DELETE | `/api/v1/files/:id` | — | `204`（软删除 + 移除镜像文件） |
+| DELETE | `/api/v1/files/:id` | — | `200 {deleted,file_id,name,dir,freed_bytes,blobs_removed,disk_free_bytes}`（删除并回收 blob 空间；客户端提示"释放 X"并刷新空间显示） |
 | GET | `/api/v1/storage` | — | `{data_dir,files_root,free_bytes,total_bytes,upload_safety_factor}` |
 
 > **服务器空间不足**：上传（整文件 / 分块 `init`）会先做空间预检，不足返回 **507**；

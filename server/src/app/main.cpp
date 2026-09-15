@@ -331,6 +331,23 @@ bool checkSpaceForUpload(const cv::Config& cfg, std::int64_t size,
   return true;
 }
 
+// 删除一批「引用计数归零」的 blob，返回实际释放的字节数（失败仅告警，不阻断主流程）
+std::int64_t dropOrphanBlobs(cv::ContentStore& store,
+                             const std::vector<std::string>& orphanHashes) {
+  std::int64_t freed = 0;
+  for (const std::string& h : orphanHashes) {
+    std::error_code sec;
+    const auto sz = fs::file_size(store.pathOf(h), sec);
+    std::string derr;
+    if (store.drop(h, derr)) {
+      if (!sec) freed += static_cast<std::int64_t>(sz);
+    } else {
+      CV_LOG_WARN("删除 blob 失败 " << h << ": " << derr);
+    }
+  }
+  return freed;
+}
+
 // 按文件行提供内容（整文件 / Range 分块复用）。调用方已完成鉴权与存在性检查。
 void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const cv::FileRow& row,
                       const cv::net::Request& req, cv::net::Response& resp) {
@@ -712,10 +729,15 @@ int main(int argc, char** argv) {
     if (nameTaken) {
       // 覆盖：保留原 id 与名称，替换内容与分块清单
       id = sameName.id;
+      std::vector<std::string> orphans;
       if (!repo.replaceContent(id, static_cast<std::int64_t>(data.size()), contentHash,
-                               chunkHashes, chunkSizes, err)) {
+                               chunkHashes, chunkSizes, orphans, err)) {
         resp.setError(500, std::string("db failed: ") + err);
         return;
+      }
+      const std::int64_t freed = dropOrphanBlobs(store, orphans);
+      if (freed > 0) {
+        CV_LOG_INFO("覆盖释放旧内容 blob " << orphans.size() << " 个，" << freed << " 字节");
       }
     } else if (!repo.insertFile(name, dir, static_cast<std::int64_t>(data.size()), contentHash,
                                 chunkHashes, chunkSizes, id, err)) {
@@ -907,14 +929,30 @@ int main(int argc, char** argv) {
                    resp.setError(404, "file not found");
                    return;
                  }
-                 if (!repo.softDelete(id, perr)) {
+                 std::vector<std::string> orphans;
+                 if (!repo.softDelete(id, orphans, perr)) {
                    resp.setError(500, std::string("db failed: ") + perr);
                    return;
                  }
+                 // 释放磁盘空间：删镜像 + 删引用计数归零的 blob
                  std::error_code rec;
+                 const auto mirrorSize = fs::file_size(diskFilePath(cfg, row.dir, row.name), rec);
                  fs::remove(diskFilePath(cfg, row.dir, row.name), rec);
-                 resp.status = 204;
-                 CV_LOG_INFO("删除文件 id=" << id << " dir=" << row.dir << " name=" << row.name);
+                 const std::int64_t freedBlob = dropOrphanBlobs(store, orphans);
+                 const std::int64_t freedMirror = rec ? 0 : static_cast<std::int64_t>(mirrorSize);
+                 json::Value v = json::Value::object();
+                 v.set("deleted", true);
+                 v.set("file_id", static_cast<long long>(id));
+                 v.set("name", row.name);
+                 v.set("dir", row.dir);
+                 v.set("freed_bytes", static_cast<long long>(freedBlob + freedMirror));
+                 v.set("blobs_removed", static_cast<long long>(orphans.size()));
+                 v.set("disk_free_bytes",
+                       static_cast<long long>(diskFreeBytes(cfg.dataDir)));
+                 resp.setJson(200, json::dump(v));
+                 CV_LOG_INFO("删除文件 id=" << id << " dir=" << row.dir << " name=" << row.name
+                                            << " 释放 " << (freedBlob + freedMirror)
+                                            << " 字节（blob " << orphans.size() << " 个）");
                });
 
   // ---- GET /api/v1/storage （磁盘空间自查）----
@@ -1466,10 +1504,16 @@ int main(int argc, char** argv) {
                  perr.clear();
                  if (replace) {
                    fileId = sameName.id;
+                   std::vector<std::string> orphans;
                    if (!repo.replaceContent(fileId, s.size, computed, chunkHashes, chunkSizes,
-                                            perr)) {
+                                            orphans, perr)) {
                      resp.setError(500, std::string("db failed: ") + perr);
                      return;
+                   }
+                   const std::int64_t freed = dropOrphanBlobs(store, orphans);
+                   if (freed > 0) {
+                     CV_LOG_INFO("覆盖释放旧内容 blob " << orphans.size() << " 个，" << freed
+                                                        << " 字节");
                    }
                  } else if (!repo.insertFile(s.name, dir, s.size, computed, chunkHashes,
                                             chunkSizes, fileId, perr)) {
