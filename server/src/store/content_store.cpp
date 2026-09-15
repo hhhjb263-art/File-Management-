@@ -192,4 +192,33 @@ bool ContentStore::readRange(const std::vector<std::string>& chunkHashes,
   return true;
 }
 
+bool ContentStore::materialize(const std::string& hex, const std::string& targetAbs,
+                               std::string& err) {
+  if (!validHash(hex)) {
+    err = "invalid hash";
+    return false;
+  }
+  std::error_code ec;
+  fs::path src = fs::path(pathOf(hex));
+  if (!fs::exists(src, ec)) {
+    err = "blob missing: " + hex;
+    return false;
+  }
+  fs::path dst = fs::path(targetAbs);
+  // 覆盖旧镜像（重传同名文件时保持指向最新内容）
+  fs::remove(dst, ec);
+  // 优先硬链接：同一数据目录内零拷贝；跨设备等场景退回复制
+  ec.clear();
+  fs::create_hard_link(src, dst, ec);
+  if (ec) {
+    std::error_code cec;
+    fs::copy_file(src, dst, fs::copy_options::overwrite_existing, cec);
+    if (cec) {
+      err = "materialize failed: link=" + ec.message() + " copy=" + cec.message();
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace cv

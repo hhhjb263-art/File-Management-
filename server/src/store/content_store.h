@@ -41,6 +41,10 @@ class ContentStore {
   bool readRange(const std::vector<std::string>& chunkHashes, std::int64_t offset,
                  std::int64_t length, std::string& out, std::string& err) const;
 
+  // 把 blob 以硬链接（失败则复制）镜像到 targetAbs（文件树下载语义的物理载体）。
+  // 父目录由调用方创建并完成越界校验；本方法只保证 blob 存在与落位。
+  bool materialize(const std::string& hex, const std::string& targetAbs, std::string& err);
+
  private:
   std::string root_;
 };

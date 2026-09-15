@@ -2,10 +2,12 @@
 //
 // 与服务端约定的接口（详见 server/src/app/main.cpp 与团队冻结契约）：
 //   GET  /healthz                          健康检查
-//   POST /api/v1/files                     整文件上传（body 原样），头 X-CV-Name=文件名百分号编码
-//   GET  /api/v1/files                     列表
+//   POST /api/v1/files                     整文件上传（body 原样），头 X-CV-Name / X-CV-Dir=百分号编码
+//   GET  /api/v1/files                     列表（含 dir）
 //   GET  /api/v1/files/:id                 元数据
 //   GET  /api/v1/files/:id/content         下载；支持 Range: bytes=start- -> 206
+//   GET  /api/v1/download?path=            按路径下载（仅限已记录文件；越界 403）
+//   POST /api/v1/dirs                      创建目录 {path}（201 新建 / 200 幂等 / 400 非法 / 403 越界）
 //
 // 分块上传（断点续传，本文件新增）：
 //   POST   /api/v1/uploads/init            {name,size,chunk_size,hash}
@@ -37,6 +39,7 @@
 #include <QFontDatabase>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -143,6 +146,8 @@ QWidget *MainWindow::createTopBar()
     m_chunkUploadBtn = new QPushButton(QStringLiteral("分块上传（断点续传）"), row1);
     m_cancelUploadBtn = new QPushButton(QStringLiteral("取消上传"), row1);
     m_dlResumeBtn = new QPushButton(QStringLiteral("分块下载（断点续传）"), row1);
+    m_mkdirBtn = new QPushButton(QStringLiteral("创建目录"), row1);
+    m_dlPathBtn = new QPushButton(QStringLiteral("按路径下载"), row1);
     m_clearLogBtn = new QPushButton(QStringLiteral("清空日志"), row1);
 
     connect(m_healthBtn, &QPushButton::clicked, this, &MainWindow::onHealthCheck);
@@ -152,6 +157,8 @@ QWidget *MainWindow::createTopBar()
     connect(m_chunkUploadBtn, &QPushButton::clicked, this, &MainWindow::onChunkedUpload);
     connect(m_cancelUploadBtn, &QPushButton::clicked, this, &MainWindow::onCancelUpload);
     connect(m_dlResumeBtn, &QPushButton::clicked, this, &MainWindow::onResumableDownload);
+    connect(m_mkdirBtn, &QPushButton::clicked, this, &MainWindow::onCreateDir);
+    connect(m_dlPathBtn, &QPushButton::clicked, this, &MainWindow::onDownloadByPath);
     connect(m_clearLogBtn, &QPushButton::clicked, this, &MainWindow::onClearLog);
 
     QHBoxLayout *layout1 = new QHBoxLayout(row1);
@@ -165,6 +172,8 @@ QWidget *MainWindow::createTopBar()
     layout1->addWidget(m_chunkUploadBtn);
     layout1->addWidget(m_cancelUploadBtn);
     layout1->addWidget(m_dlResumeBtn);
+    layout1->addWidget(m_mkdirBtn);
+    layout1->addWidget(m_dlPathBtn);
     layout1->addWidget(m_clearLogBtn);
     layout1->addStretch(1);
 
@@ -285,6 +294,23 @@ void MainWindow::onUpload()
         return;   // 用户取消
     }
 
+    // 目标目录（相对路径；留空 = 根目录）。客户端预检 + 服务端强校验双层防护
+    bool ok = false;
+    QString dir = QInputDialog::getText(this, QStringLiteral("上传目标目录"),
+                                        QStringLiteral("目标目录（相对路径，'/' 分隔；留空 = 根目录）："),
+                                        QLineEdit::Normal, m_lastDir, &ok).trimmed();
+    if (!ok) {
+        return;   // 用户取消
+    }
+    if (!dir.isEmpty()) {
+        QString why;
+        if (!validRelPathInput(dir, &why)) {
+            QMessageBox::warning(this, QStringLiteral("目录不合法"), why);
+            return;
+        }
+    }
+    m_lastDir = dir;
+
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
         QMessageBox::warning(this, QStringLiteral("无法读取文件"), file.errorString());
@@ -300,11 +326,15 @@ void MainWindow::onUpload()
                   QStringLiteral("application/octet-stream"));
     // 文件名按 RFC 3986 百分号编码后放进请求头，服务端会 urlDecode 还原
     req.setRawHeader("X-CV-Name", QUrl::toPercentEncoding(name));
+    if (!dir.isEmpty()) {
+        req.setRawHeader("X-CV-Dir", QUrl::toPercentEncoding(dir));
+    }
     req.setHeader(QNetworkRequest::ContentLengthHeader, data.size());
 
     appendLog(QStringLiteral("POST"), req.url(), 0, 0,
-              QStringLiteral("准备上传：%1（%2，请求头 X-CV-Name=%3）")
+              QStringLiteral("准备上传：%1（%2，目标目录=%3，请求头 X-CV-Name=%4）")
                   .arg(path, formatSize(data.size()),
+                       dir.isEmpty() ? QStringLiteral("(根目录)") : dir,
                        QString::fromUtf8(QUrl::toPercentEncoding(name))));
 
     sendRequest(req, "POST", data);
@@ -352,6 +382,24 @@ void MainWindow::onChunkedUpload()
     if (path.isEmpty()) {
         return;   // 用户取消
     }
+
+    // 目标目录（相对路径；留空 = 根目录）。客户端预检 + 服务端强校验双层防护
+    bool dirOk = false;
+    QString dir = QInputDialog::getText(this, QStringLiteral("分块上传目标目录"),
+                                        QStringLiteral("目标目录（相对路径，'/' 分隔；留空 = 根目录）："),
+                                        QLineEdit::Normal, m_lastDir, &dirOk).trimmed();
+    if (!dirOk) {
+        return;   // 用户取消
+    }
+    if (!dir.isEmpty()) {
+        QString why;
+        if (!validRelPathInput(dir, &why)) {
+            QMessageBox::warning(this, QStringLiteral("目录不合法"), why);
+            return;
+        }
+    }
+    m_lastDir = dir;
+    m_chunkDir = dir;
 
     QString err;
     if (!prepareChunkPlan(path, &err)) {
@@ -785,6 +833,7 @@ void MainWindow::sendInit()
     body.insert(QStringLiteral("size"), m_chunkFileSize);
     body.insert(QStringLiteral("chunk_size"), kChunkSize);
     body.insert(QStringLiteral("hash"), m_chunkFileHash);
+    body.insert(QStringLiteral("dir"), m_chunkDir);   // '' = 根目录；非法/越界服务端 400/403
     const QByteArray payload = QJsonDocument(body).toJson(QJsonDocument::Compact);
 
     QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/uploads/init")));
@@ -793,8 +842,9 @@ void MainWindow::sendInit()
     QNetworkReply *r = sendRequest(req, "POST", payload);
     r->setProperty("cvStep", QStringLiteral("init"));
     appendLog(QStringLiteral("init"), req.url(), 0, 0,
-              QStringLiteral("准备分块上传：%1（%2，chunk_size=%3，hash=%4）")
+              QStringLiteral("准备分块上传：%1（%2，目标目录=%3，chunk_size=%4，hash=%5）")
                   .arg(m_chunkPath, formatSize(m_chunkFileSize),
+                       m_chunkDir.isEmpty() ? QStringLiteral("(根目录)") : m_chunkDir,
                        formatSize(kChunkSize), m_chunkFileHash));
 }
 
@@ -887,6 +937,16 @@ void MainWindow::handleChunkedReply(const QString &step, int seq, int status, bo
     if (step == QStringLiteral("dlchunk")) {
         // 分块下载必须在取消守卫之前分派：下载会话与上传会话互不相干
         handleDownloadChunkReply(status, networkError, errorString, raw, dlTotal, dlStart);
+        return;
+    }
+    if (step == QStringLiteral("dlpath")) {
+        // 按路径下载（边界受限）：与上传会话无关，同样跳过取消守卫
+        handleDownloadPathReply(status, networkError, errorString, raw);
+        return;
+    }
+    if (step == QStringLiteral("mkdir")) {
+        // 创建目录：一次性请求，直接回传结果
+        handleMkdirReply(status, raw);
         return;
     }
     if (m_cancelRequested && step != QStringLiteral("cancel")) {
@@ -1324,6 +1384,183 @@ void MainWindow::finishDownload(bool ok)
     Q_UNUSED(ok);
     m_dlActive = false;
     updateProgress();
+}
+
+// ---------------------------------------------------------------------------
+//  目录管理 + 按路径下载（边界受限）
+// ---------------------------------------------------------------------------
+
+// 客户端侧路径预检：与服务端 sanitizeRelPath 同规则。
+// 这里只做快速反馈，最终裁决始终在服务端（双保险，前端规则不可作为安全边界）。
+bool MainWindow::validRelPathInput(const QString &in, QString *why)
+{
+    const auto fail = [why](const QString &m) {
+        if (why) *why = m;
+        return false;
+    };
+    if (in.isEmpty()) {
+        return fail(QStringLiteral("路径为空"));
+    }
+    if (in.size() > 400) {
+        return fail(QStringLiteral("路径过长（>400 字符）"));
+    }
+    if (in.startsWith(QLatin1Char('/')) || in.startsWith(QLatin1Char('\\'))) {
+        return fail(QStringLiteral("不允许绝对路径（不得以 / 或 \\ 开头）"));
+    }
+    if (in.contains(QLatin1Char('\\'))) {
+        return fail(QStringLiteral("不允许反斜杠，请使用 '/' 作为分隔符"));
+    }
+    if (in.contains(QLatin1Char(':'))) {
+        return fail(QStringLiteral("不允许冒号（盘符 / 保留字符）"));
+    }
+    for (const QChar ch : in) {
+        const ushort u = ch.unicode();
+        if (u < 0x20 || u == 0x7F || ch == QLatin1Char('<') || ch == QLatin1Char('>')
+            || ch == QLatin1Char('"') || ch == QLatin1Char('|') || ch == QLatin1Char('?')
+            || ch == QLatin1Char('*')) {
+            return fail(QStringLiteral("包含非法字符（< > \" | ? * 或控制字符）"));
+        }
+    }
+    const QStringList segs = in.split(QLatin1Char('/'));
+    for (const QString &seg : segs) {
+        if (seg.isEmpty()) {
+            return fail(QStringLiteral("存在空路径段（如 a//b 或结尾 '/'）"));
+        }
+        if (seg == QStringLiteral(".") || seg == QStringLiteral("..")) {
+            return fail(QStringLiteral("不允许 '.' / '..' 路径段（防止目录穿越）"));
+        }
+        if (seg.endsWith(QLatin1Char('.')) || seg.endsWith(QLatin1Char(' '))) {
+            return fail(QStringLiteral("路径段不能以 '.' 或空格结尾：%1").arg(seg));
+        }
+    }
+    return true;
+}
+
+void MainWindow::onCreateDir()
+{
+    bool ok = false;
+    const QString dir = QInputDialog::getText(
+                            this, QStringLiteral("创建目录"),
+                            QStringLiteral("输入目录路径（相对路径，'/' 分隔，如 docs/backup）："),
+                            QLineEdit::Normal, m_lastDir, &ok)
+                            .trimmed();
+    if (!ok) {
+        return;   // 用户取消
+    }
+    QString why;
+    if (!validRelPathInput(dir, &why)) {
+        QMessageBox::warning(this, QStringLiteral("目录不合法"), why);
+        return;
+    }
+    m_lastDir = dir;
+
+    QJsonObject body;
+    body.insert(QStringLiteral("path"), dir);
+    const QByteArray payload = QJsonDocument(body).toJson(QJsonDocument::Compact);
+    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/dirs")));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    req.setHeader(QNetworkRequest::ContentLengthHeader, payload.size());
+    QNetworkReply *r = sendRequest(req, "POST", payload);
+    r->setProperty("cvStep", QStringLiteral("mkdir"));
+    appendLog(QStringLiteral("POST"), req.url(), 0, 0,
+              QStringLiteral("请求创建目录：%1").arg(dir));
+}
+
+void MainWindow::handleMkdirReply(int status, const QByteArray &raw)
+{
+    const QString bodyText = formatBody(raw);
+    appendLog(QStringLiteral("mkdir"), buildUrl(QStringLiteral("/api/v1/dirs")), status, 0,
+              bodyText);
+    if (status == 201) {
+        QMessageBox::information(this, QStringLiteral("创建目录"),
+                                 QStringLiteral("目录创建成功。\n%1").arg(bodyText));
+        return;
+    }
+    if (status == 200) {
+        QMessageBox::information(this, QStringLiteral("创建目录"),
+                                 QStringLiteral("目录已存在（幂等成功）。\n%1").arg(bodyText));
+        return;
+    }
+    if (status == 403) {
+        QMessageBox::warning(this, QStringLiteral("越界拒绝"),
+                             QStringLiteral("服务端拒绝该路径（越界 / 符号链接）：%1").arg(bodyText));
+        return;
+    }
+    QMessageBox::warning(this, QStringLiteral("创建目录失败"),
+                         QStringLiteral("HTTP %1：%2").arg(status).arg(bodyText));
+}
+
+void MainWindow::onDownloadByPath()
+{
+    if (m_pathDlActive) {
+        QMessageBox::information(this, QStringLiteral("正在下载"),
+                                 QStringLiteral("已有按路径下载进行中。"));
+        return;
+    }
+    bool ok = false;
+    const QString def = m_lastDir.isEmpty() ? QString() : m_lastDir + QStringLiteral("/");
+    const QString path = QInputDialog::getText(
+                             this, QStringLiteral("按路径下载"),
+                             QStringLiteral("输入服务器上文件的相对路径（如 docs/report.txt）："),
+                             QLineEdit::Normal, def, &ok)
+                             .trimmed();
+    if (!ok || path.isEmpty()) {
+        return;   // 用户取消 / 空输入
+    }
+    QString why;
+    if (!validRelPathInput(path, &why)) {
+        QMessageBox::warning(this, QStringLiteral("路径不合法"),
+                             QStringLiteral("本地预检拒绝（最终以服务端裁决为准）：\n%1").arg(why));
+        return;
+    }
+    m_lastDir = path.section(QLatin1Char('/'), 0, -2);
+
+    const QString defName = path.section(QLatin1Char('/'), -1);
+    const QString savePath =
+        QFileDialog::getSaveFileName(this, QStringLiteral("保存到"), defName);
+    if (savePath.isEmpty()) {
+        return;   // 用户取消
+    }
+
+    m_pathDlActive = true;
+    m_pathDlSavePath = savePath;
+
+    QUrl url = buildUrl(QStringLiteral("/api/v1/download"));
+    url.setQuery(QStringLiteral("path=%1").arg(
+        QString::fromUtf8(QUrl::toPercentEncoding(path))));
+    QNetworkRequest req(url);
+    QNetworkReply *r = sendRequest(req, "GET");
+    r->setProperty("cvStep", QStringLiteral("dlpath"));
+    appendLog(QStringLiteral("GET"), url, 0, 0,
+              QStringLiteral("按路径下载：%1 -> %2").arg(path, savePath));
+}
+
+void MainWindow::handleDownloadPathReply(int status, bool networkError,
+                                         const QString &errorString, const QByteArray &raw)
+{
+    m_pathDlActive = false;
+    const QUrl url = buildUrl(QStringLiteral("/api/v1/download"));
+    if (networkError || status != 200) {
+        const QString msg = status > 0
+            ? QStringLiteral("HTTP %1：%2").arg(status).arg(formatBody(raw))
+            : errorString;
+        appendLog(QStringLiteral("按路径下载"), url, status, 0,
+                  QStringLiteral("[下载失败] %1").arg(msg));
+        QMessageBox::warning(this, QStringLiteral("按路径下载失败"), msg);
+        return;
+    }
+    QFile out(m_pathDlSavePath);
+    if (!out.open(QIODevice::WriteOnly)) {
+        QMessageBox::warning(this, QStringLiteral("保存失败"), out.errorString());
+        return;
+    }
+    out.write(raw);
+    out.close();
+    appendLog(QStringLiteral("按路径下载"), url, 200, 0,
+              QStringLiteral("已保存到 %1（%2）").arg(m_pathDlSavePath, formatSize(raw.size())));
+    QMessageBox::information(this, QStringLiteral("按路径下载"),
+                             QStringLiteral("下载完成：%1（%2）")
+                                 .arg(m_pathDlSavePath, formatSize(raw.size())));
 }
 
 // ---------------------------------------------------------------------------

@@ -48,6 +48,8 @@ private slots:
     void onChunkedUpload(); // 【分块上传（断点续传）】 init -> PUT chunk* -> complete
     void onCancelUpload();  // 【取消上传】 DELETE /api/v1/uploads/:id
     void onResumableDownload();  // 【分块下载（断点续传）】 GET /content 带 Range
+    void onCreateDir();          // 【创建目录】 POST /api/v1/dirs（边界受限）
+    void onDownloadByPath();     // 【按路径下载】 GET /api/v1/download?path=（越界拒绝）
     void onSelectionChanged();   // 列表选中行变化 -> 拉取并渲染预览
     void onForcePreview();       // 【仍要预览】超过体积上限时由用户显式确认
     void onReplyFinished(QNetworkReply *reply);
@@ -107,6 +109,13 @@ private:
     void finalizeDownload();     // 校验大小，.part -> 正式文件
     void finishDownload(bool ok);
 
+    // ---- 目录与按路径下载 ----
+    // 客户端侧路径预检（与服务端 sanitizeRelPath 同规则；不做最终裁决）
+    static bool validRelPathInput(const QString &in, QString *why);
+    void handleMkdirReply(int status, const QByteArray &raw);
+    void handleDownloadPathReply(int status, bool networkError, const QString &errorString,
+                                 const QByteArray &raw);
+
     // ---- 预览 ----
     void cancelPreview();                                   // 中止并丢弃在途的预览请求
     void startPreview(const QString &id);                   // 发起预览请求
@@ -146,6 +155,8 @@ private:
     QPushButton *m_chunkUploadBtn = nullptr;   // 【分块上传（断点续传）】
     QPushButton *m_cancelUploadBtn = nullptr;  // 【取消上传】
     QPushButton *m_dlResumeBtn = nullptr;       // 【分块下载（断点续传）】
+    QPushButton *m_mkdirBtn = nullptr;          // 【创建目录】
+    QPushButton *m_dlPathBtn = nullptr;         // 【按路径下载】
     QProgressBar *m_progressBar = nullptr;     // 分块上传进度：已传块数 / 总块数
     QLabel *m_progressLabel = nullptr;         // 进度文案（含 upload_id / 续传命中）
     QTableWidget *m_table = nullptr;
@@ -187,6 +198,8 @@ private:
     bool m_resumeHit = false;        // 本次是否命中本地 manifest 续传
     bool m_completeSent = false;     // 防止 complete 被重复发送
     QString m_manifestDir;        // manifest 目录（AppDataLocation/cloudvault）
+    QString m_chunkDir;           // 本次分块上传的目标目录（'' = 根目录）
+    QString m_lastDir;            // 上一次使用的目标目录（输入框默认值）
 
     // ---- 分块下载会话状态 ----
     bool m_dlActive = false;      // 是否有下载会话在进行
@@ -195,4 +208,8 @@ private:
     QString m_dlPartPath;         // 临时文件 <final>.part
     qint64 m_dlTotal = 0;         // 文件总字节数（来自列表 / Content-Range）
     qint64 m_dlOffset = 0;        // 已下载字节数（= .part 当前大小）
+
+    // ---- 按路径下载会话状态 ----
+    bool m_pathDlActive = false;
+    QString m_pathDlSavePath;     // 用户选择的保存路径
 };

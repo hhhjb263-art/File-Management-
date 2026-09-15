@@ -77,6 +77,26 @@ CREATE TABLE IF NOT EXISTS upload_chunk (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (upload_id, seq)
 );
+
+-- 虚拟目录树（规范化相对路径，'/' 分隔；根目录为空串不落行）。
+-- 磁盘镜像树位于 <dataDir>/files/<path>；DB 是"哪些目录存在"的真相源。
+CREATE TABLE IF NOT EXISTS dir_node (
+  path       TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL
+);
+
+-- 文件所属目录（与 file_node 1:1）。独立成表避免对存量库做 ALTER 迁移；
+-- dir 为空串表示位于根目录。
+CREATE TABLE IF NOT EXISTS file_dir (
+  file_id INTEGER PRIMARY KEY,
+  dir     TEXT NOT NULL DEFAULT ''
+);
+
+-- 分块上传会话的目标目录（init 时登记，complete 时落 file_dir）
+CREATE TABLE IF NOT EXISTS upload_dir (
+  upload_id INTEGER PRIMARY KEY,
+  dir       TEXT NOT NULL DEFAULT ''
+);
 )SQL";
 
 }  // namespace cv

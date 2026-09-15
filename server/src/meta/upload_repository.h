@@ -62,6 +62,10 @@ class UploadRepository {
   // 更新状态与 updated_at
   bool setStatus(std::int64_t id, const std::string& status, std::string& err);
 
+  // 会话目标目录（init 登记，complete 取用；不存在的会话返回空串）
+  bool setDir(std::int64_t id, const std::string& dir, std::string& err);
+  bool getDir(std::int64_t id, std::string& out, std::string& err);
+
   // 删除会话及其全部分块记录（取消 / GC 用）
   bool removeSession(std::int64_t id, std::string& err);
 

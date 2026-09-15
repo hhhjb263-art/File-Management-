@@ -183,8 +183,35 @@ bool UploadRepository::setStatus(std::int64_t id, const std::string& status,
   return stmt.step(err) == SQLITE_DONE;
 }
 
+bool UploadRepository::setDir(std::int64_t id, const std::string& dir, std::string& err) {
+  Stmt stmt(db_.handle(),
+            "INSERT INTO upload_dir (upload_id, dir) VALUES (?, ?) "
+            "ON CONFLICT(upload_id) DO UPDATE SET dir = excluded.dir",
+            err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, id) || !stmt.bind(2, dir)) {
+    err = "bind failed";
+    return false;
+  }
+  return stmt.step(err) == SQLITE_DONE;
+}
+
+bool UploadRepository::getDir(std::int64_t id, std::string& out, std::string& err) {
+  out.clear();
+  Stmt stmt(db_.handle(), "SELECT dir FROM upload_dir WHERE upload_id = ?", err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, id)) {
+    err = "bind failed";
+    return false;
+  }
+  if (stmt.step(err) == SQLITE_ROW) out = stmt.text(0);
+  return true;  // 无行 = 未登记目录，返回空串即可
+}
+
 bool UploadRepository::removeSession(std::int64_t id, std::string& err) {
   if (!deleteChunks(id, err)) return false;
+  Stmt dir(db_.handle(), "DELETE FROM upload_dir WHERE upload_id = ?", err);
+  if (dir.ok() && dir.bind(1, id)) dir.step(err);
   Stmt stmt(db_.handle(), "DELETE FROM upload_session WHERE upload_id = ?", err);
   if (!stmt.ok()) return false;
   if (!stmt.bind(1, id)) {

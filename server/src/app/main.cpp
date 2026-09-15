@@ -2,14 +2,17 @@
 //
 // 今日能力：
 //   GET  /healthz                    健康检查
-//   POST /api/v1/files               整文件上传（分块落盘 + 秒传命中）
-//   GET  /api/v1/files               文件列表
+//   POST /api/v1/files               整文件上传（分块落盘 + 秒传命中；头 X-CV-Dir 指定目录）
+//   GET  /api/v1/files               文件列表（含 dir）
 //   GET  /api/v1/files/:id           文件元数据
 //   GET  /api/v1/files/:id/content   下载（按分块重组，支持 Range/206）
-//   POST /api/v1/uploads/init        分块上传会话初始化（含秒传 / 断点复用）
+//   GET  /api/v1/download?path=      按路径下载（仅限已记录文件，严格越界校验）
+//   POST /api/v1/dirs                创建目录（规范化 + 符号链接/越界拒绝）
+//   GET  /api/v1/dirs                列出已登记目录
+//   POST /api/v1/uploads/init        分块上传会话初始化（含秒传 / 断点复用；body 可带 dir）
 //   GET  /api/v1/uploads/:id         查询会话状态与已收分块
 //   PUT  /api/v1/uploads/:id/chunk/:seq  上传单个分块（幂等）
-//   POST /api/v1/uploads/:id/complete     合并分块落库
+//   POST /api/v1/uploads/:id/complete     合并分块落库（落入 init 登记的目录）
 //   DELETE /api/v1/uploads/:id       取消会话
 
 #include <algorithm>
@@ -25,6 +28,7 @@
 #include "core/config.h"
 #include "core/json.h"
 #include "core/logger.h"
+#include "core/path_util.h"
 #include "core/sha256.h"
 #include "core/util.h"
 #include "meta/db.h"
@@ -48,6 +52,7 @@ cv::json::Value fileToJson(const cv::FileRow& f) {
   cv::json::Value v = cv::json::Value::object();
   v.set("id", static_cast<long long>(f.id));
   v.set("name", f.name);
+  v.set("dir", f.dir);
   v.set("size", static_cast<long long>(f.size));
   v.set("hash", f.contentHash);
   v.set("chunks", static_cast<long long>(f.chunkCount));
@@ -155,6 +160,188 @@ bool readWholeFile(const std::string& path, std::string& out, std::string& err) 
   return true;
 }
 
+// ---- 目录树（边界受限的虚拟目录 + 物理镜像）----
+
+// 允许上传/下载的物理根目录：<dataDir>/files（唯一允许的目录树根）
+std::string filesRoot(const cv::Config& cfg) { return cfg.dataDir + "/files"; }
+
+// dir/name 已是规范化相对路径，此处仅做拼接（绝不再接收原始用户路径）
+std::string diskFilePath(const cv::Config& cfg, const std::string& dir,
+                         const std::string& name) {
+  return filesRoot(cfg) + "/" + (dir.empty() ? std::string() : dir + "/") + name;
+}
+
+// 从 query string 取参数（已百分号编码，调用方自行 urlDecode）
+std::string queryParam(const std::string& query, const std::string& key) {
+  std::size_t start = 0;
+  while (start <= query.size()) {
+    std::size_t amp = query.find('&', start);
+    std::string item = query.substr(start, amp == std::string::npos
+                                              ? std::string::npos
+                                              : amp - start);
+    if (!item.empty()) {
+      std::size_t eq = item.find('=');
+      std::string k = (eq == std::string::npos) ? item : item.substr(0, eq);
+      if (k == key) return (eq == std::string::npos) ? std::string() : item.substr(eq + 1);
+    }
+    if (amp == std::string::npos) break;
+    start = amp + 1;
+  }
+  return "";
+}
+
+// 目录/路径参数的统一入口：清洗 + 校验。
+// 空 = 根目录（放行，out 置空）；穿越/绝对路径 → 403 越界；
+// 非法字符/超长 → 400 非法。返回 false 表示已写响应。
+bool sanitizeDirParam(const std::string& raw, std::string& out, cv::net::Response& resp) {
+  cv::PathStatus st = cv::sanitizeRelPath(raw, out);
+  if (st == cv::PathStatus::Empty) {
+    out.clear();
+    return true;
+  }
+  if (st == cv::PathStatus::Ok) return true;
+  if (st == cv::PathStatus::Traversal || st == cv::PathStatus::Absolute) {
+    resp.setError(403, std::string("path escapes allowed root: ") + cv::pathStatusText(st));
+  } else {
+    resp.setError(400, std::string("invalid path: ") + cv::pathStatusText(st));
+  }
+  return false;
+}
+
+// 在 rootAbs 下逐级创建 relDir（已规范化）。任何一级若是已存在的符号链接则拒绝；
+// 完成后做规范化包含校验，防止符号链接把真实路径引到 root 之外。
+bool ensureRealDirUnder(const std::string& rootAbs, const std::string& relDir,
+                        std::string& err) {
+  fs::path root = fs::path(rootAbs).lexically_normal();
+  std::error_code ec;
+  fs::create_directories(root, ec);
+  if (ec && !fs::is_directory(root)) {
+    err = "create root failed: " + ec.message();
+    return false;
+  }
+  fs::path cur = root;
+  std::istringstream iss(relDir);
+  std::string seg;
+  while (std::getline(iss, seg, '/')) {
+    if (seg.empty()) continue;
+    cur /= seg;
+    ec.clear();
+    auto st = fs::symlink_status(cur, ec);
+    if (!ec && fs::is_symlink(st)) {
+      err = "refuse symlink in path: " + cur.string();
+      return false;
+    }
+    if (ec || st.type() == fs::file_type::not_found) {
+      std::error_code cec;
+      fs::create_directory(cur, cec);
+      if (cec && !fs::is_directory(cur, ec)) {
+        err = "create dir failed: " + cur.string() + ": " + cec.message();
+        return false;
+      }
+    } else if (!fs::is_directory(st)) {
+      err = "path component is not a directory: " + cur.string();
+      return false;
+    }
+  }
+  // 包含校验：解析符号链接后的真实路径必须仍位于 root 之下
+  std::error_code e1, e2;
+  fs::path canonCur = fs::weakly_canonical(cur, e1);
+  fs::path canonRoot = fs::weakly_canonical(root, e2);
+  if (e1 || e2) {
+    err = "canonicalize failed: " + (e1 ? e1.message() : e2.message());
+    return false;
+  }
+  const std::string cs = canonCur.string();
+  const std::string rs = canonRoot.string();
+  if (cs != rs && cs.rfind(rs + "/", 0) != 0) {
+    err = "path escapes allowed root: " + relDir;
+    return false;
+  }
+  return true;
+}
+
+// 按文件行提供内容（整文件 / Range 分块复用）。调用方已完成鉴权与存在性检查。
+void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const cv::FileRow& row,
+                      const cv::net::Request& req, cv::net::Response& resp) {
+  std::string err;
+  std::vector<std::string> hashes;
+  if (!repo.chunkHashesOf(row.id, hashes, err)) {
+    resp.setError(500, std::string("db failed: ") + err);
+    return;
+  }
+  const std::int64_t total = row.size;
+
+  // 解析 Range: bytes=start- / bytes=start-end / bytes=-N（后缀范围）。
+  // 非法形态（无 '-'、含非数字、后缀 N<=0）一律忽略 Range -> 回 200 全文。
+  bool haveRange = false;
+  std::int64_t rstart = 0, rend = total - 1;
+  std::string rh = req.header("range");
+  auto allDigits = [](const std::string& s) {
+    if (s.empty()) return false;
+    for (char c : s) {
+      if (c < '0' || c > '9') return false;
+    }
+    return true;
+  };
+  if (!rh.empty() && rh.rfind("bytes=", 0) == 0) {
+    std::string spec = rh.substr(6);
+    std::size_t dash = spec.find('-');
+    if (dash != std::string::npos) {
+      std::string a = spec.substr(0, dash);
+      std::string b = spec.substr(dash + 1);
+      if (!a.empty() && allDigits(a) && (b.empty() || allDigits(b))) {
+        // bytes=start- / bytes=start-end
+        rstart = std::strtoll(a.c_str(), nullptr, 10);
+        rend = b.empty() ? (total - 1) : std::strtoll(b.c_str(), nullptr, 10);
+        haveRange = true;
+      } else if (a.empty() && allDigits(b)) {
+        // bytes=-N：末尾 N 字节（N 超过文件大小时取整个文件）
+        std::int64_t suffixN = std::strtoll(b.c_str(), nullptr, 10);
+        if (suffixN > 0) {
+          rstart = total - suffixN;
+          if (rstart < 0) rstart = 0;
+          rend = total - 1;
+          haveRange = true;
+        }
+      }
+    }
+  }
+
+  if (haveRange) {
+    if (total == 0 || rstart < 0 || rstart >= total) {
+      resp.setError(416, "range not satisfiable");
+      return;
+    }
+    if (rend >= total) rend = total - 1;
+    if (rend < rstart) {
+      resp.setError(416, "range not satisfiable");
+      return;
+    }
+    std::int64_t len = rend - rstart + 1;
+    std::string slice;
+    if (!store.readRange(hashes, rstart, len, slice, err)) {
+      resp.setError(500, std::string("store failed: ") + err);
+      return;
+    }
+    resp.status = 206;
+    resp.extraHeaders["Accept-Ranges"] = "bytes";
+    resp.extraHeaders["Content-Range"] =
+        "bytes " + std::to_string(rstart) + "-" + std::to_string(rend) + "/" +
+        std::to_string(total);
+    resp.setBinary(206, slice, "application/octet-stream");
+    CV_LOG_INFO("分块下载 id=" << row.id << " range=" << rstart << "-" << rend);
+    return;
+  }
+
+  // 无 Range：全文下载（沿用 getChunked，行为不变）
+  std::string content;
+  if (!store.getChunked(hashes, content, err)) {
+    resp.setError(500, std::string("store failed: ") + err);
+    return;
+  }
+  resp.setBinary(200, content, "application/octet-stream");
+}
+
 // 以 DB 行 + 磁盘 part 双重校验生成 uploaded 列表（自愈：不一致则剔除 DB 行）。
 // 返回 received_bytes（已收分块字节数之和）。
 std::vector<std::int64_t> buildUploaded(const cv::Config& cfg,
@@ -200,6 +387,7 @@ int main(int argc, char** argv) {
   std::error_code ec;
   fs::create_directories(cfg.dataDir, ec);
   fs::create_directories(cfg.tmpRoot(), ec);
+  fs::create_directories(filesRoot(cfg), ec);   // 目录树物理根
   if (ec) {
     CV_LOG_ERROR("创建数据目录失败: " << ec.message());
     return 1;
@@ -250,7 +438,7 @@ int main(int argc, char** argv) {
     resp.setJson(200, json::dump(v));
   });
 
-  // ---- POST /api/v1/files （整文件上传，行为保持不变）----
+  // ---- POST /api/v1/files （整文件上传；头 X-CV-Dir 指定目标目录）----
   server.route("POST", "/api/v1/files", [&](const net::Request& req, net::Response& resp) {
     std::string err;
     if (req.body.size() > kMaxUploadBytes) {
@@ -260,6 +448,10 @@ int main(int argc, char** argv) {
     std::string name = util::baseName(util::urlDecode(req.header("x-cv-name")));
     if (name.empty()) name = util::baseName(util::urlDecode(req.param("name")));
     if (name.empty()) name = "unnamed";
+
+    // 目标目录：空 = 根目录；非法/越界直接拒绝
+    std::string dir;
+    if (!sanitizeDirParam(util::urlDecode(req.header("x-cv-dir")), dir, resp)) return;
 
     const std::string& data = req.body;
     std::string contentHash = Sha256::of(data);
@@ -276,21 +468,28 @@ int main(int argc, char** argv) {
     }
 
     std::int64_t id = 0;
-    if (!repo.insertFile(name, static_cast<std::int64_t>(data.size()), contentHash,
+    if (!repo.insertFile(name, dir, static_cast<std::int64_t>(data.size()), contentHash,
                          chunkHashes, chunkSizes, id, err)) {
       resp.setError(500, std::string("db failed: ") + err);
       return;
     }
 
+    // 物理镜像树（尽力而为；内容仍以 blob + DB 为权威，失败仅告警）
+    std::string mirrorErr;
+    if (!store.materialize(contentHash, diskFilePath(cfg, dir, name), mirrorErr)) {
+      CV_LOG_WARN("镜像文件树失败 id=" << id << ": " << mirrorErr);
+    }
+
     json::Value v = json::Value::object();
     v.set("id", static_cast<long long>(id));
     v.set("name", name);
+    v.set("dir", dir);
     v.set("size", static_cast<long long>(data.size()));
     v.set("hash", contentHash);
     v.set("chunks", static_cast<long long>(chunkHashes.size()));
     v.set("instant", instant);
     resp.setJson(201, json::dump(v));
-    CV_LOG_INFO("上传 id=" << id << " name=" << name << " size=" << data.size()
+    CV_LOG_INFO("上传 id=" << id << " dir=" << dir << " name=" << name << " size=" << data.size()
                            << (instant ? " [秒传命中]" : ""));
   });
 
@@ -340,83 +539,115 @@ int main(int argc, char** argv) {
                    resp.setError(404, "file not found");
                    return;
                  }
-                 std::vector<std::string> hashes;
-                 if (!repo.chunkHashesOf(id, hashes, err)) {
-                   resp.setError(500, std::string("db failed: ") + err);
+                 serveFileContent(repo, store, row, req, resp);
+               });
+
+  // ---- GET /api/v1/download?path=dir/name （按路径下载，严格越界校验）----
+  // 只服务"已记录且位于允许目录树内"的文件；路径先清洗，再按 (dir,name) 查 DB，
+  // 用户路径从不直接拼接磁盘路径；镜像树若存在则追加一次符号链接包含校验。
+  server.route("GET", "/api/v1/download",
+               [&](const net::Request& req, net::Response& resp) {
+                 std::string err;
+                 std::string raw = req.header("x-cv-path");
+                 if (raw.empty()) raw = queryParam(req.query, "path");
+                 std::string norm;
+                 if (!sanitizeDirParam(util::urlDecode(raw), norm, resp)) return;
+                 if (norm.empty()) {
+                   resp.setError(400, "missing path (expect dir/name, root has no files)");
                    return;
                  }
-                 const std::int64_t total = row.size;
-
-                 // 解析 Range: bytes=start- / bytes=start-end / bytes=-N（后缀范围）。
-                 // 非法形态（无 '-'、含非数字、后缀 N<=0）一律忽略 Range -> 回 200 全文。
-                 bool haveRange = false;
-                 std::int64_t rstart = 0, rend = total - 1;
-                 std::string rh = req.header("range");
-                 auto allDigits = [](const std::string& s) {
-                   if (s.empty()) return false;
-                   for (char c : s) {
-                     if (c < '0' || c > '9') return false;
-                   }
-                   return true;
-                 };
-                 if (!rh.empty() && rh.rfind("bytes=", 0) == 0) {
-                   std::string spec = rh.substr(6);
-                   std::size_t dash = spec.find('-');
-                   if (dash != std::string::npos) {
-                     std::string a = spec.substr(0, dash);
-                     std::string b = spec.substr(dash + 1);
-                     if (!a.empty() && allDigits(a) && (b.empty() || allDigits(b))) {
-                       // bytes=start- / bytes=start-end
-                       rstart = std::strtoll(a.c_str(), nullptr, 10);
-                       rend = b.empty() ? (total - 1) : std::strtoll(b.c_str(), nullptr, 10);
-                       haveRange = true;
-                     } else if (a.empty() && allDigits(b)) {
-                       // bytes=-N：末尾 N 字节（N 超过文件大小时取整个文件）
-                       std::int64_t suffixN = std::strtoll(b.c_str(), nullptr, 10);
-                       if (suffixN > 0) {
-                         rstart = total - suffixN;
-                         if (rstart < 0) rstart = 0;
-                         rend = total - 1;
-                         haveRange = true;
-                       }
+                 std::size_t slash = norm.find_last_of('/');
+                 std::string dir = (slash == std::string::npos) ? std::string()
+                                                                : norm.substr(0, slash);
+                 std::string name =
+                     (slash == std::string::npos) ? norm : norm.substr(slash + 1);
+                 FileRow row;
+                 if (!repo.findByPath(dir, name, row, err)) {
+                   resp.setError(404,
+                                 "file not found under allowed root (path rejected or "
+                                 "not recorded)");
+                   return;
+                 }
+                 // 防御纵深：镜像树中该文件若存在，校验其真实路径未逃出允许根
+                 std::string disk = diskFilePath(cfg, row.dir, row.name);
+                 std::error_code ec;
+                 if (fs::symlink_status(disk, ec).type() == fs::file_type::symlink) {
+                   resp.setError(403, "refuse symlink in file tree");
+                   return;
+                 }
+                 if (fs::exists(disk, ec)) {
+                   std::error_code e1, e2;
+                   fs::path canon = fs::weakly_canonical(disk, e1);
+                   fs::path root = fs::weakly_canonical(filesRoot(cfg), e2);
+                   if (!e1 && !e2) {
+                     const std::string cs = canon.string();
+                     const std::string rs = root.string();
+                     if (cs != rs && cs.rfind(rs + "/", 0) != 0) {
+                       resp.setError(403, "path escapes allowed root");
+                       return;
                      }
                    }
                  }
-
-                 if (haveRange) {
-                   if (total == 0 || rstart < 0 || rstart >= total) {
-                     resp.setError(416, "range not satisfiable");
-                     return;
-                   }
-                   if (rend >= total) rend = total - 1;
-                   if (rend < rstart) {
-                     resp.setError(416, "range not satisfiable");
-                     return;
-                   }
-                   std::int64_t len = rend - rstart + 1;
-                   std::string slice;
-                   if (!store.readRange(hashes, rstart, len, slice, err)) {
-                     resp.setError(500, std::string("store failed: ") + err);
-                     return;
-                   }
-                   resp.status = 206;
-                   resp.extraHeaders["Accept-Ranges"] = "bytes";
-                   resp.extraHeaders["Content-Range"] =
-                       "bytes " + std::to_string(rstart) + "-" + std::to_string(rend) + "/" +
-                       std::to_string(total);
-                   resp.setBinary(206, slice, "application/octet-stream");
-                   CV_LOG_INFO("分块下载 id=" << id << " range=" << rstart << "-" << rend);
-                   return;
-                 }
-
-                 // 无 Range：全文下载（沿用 getChunked，行为不变）
-                 std::string content;
-                 if (!store.getChunked(hashes, content, err)) {
-                   resp.setError(500, std::string("store failed: ") + err);
-                   return;
-                 }
-                 resp.setBinary(200, content, "application/octet-stream");
+                 serveFileContent(repo, store, row, req, resp);
+                 CV_LOG_INFO("按路径下载 " << norm << " -> file_id=" << row.id);
                });
+
+  // ---- POST /api/v1/dirs （创建目录，边界受限）----
+  server.route("POST", "/api/v1/dirs",
+               [&](const net::Request& req, net::Response& resp) {
+                 std::string perr;
+                 json::Value body = parseJsonBody(req.body, perr);
+                 if (!perr.empty()) {
+                   resp.setError(400, "invalid json: " + perr);
+                   return;
+                 }
+                 const json::Value* ppath = body.find("path");
+                 if (!ppath || ppath->type() != json::Value::Type::String) {
+                   resp.setError(400, "missing path");
+                   return;
+                 }
+                 std::string dir;
+                 if (!sanitizeDirParam(ppath->stringValue(), dir, resp)) return;
+                 if (dir.empty()) {
+                   resp.setError(400, "empty path (root always exists)");
+                   return;
+                 }
+                 // 物理侧：逐级创建，任何一级符号链接/逃逸都拒绝
+                 std::string ferr;
+                 if (!ensureRealDirUnder(filesRoot(cfg), dir, ferr)) {
+                   resp.setError(403, ferr);
+                   return;
+                 }
+                 // 元数据侧：幂等登记
+                 bool created = false;
+                 if (!repo.createDir(dir, created, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 json::Value v = json::Value::object();
+                 v.set("path", dir);
+                 v.set("created", created);
+                 v.set("exists", !created);
+                 resp.setJson(created ? 201 : 200, json::dump(v));
+                 CV_LOG_INFO((created ? "创建目录 " : "目录已存在 ") << dir);
+               });
+
+  // ---- GET /api/v1/dirs （列出已登记目录）----
+  server.route("GET", "/api/v1/dirs", [&](const net::Request&, net::Response& resp) {
+    std::string err;
+    std::vector<std::string> dirs;
+    if (!repo.listDirs(dirs, err)) {
+      resp.setError(500, std::string("db failed: ") + err);
+      return;
+    }
+    json::Value arr = json::Value::array();
+    for (const std::string& d : dirs) arr.push_back(json::Value(d));
+    json::Value v = json::Value::object();
+    v.set("total", static_cast<long long>(dirs.size()));
+    v.set("items", arr);
+    resp.setJson(200, json::dump(v));
+  });
+
 
   // ---- POST /api/v1/uploads/init ----
   server.route("POST", "/api/v1/uploads/init",
@@ -459,6 +690,14 @@ int main(int argc, char** argv) {
                    resp.setError(400, "invalid hash (expect 64-hex sha256)");
                    return;
                  }
+                 // 目标目录（可选）：空 = 根目录；非法/越界直接拒绝
+                 std::string dir;
+                 const json::Value* pdir = body.find("dir");
+                 std::string dirRaw =
+                     (pdir && pdir->type() == json::Value::Type::String)
+                         ? pdir->stringValue()
+                         : std::string();
+                 if (!sanitizeDirParam(dirRaw, dir, resp)) return;
 
                  auto buildOk = [&](const UploadSession& s) {
                    std::int64_t recv = 0;
@@ -510,11 +749,13 @@ int main(int argc, char** argv) {
                    resp.setError(500, std::string("db failed: ") + perr);
                    return;
                  }
+                 up.setDir(newId, dir, perr);   // 登记目标目录，complete 时取用
                  std::error_code msec;
                  fs::create_directories(uploadTmpDir(cfg, newId), msec);
                  json::Value v = json::Value::object();
                  v.set("upload_id", static_cast<long long>(newId));
                  v.set("name", name);
+                 v.set("dir", dir);
                  v.set("size", static_cast<long long>(size));
                  v.set("chunk_size", static_cast<long long>(chunkSize));
                  v.set("hash", fileHash);
@@ -709,10 +950,19 @@ int main(int argc, char** argv) {
                    chunkSizes.push_back(static_cast<std::size_t>(data.size()));
                  }
                  std::int64_t fileId = 0;
-                 if (!repo.insertFile(s.name, s.size, computed, chunkHashes, chunkSizes,
-                                     fileId, perr)) {
+                 // 目标目录：init 时登记（upload_dir 表），读取失败按根目录兜底
+                 std::string dir;
+                 up.getDir(id, dir, perr);
+                 perr.clear();
+                 if (!repo.insertFile(s.name, dir, s.size, computed, chunkHashes, chunkSizes,
+                                      fileId, perr)) {
                    resp.setError(500, std::string("db failed: ") + perr);
                    return;
+                 }
+                 // 物理镜像树（尽力而为；失败仅告警，内容仍以 blob + DB 为权威）
+                 std::string mirrorErr;
+                 if (!store.materialize(computed, diskFilePath(cfg, dir, s.name), mirrorErr)) {
+                   CV_LOG_WARN("镜像文件树失败 file_id=" << fileId << ": " << mirrorErr);
                  }
                  up.setStatus(id, "completed", perr);
                  // 清理临时分块文件与会话分块记录（会话行保留供查询）
@@ -723,6 +973,7 @@ int main(int argc, char** argv) {
                  json::Value v = json::Value::object();
                  v.set("file_id", static_cast<long long>(fileId));
                  v.set("name", s.name);
+                 v.set("dir", dir);
                  v.set("size", static_cast<long long>(s.size));
                  v.set("hash", computed);
                  resp.setJson(200, json::dump(v));

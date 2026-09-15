@@ -124,7 +124,7 @@ build\cloudvault-client.exe
 
 ### 界面
 
-- **顶部**：服务器地址输入框（默认 `http://127.0.0.1:8080`）+ 七个按钮 +
+- **顶部**：服务器地址输入框（默认 `http://127.0.0.1:8080`）+ 九个按钮 +
   第二行的 **进度条与进度文案**
 - **中部**：由一条可拖拽的分隔条分成左右两栏
   - **左**：文件列表，列为 `ID / 名称 / 大小 / 时间 / Hash 前 8 位 / 是否秒传`
@@ -132,17 +132,19 @@ build\cloudvault-client.exe
 - **底部**：日志区，逐条打印 `方法 + URL`、HTTP 状态码、耗时(ms) 与响应原文
   （单条响应超过 4096 字节会截断，避免 6MB 文件刷爆日志）
 
-七个按钮：
+九个按钮：
 
 | 按钮 | 接口 / 说明 |
 |---|---|
 | 健康检查 | `GET /healthz` |
-| 选择文件并上传 | `POST /api/v1/files`（**整文件**上传，保留原有功能） |
+| 选择文件并上传 | `POST /api/v1/files`（**整文件**上传；弹窗输入目标目录，头 `X-CV-Dir`） |
 | 列出文件 | `GET /api/v1/files` |
 | 下载选中文件 | `GET /api/v1/files/:id/content`（**整文件**下载，保留原有功能） |
-| **分块上传（断点续传）** | `init -> PUT chunk* -> complete`，见第 4.3 节 |
+| **分块上传（断点续传）** | `init -> PUT chunk* -> complete`，见第 4.3 节（init body 带 `dir`） |
 | **取消上传** | `DELETE /api/v1/uploads/:id`，中断当前分块会话 |
 | **分块下载（断点续传）** | `GET /api/v1/files/:id/content` 带 `Range`，见第 4.4 节 |
+| **创建目录** | `POST /api/v1/dirs {path}`，见第 4.5 节（201 新建 / 200 幂等） |
+| **按路径下载** | `GET /api/v1/download?path=dir/name`，见第 4.5 节（越界 403） |
 | 清空日志 | 清空日志区 |
 
 请求进行中会自动禁用网络按钮并把鼠标指针置为忙碌态，响应回来后恢复，避免重复点击。
@@ -281,18 +283,47 @@ mkdir -p /tmp/cvdata
 > 所以"是否秒传"一列取自本客户端本地记录的上传结果；
 > 不是由本客户端上传的文件显示为 `-`，这是预期行为，不是 bug。
 
+### 4.5 目录与按路径下载（边界受限）
+
+**服务端目录模型**：允许目录树的唯一物理根是 `<dataDir>/files/`；目录元数据存在
+`dir_node` 表（DB 为真相源），文件通过硬链接镜像到 `<dataDir>/files/<dir>/<name>`。
+用户路径与磁盘路径**从不直接拼接**——先经 `core/path_util.h` 的 `sanitizeRelPath`
+清洗，再按 `(dir, name)` 查库。
+
+**边界规则（两端同规则，服务端为最终裁决）**：
+- 拒绝 `.` / `..` 路径段、绝对路径（`/` 开头）、盘符 / 冒号、反斜杠
+- 拒绝非法字符 `< > : " | ? *` 与控制字符、空路径段（`a//b`）、`CON/NUL` 等保留名
+- 目录创建时逐级检查符号链接：任何一级是符号链接 → **403** 拒绝；
+  创建后做规范化包含校验，解析出的真实路径逃出允许根 → **403**
+- 非法字符 / 超长 → **400**；越界（穿越 / 绝对路径 / 符号链接）→ **403**（明确报错）
+- 客户端在发请求前做同样的预检（`validRelPathInput`），快速给出提示；这只是
+  用户体验层的双保险，**不构成安全边界**
+
+**创建目录**：`POST /api/v1/dirs {path}` → `201 {path,created:true}` 新建 /
+`200 {path,created:false,exists:true}` 幂等（重名不算错误）。
+
+**按路径下载**：`GET /api/v1/download?path=docs/report.txt` → 只服务**已记录且
+位于允许目录树内**的文件；未记录 / 路径被拒 → `404`（区分于越界的 `403`）。
+支持与 id 下载一致的 `Range/206`。
+
+**上传指定目录**：整文件上传弹窗输入目标目录（头 `X-CV-Dir`）；分块上传在
+`init` body 带 `dir`（服务端登记到会话，`complete` 时落位）。目录为空 = 根目录。
+
 ### 客户端请求的接口契约
 
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
 | GET | `/healthz` | — | `{"status","version","data_dir"}` |
-| POST | `/api/v1/files` | body = 文件原始字节；请求头 `X-CV-Name` = 文件名百分号编码 | `201 {"id","name","size","hash","chunks","instant"}` |
-| GET | `/api/v1/files` | — | `{"total":N,"items":[{id,name,size,hash,chunks,created_at}]}` |
+| POST | `/api/v1/files` | body = 文件原始字节；请求头 `X-CV-Name` / `X-CV-Dir` = 百分号编码 | `201 {"id","name","dir","size","hash","chunks","instant"}` |
+| GET | `/api/v1/files` | — | `{"total":N,"items":[{id,name,dir,size,hash,chunks,created_at}]}` |
 | GET | `/api/v1/files/{id}/content` | 可选 `Range: bytes=start-` | `200` 全文 / `206 + Content-Range`，`application/octet-stream` |
-| POST | `/api/v1/uploads/init` | JSON `{name,size,chunk_size,hash}` | `200 {upload_id,name,size,chunk_size,hash,uploaded:[seq],received_bytes}`（秒传则带 `done:true`+`file_id`） |
+| GET | `/api/v1/download` | `?path=dir/name`（百分号编码） | `200` 全文 / `206`（同上）；未记录 `404`；非法 `400`；越界 `403` |
+| POST | `/api/v1/dirs` | JSON `{path}` | `201 {path,created:true}` / `200 {path,exists:true}`；非法 `400`；越界/符号链接 `403` |
+| GET | `/api/v1/dirs` | — | `{"total":N,"items":[path,...]}` |
+| POST | `/api/v1/uploads/init` | JSON `{name,size,chunk_size,hash,dir}` | `200 {upload_id,name,size,chunk_size,hash,uploaded:[seq],received_bytes}`（秒传则带 `done:true`+`file_id`） |
 | GET | `/api/v1/uploads/:id` | — | `200 {upload_id,size,chunk_size,uploaded:[...],received_bytes,status}`（失效 404） |
 | PUT | `/api/v1/uploads/:id/chunk/:seq` | body = 分块字节；头 `X-Chunk-SHA256` = 分块 sha256 | `200 {seq,received_bytes}`（幂等） |
-| POST | `/api/v1/uploads/:id/complete` | — | `200 {file_id,...}`；缺块 `409 {missing:[...]}`；哈希不符 `422 {invalid:[...]}` |
+| POST | `/api/v1/uploads/:id/complete` | — | `200 {file_id,name,dir,size,hash}`；缺块 `409 {missing:[...]}`；哈希不符 `422 {invalid:[...]}` |
 | DELETE | `/api/v1/uploads/:id` | — | `204`（取消会话） |
 
 上传时文件名用 `QUrl::toPercentEncoding(name)` 编码后放进 `X-CV-Name`，

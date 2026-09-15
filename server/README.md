@@ -294,6 +294,46 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke_chunked.sh   # 指定端口
 ```
 > 注意：Windows 下 git 不保留脚本执行位，请用 `bash testdata/smoke_chunked.sh` 显式运行；脚本仅依赖 `curl`/`sha256sum`/`dd`/`stat`，不依赖 `jq`。
 
+## 4.2 目录树 + 按路径下载（边界受限）
+
+**模型**：允许目录树的唯一物理根是 `<dataDir>/files/`；目录元数据在 `dir_node` 表
+（DB 为真相源），上传完成的文件经硬链接镜像到 `<dataDir>/files/<dir>/<name>`
+（跨设备退回复制）。**用户路径从不直接拼接磁盘路径**：先经 `core/path_util.h`
+的 `sanitizeRelPath()` 清洗，再按 `(dir, name)` 查库取内容。
+
+**端点**
+
+| 方法 | 路径 | 请求 | 响应 |
+|---|---|---|---|
+| POST | `/api/v1/dirs` | JSON `{path}` | `201 {path,created:true}` 新建 / `200 {path,exists:true}` 幂等 |
+| GET | `/api/v1/dirs` | — | `{"total":N,"items":[path,...]}` |
+| GET | `/api/v1/download` | `?path=dir/name`（百分号编码）或头 `X-CV-Path` | `200` 全文 / `206` Range；未记录 `404`；非法 `400`；越界 `403` |
+
+**边界与校验规则**（`sanitizeRelPath` 统一裁决）：
+
+- 拒绝 `.` / `..` 路径段（穿越）、绝对路径（`/` 开头）、盘符 / 冒号、反斜杠 → **403**
+- 拒绝非法字符 `< > : " | ? *` 与控制字符、空路径段（`a//b`）、段尾 `.`/空格、
+  Windows 保留设备名（`CON`/`NUL`/`COM1-9`/…，含 `CON.txt` 形态）→ **400**
+- 限长：整路径 400 字节、单段 128 字节（UTF-8 计）
+- 目录创建（`POST /api/v1/dirs`）在物理树上**逐级**创建：任何一级已存在且是符号
+  链接 → **403**；创建后 `weakly_canonical` 包含校验，真实路径逃出允许根 → **403**
+- 按路径下载对镜像树做防御纵深校验：文件本身是符号链接 → **403**；存在则包含校验
+- 上传指定目录：整文件上传头 `X-CV-Dir`；分块上传 `init` body 带 `dir`（登记到
+  `upload_dir` 表，`complete` 落位）。`dir` 为空 = 根目录；镜像失败仅告警
+  （内容仍以 blob + DB 为权威）
+
+curl 快速验证：
+
+```bash
+curl -s -X POST localhost:8080/api/v1/dirs -d '{"path":"docs/backup"}'      # 201
+curl -s -X POST localhost:8080/api/v1/dirs -d '{"path":"../etc"}'           # 403 越界
+curl -s -X POST localhost:8080/api/v1/dirs -d '{"path":"a//b"}'             # 400 非法
+curl -s -X POST localhost:8080/api/v1/files -H 'X-CV-Name: a.txt' \
+  -H 'X-CV-Dir: docs%2Fbackup' --data-binary @hello.txt                     # 201
+curl -s "localhost:8080/api/v1/download?path=docs%2Fbackup%2Fa.txt" -o a.txt
+curl -s "localhost:8080/api/v1/download?path=..%2Fsecret" -o -              # 403 越界
+```
+
 ---
 
 ## 5. 今天做 / 没做的边界
@@ -304,10 +344,12 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke_chunked.sh   # 指定端口
 - 配置（命令行 > 环境变量 > 配置文件 > 默认值）、结构化日志
 - HTTP/1.1 服务器：POSIX socket + 线程池 + 路径参数路由（每连接单请求后关闭）
 - SHA-256 内容寻址存储：5MB 分块、原子写入（临时文件 + rename）、去重
-- SQLite 元数据：chunk / file_node / file_chunk / file_version / upload_session / upload_chunk 建表，写入走事务
+- SQLite 元数据：chunk / file_node / file_chunk / file_version / upload_session / upload_chunk / dir_node / file_dir / upload_dir 建表，写入走事务
 - 整文件上传 / 列表 / 下载（下载支持 `Range: bytes=` → `206`）
 - 分块上传协议 + 断点续传 + 秒传：`init` → `PUT chunk` → `complete` → `DELETE`，含会话复用、DB+磁盘双重校验自愈、闲置会话 GC
 - 端到端冒烟脚本 `testdata/smoke_chunked.sh`（覆盖续传 / 秒传 / 空文件 / Range）
+- 边界受限目录树：`POST/GET /api/v1/dirs` + 按路径下载 `GET /api/v1/download`
+  （路径规范化清洗、`..`/绝对路径/符号链接拒绝、越界 403）
 
 **明确未实现（后续模块）**
 

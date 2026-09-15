@@ -13,14 +13,25 @@ std::int64_t nowMillis() {
 namespace {
 
 const char* kSelectFile =
-    "SELECT id, name, size, content_hash, chunk_count, created_at "
-    "FROM file_node WHERE deleted = 0";
+    "SELECT f.id, f.name, f.size, f.content_hash, f.chunk_count, f.created_at, "
+    "COALESCE(d.dir, '') FROM file_node f "
+    "LEFT JOIN file_dir d ON d.file_id = f.id WHERE f.deleted = 0";
+
+void readFileRow(Stmt& stmt, FileRow& out) {
+  out.id = stmt.int64(0);
+  out.name = stmt.text(1);
+  out.size = stmt.int64(2);
+  out.contentHash = stmt.text(3);
+  out.chunkCount = static_cast<int>(stmt.int64(4));
+  out.createdAt = stmt.int64(5);
+  out.dir = stmt.text(6);
+}
 
 }  // namespace
 
 bool FileRepository::findByContentHash(const std::string& hash, FileRow& out,
                                        std::string& err) {
-  std::string sql = std::string(kSelectFile) + " AND content_hash = ? LIMIT 1";
+  std::string sql = std::string(kSelectFile) + " AND f.content_hash = ? LIMIT 1";
   Stmt stmt(db_.handle(), sql, err);
   if (!stmt.ok()) return false;
   if (!stmt.bind(1, hash)) {
@@ -28,17 +39,12 @@ bool FileRepository::findByContentHash(const std::string& hash, FileRow& out,
     return false;
   }
   if (stmt.step(err) != SQLITE_ROW) return false;
-  out.id = stmt.int64(0);
-  out.name = stmt.text(1);
-  out.size = stmt.int64(2);
-  out.contentHash = stmt.text(3);
-  out.chunkCount = static_cast<int>(stmt.int64(4));
-  out.createdAt = stmt.int64(5);
+  readFileRow(stmt, out);
   return true;
 }
 
 bool FileRepository::findById(std::int64_t id, FileRow& out, std::string& err) {
-  std::string sql = std::string(kSelectFile) + " AND id = ? LIMIT 1";
+  std::string sql = std::string(kSelectFile) + " AND f.id = ? LIMIT 1";
   Stmt stmt(db_.handle(), sql, err);
   if (!stmt.ok()) return false;
   if (!stmt.bind(1, id)) {
@@ -46,17 +52,27 @@ bool FileRepository::findById(std::int64_t id, FileRow& out, std::string& err) {
     return false;
   }
   if (stmt.step(err) != SQLITE_ROW) return false;
-  out.id = stmt.int64(0);
-  out.name = stmt.text(1);
-  out.size = stmt.int64(2);
-  out.contentHash = stmt.text(3);
-  out.chunkCount = static_cast<int>(stmt.int64(4));
-  out.createdAt = stmt.int64(5);
+  readFileRow(stmt, out);
+  return true;
+}
+
+bool FileRepository::findByPath(const std::string& dir, const std::string& name,
+                                FileRow& out, std::string& err) {
+  std::string sql =
+      std::string(kSelectFile) + " AND COALESCE(d.dir, '') = ? AND f.name = ? LIMIT 1";
+  Stmt stmt(db_.handle(), sql, err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, dir) || !stmt.bind(2, name)) {
+    err = "bind failed";
+    return false;
+  }
+  if (stmt.step(err) != SQLITE_ROW) return false;
+  readFileRow(stmt, out);
   return true;
 }
 
 bool FileRepository::listFiles(std::vector<FileRow>& out, std::string& err) {
-  std::string sql = std::string(kSelectFile) + " ORDER BY id DESC LIMIT 500";
+  std::string sql = std::string(kSelectFile) + " ORDER BY f.id DESC LIMIT 500";
   Stmt stmt(db_.handle(), sql, err);
   if (!stmt.ok()) return false;
   while (true) {
@@ -64,13 +80,37 @@ bool FileRepository::listFiles(std::vector<FileRow>& out, std::string& err) {
     if (rc == SQLITE_DONE) break;
     if (rc != SQLITE_ROW) return false;
     FileRow row;
-    row.id = stmt.int64(0);
-    row.name = stmt.text(1);
-    row.size = stmt.int64(2);
-    row.contentHash = stmt.text(3);
-    row.chunkCount = static_cast<int>(stmt.int64(4));
-    row.createdAt = stmt.int64(5);
+    readFileRow(stmt, row);
     out.push_back(row);
+  }
+  return true;
+}
+
+bool FileRepository::createDir(const std::string& path, bool& created, std::string& err) {
+  created = false;
+  Stmt ins(db_.handle(),
+           "INSERT INTO dir_node (path, created_at) VALUES (?, ?) "
+           "ON CONFLICT(path) DO NOTHING",
+           err);
+  if (!ins.ok()) return false;
+  if (!ins.bind(1, path) || !ins.bind(2, nowMillis())) {
+    err = "bind failed";
+    return false;
+  }
+  if (ins.step(err) != SQLITE_DONE) return false;
+  created = sqlite3_changes(db_.handle()) > 0;
+  return true;
+}
+
+bool FileRepository::listDirs(std::vector<std::string>& out, std::string& err) {
+  out.clear();
+  Stmt stmt(db_.handle(), "SELECT path FROM dir_node ORDER BY path", err);
+  if (!stmt.ok()) return false;
+  while (true) {
+    int rc = stmt.step(err);
+    if (rc == SQLITE_DONE) break;
+    if (rc != SQLITE_ROW) return false;
+    out.push_back(stmt.text(0));
   }
   return true;
 }
@@ -119,8 +159,8 @@ bool FileRepository::addChunkIfAbsent(const std::string& hash, std::int64_t size
   return ins.step(err) == SQLITE_DONE;
 }
 
-bool FileRepository::insertFile(const std::string& name, std::int64_t size,
-                                const std::string& contentHash,
+bool FileRepository::insertFile(const std::string& name, const std::string& dir,
+                                std::int64_t size, const std::string& contentHash,
                                 const std::vector<std::string>& chunkHashes,
                                 const std::vector<std::size_t>& chunkSizes,
                                 std::int64_t& id, std::string& err) {
@@ -148,6 +188,20 @@ bool FileRepository::insertFile(const std::string& name, std::int64_t size,
       return false;
     }
     newId = db_.lastInsertId();
+  }
+
+  {
+    // 所属目录（dir 已由调用方 sanitizeRelPath 清洗；'' = 根目录）
+    Stmt d(db_.handle(), "INSERT INTO file_dir (file_id, dir) VALUES (?, ?)", err);
+    if (!d.ok() || !d.bind(1, newId) || !d.bind(2, dir)) {
+      err = err.empty() ? "bind failed" : err;
+      db_.exec("ROLLBACK", err);
+      return false;
+    }
+    if (d.step(err) != SQLITE_DONE) {
+      db_.exec("ROLLBACK", err);
+      return false;
+    }
   }
 
   for (std::size_t i = 0; i < chunkHashes.size(); ++i) {
