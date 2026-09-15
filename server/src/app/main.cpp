@@ -9,6 +9,7 @@
 //   GET  /api/v1/download?path=      按路径下载（仅限已记录文件，严格越界校验）
 //   POST /api/v1/dirs                创建目录（规范化 + 符号链接/越界拒绝）
 //   GET  /api/v1/dirs                列出已登记目录
+//   GET  /api/v1/tree                嵌套文件树（目录在前/文件在后、name 升序；供客户端树选择）
 //   POST /api/v1/uploads/init        分块上传会话初始化（含秒传 / 断点复用；body 可带 dir）
 //   GET  /api/v1/uploads/:id         查询会话状态与已收分块
 //   PUT  /api/v1/uploads/:id/chunk/:seq  上传单个分块（幂等）
@@ -21,6 +22,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -162,8 +165,16 @@ bool readWholeFile(const std::string& path, std::string& out, std::string& err) 
 
 // ---- 目录树（边界受限的虚拟目录 + 物理镜像）----
 
-// 允许上传/下载的物理根目录：<dataDir>/files（唯一允许的目录树根）
-std::string filesRoot(const cv::Config& cfg) { return cfg.dataDir + "/files"; }
+// 允许上传/下载的物理根目录：由配置显式给出（默认 <dataDir>/files），
+// 不随进程启动目录（cwd）变化；相对路径在这里统一转成绝对路径。
+std::string filesRoot(const cv::Config& cfg) {
+  std::error_code ec;
+  fs::path p(cfg.filesRootDir());
+  if (p.is_relative()) {
+    p = fs::absolute(p, ec);
+  }
+  return p.lexically_normal().string();
+}
 
 // dir/name 已是规范化相对路径，此处仅做拼接（绝不再接收原始用户路径）
 std::string diskFilePath(const cv::Config& cfg, const std::string& dir,
@@ -342,6 +353,134 @@ void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const c
   resp.setBinary(200, content, "application/octet-stream");
 }
 
+// ---- 文件树（GET /api/v1/tree）----
+
+// 目录/文件树节点：目录为容器，文件为叶子
+struct TreeNode {
+  bool isDir = true;                          // true=目录 false=文件
+  std::string name;                           // 末级段名（根目录不进入树节点）
+  std::string path;                           // 规范化相对路径（目录=dir；文件=dir/name）
+  std::int64_t size = 0;
+  std::int64_t id = 0;
+  std::vector<std::string> children;          // 子节点 key：目录="D:"+path，文件="F:"+path
+};
+
+// 取父目录路径；'' 表示根（根无父目录节点）
+std::string treeParentPath(const std::string& p) {
+  if (p.empty()) return "";
+  std::size_t slash = p.find_last_of('/');
+  return (slash == std::string::npos) ? std::string() : p.substr(0, slash);
+}
+
+// 取末级段名
+std::string treeLastSegment(const std::string& p) {
+  if (p.empty()) return "";
+  std::size_t slash = p.find_last_of('/');
+  return (slash == std::string::npos) ? p : p.substr(slash + 1);
+}
+
+// 子节点排序：目录在前、文件在后；同类按 name 升序（字典序）
+bool treeChildLess(const std::map<std::string, TreeNode>& nodes, const std::string& ka,
+                   const std::string& kb) {
+  const TreeNode& a = nodes.at(ka);
+  const TreeNode& b = nodes.at(kb);
+  if (a.isDir != b.isDir) return a.isDir;     // dir(true) < file(false)
+  return a.name < b.name;
+}
+
+// 以 DB 行（dir_node 全量 + file_node/file_dir）在内存按路径段建树。
+// key 命名空间隔离：目录="D:"+path，文件="F:"+path，避免同名目录/文件 key 冲突。
+void buildFileTree(cv::FileRepository& repo, cv::json::Value& rootArr, std::int64_t& totalDirs,
+                   std::int64_t& totalFiles, std::string& err) {
+  std::vector<std::string> dirs;
+  if (!repo.listDirsAll(dirs, err)) return;
+  std::vector<cv::FileRow> files;
+  if (!repo.listFiles(files, err)) return;
+
+  std::map<std::string, TreeNode> nodes;
+  // 1) 目录节点（根 '' 不建节点，由 root 数组表达）
+  for (const std::string& d : dirs) {
+    if (d.empty()) continue;
+    TreeNode n;
+    n.isDir = true;
+    n.path = d;
+    n.name = treeLastSegment(d);
+    nodes["D:" + d] = n;
+  }
+  // 2) 文件节点（并补齐其父目录节点，防 listDirsAll 漏网）
+  for (const cv::FileRow& f : files) {
+    std::string fpath = f.dir.empty() ? f.name : f.dir + "/" + f.name;
+    TreeNode fn;
+    fn.isDir = false;
+    fn.path = fpath;
+    fn.name = f.name;
+    fn.size = f.size;
+    fn.id = f.id;
+    nodes["F:" + fpath] = fn;
+    if (!f.dir.empty()) {
+      std::string key = "D:" + f.dir;
+      if (nodes.find(key) == nodes.end()) {
+        TreeNode dn;
+        dn.isDir = true;
+        dn.path = f.dir;
+        dn.name = treeLastSegment(f.dir);
+        nodes[key] = dn;
+      }
+    }
+  }
+  // 3) 建立父子关系（父目录路径 = parentPath(path)；空父即根级）
+  std::vector<std::string> rootKeys;
+  for (const auto& kv : nodes) {
+    const TreeNode& n = kv.second;
+    std::string par = treeParentPath(n.path);
+    if (par.empty()) {
+      rootKeys.push_back(kv.first);
+    } else {
+      auto it = nodes.find("D:" + par);
+      if (it != nodes.end()) it->second.children.push_back(kv.first);
+      else rootKeys.push_back(kv.first);      // 父目录缺失兜底（理论上不发生）
+    }
+  }
+
+  totalDirs = 0;
+  for (const auto& kv : nodes) if (kv.second.isDir) ++totalDirs;
+  totalFiles = static_cast<std::int64_t>(files.size());
+
+  // 递归序列化（dirs-first / name-asc）
+  std::function<cv::json::Value(const std::string&)> serialize =
+      [&](const std::string& key) -> cv::json::Value {
+    const TreeNode& n = nodes.at(key);
+    cv::json::Value v = cv::json::Value::object();
+    if (n.isDir) {
+      v.set("type", "dir");
+      v.set("name", n.name);
+      v.set("path", n.path);
+      std::vector<std::string> sorted = n.children;
+      std::sort(sorted.begin(), sorted.end(),
+                [&](const std::string& ka, const std::string& kb) {
+                  return treeChildLess(nodes, ka, kb);
+                });
+      cv::json::Value children = cv::json::Value::array();
+      for (const std::string& ck : sorted) children.push_back(serialize(ck));
+      v.set("children", children);
+    } else {
+      v.set("type", "file");
+      v.set("name", n.name);
+      v.set("path", n.path);
+      v.set("size", static_cast<long long>(n.size));
+      v.set("id", static_cast<long long>(n.id));
+    }
+    return v;
+  };
+
+  std::sort(rootKeys.begin(), rootKeys.end(),
+            [&](const std::string& ka, const std::string& kb) {
+              return treeChildLess(nodes, ka, kb);
+            });
+  rootArr = cv::json::Value::array();
+  for (const std::string& k : rootKeys) rootArr.push_back(serialize(k));
+}
+
 // 以 DB 行 + 磁盘 part 双重校验生成 uploaded 列表（自愈：不一致则剔除 DB 行）。
 // 返回 received_bytes（已收分块字节数之和）。
 std::vector<std::int64_t> buildUploaded(const cv::Config& cfg,
@@ -435,6 +574,7 @@ int main(int argc, char** argv) {
     v.set("status", "ok");
     v.set("version", kVersion);
     v.set("data_dir", cfg.dataDir);
+    v.set("files_root", filesRoot(cfg));   // 客户端可操作的目录树根（便于自查）
     resp.setJson(200, json::dump(v));
   });
 
@@ -646,6 +786,26 @@ int main(int argc, char** argv) {
     v.set("total", static_cast<long long>(dirs.size()));
     v.set("items", arr);
     resp.setJson(200, json::dump(v));
+  });
+
+  // ---- GET /api/v1/tree （嵌套文件树，供客户端文件树选择对话框）----
+  // 不鉴权、不分页；从 dir_node + file_node/file_dir 在内存按路径段建树，
+  // 目录在前文件在后、同类 name 升序；空目录以 children:[] 出现；路径为规范化相对路径（'/' 分隔）。
+  server.route("GET", "/api/v1/tree", [&](const net::Request&, net::Response& resp) {
+    std::string err;
+    json::Value rootArr;
+    std::int64_t totalDirs = 0, totalFiles = 0;
+    buildFileTree(repo, rootArr, totalDirs, totalFiles, err);
+    if (!err.empty()) {
+      resp.setError(500, std::string("db failed: ") + err);
+      return;
+    }
+    json::Value v = json::Value::object();
+    v.set("total_dirs", static_cast<long long>(totalDirs));
+    v.set("total_files", static_cast<long long>(totalFiles));
+    v.set("root", rootArr);
+    resp.setJson(200, json::dump(v));
+    CV_LOG_INFO("列出文件树 dirs=" << totalDirs << " files=" << totalFiles);
   });
 
 

@@ -1,6 +1,8 @@
 #include "meta/file_repository.h"
 
 #include <chrono>
+#include <set>
+#include <string>
 
 namespace cv {
 
@@ -112,6 +114,36 @@ bool FileRepository::listDirs(std::vector<std::string>& out, std::string& err) {
     if (rc != SQLITE_ROW) return false;
     out.push_back(stmt.text(0));
   }
+  return true;
+}
+
+bool FileRepository::listDirsAll(std::vector<std::string>& out, std::string& err) {
+  std::set<std::string> dirs;  // 自动去重 + 排序
+  // 1) 已显式登记的目录（dir_node）
+  {
+    std::vector<std::string> registered;
+    if (!listDirs(registered, err)) return false;
+    for (const std::string& d : registered) dirs.insert(d);
+  }
+  // 2) 文件所属目录及其全部祖先（有些目录仅通过文件登记、未走 createDir）
+  {
+    Stmt stmt(db_.handle(), "SELECT DISTINCT dir FROM file_dir", err);
+    if (!stmt.ok()) return false;
+    while (true) {
+      int rc = stmt.step(err);
+      if (rc == SQLITE_DONE) break;
+      if (rc != SQLITE_ROW) return false;
+      std::string cur = stmt.text(0);
+      // 把 cur 及其每一级父目录（直到根 ''）都登记进集合
+      while (true) {
+        dirs.insert(cur);
+        if (cur.empty()) break;
+        std::size_t slash = cur.find_last_of('/');
+        cur = (slash == std::string::npos) ? std::string() : cur.substr(0, slash);
+      }
+    }
+  }
+  out.assign(dirs.begin(), dirs.end());
   return true;
 }
 

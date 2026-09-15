@@ -4,8 +4,10 @@
 #include <QHash>
 #include <QList>
 #include <QMainWindow>
+#include <QPair>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QUrl>
 
 class QLabel;
@@ -55,8 +57,6 @@ private slots:
     void onChunkedUpload(); // 【分块上传（断点续传）】 init -> PUT chunk* -> complete
     void onCancelUpload();  // 【取消上传】 DELETE /api/v1/uploads/:id
     void onResumableDownload();  // 【分块下载（断点续传）】 GET /content 带 Range
-    void onCreateDir();          // 【创建目录】 POST /api/v1/dirs（边界受限）
-    void onDownloadByPath();     // 【按路径下载】 GET /api/v1/download?path=（越界拒绝）
     void onSelectionChanged();   // 列表选中行变化 -> 拉取并渲染预览
     void onForcePreview();       // 【仍要预览】超过体积上限时由用户显式确认
     void onReplyFinished(QNetworkReply *reply);
@@ -116,10 +116,10 @@ private:
     void finalizeDownload();     // 校验大小，.part -> 正式文件
     void finishDownload(bool ok);
 
-    // ---- 目录与按路径下载 ----
-    void handleMkdirReply(int status, const QByteArray &raw);
-    void handleDownloadPathReply(int status, bool networkError, const QString &errorString,
-                                 const QByteArray &raw);
+    // ---- 批量上传 / 下载（多选）----
+    void startNextUpload();      // 顺序上传队列中的下一个本地文件
+    void startNextDownload();    // 顺序下载队列中的下一个服务器文件
+    void showStatus(const QString &text, bool ok);   // 顶部 ✓/✗ 简化结果标识
 
     // ---- 预览 ----
     void cancelPreview();                                   // 中止并丢弃在途的预览请求
@@ -156,8 +156,7 @@ private:
     QPushButton *m_chunkUploadBtn = nullptr;   // 【分块上传（断点续传）】
     QPushButton *m_cancelUploadBtn = nullptr;  // 【取消上传】
     QPushButton *m_dlResumeBtn = nullptr;       // 【分块下载（断点续传）】
-    QPushButton *m_mkdirBtn = nullptr;          // 【创建目录】
-    QPushButton *m_dlPathBtn = nullptr;         // 【按路径下载】
+    QLabel *m_statusLabel = nullptr;            // 顶部结果标识（✓ 成功 / ✗ 失败）
     QProgressBar *m_progressBar = nullptr;     // 分块上传进度：已传块数 / 总块数
     QLabel *m_progressLabel = nullptr;         // 进度文案（含 upload_id / 续传命中）
     QTableWidget *m_table = nullptr;
@@ -210,7 +209,15 @@ private:
     qint64 m_dlTotal = 0;         // 文件总字节数（来自列表 / Content-Range）
     qint64 m_dlOffset = 0;        // 已下载字节数（= .part 当前大小）
 
-    // ---- 按路径下载会话状态 ----
-    bool m_pathDlActive = false;
-    QString m_pathDlSavePath;     // 用户选择的保存路径
+    // ---- 批量上传 / 下载队列（多选）----
+    QStringList m_upQueue;        // 待上传的本地文件绝对路径
+    QString m_upDir;              // 本次批量上传的目标目录（'' = 根目录）
+    int m_upOk = 0;
+    int m_upFail = 0;
+    bool m_upBatch = false;       // 是否处于批量上传中（响应回来后推进队列）
+    QList<QPair<QString, QString>> m_dlQueue;  // (file_id, name) 待下载
+    QString m_dlDir;              // 批量下载的保存目录
+    int m_dlOk = 0;
+    int m_dlFail = 0;
+    bool m_dlBatch = false;       // 是否处于批量下载中
 };

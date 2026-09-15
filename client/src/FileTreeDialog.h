@@ -78,9 +78,8 @@ private:
 
     QTreeWidget *m_tree = nullptr;
     QLabel *m_status = nullptr;
-    QPushButton *m_okBtn = nullptr;       // 选取模式（allowCreateDir=false）才有
-    QPushButton *m_closeBtn = nullptr;    // 浏览/新建模式（allowCreateDir=true）才有
-    QPushButton *m_createBtn = nullptr;
+    QPushButton *m_okBtn = nullptr;       // 【确定】（选择文件 / 目录 / 上传位置）
+    QPushButton *m_createBtn = nullptr;   // 【新建文件夹】（allowCreateDir 模式才有）
     QPushButton *m_retryBtn = nullptr;
 
     QNetworkAccessManager *m_nam = nullptr;

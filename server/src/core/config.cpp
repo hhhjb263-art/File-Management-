@@ -46,6 +46,7 @@ bool loadFile(const std::string& path, Config& cfg, std::string& err) {
     while (!k.empty() && (k.back() == ' ' || k.back() == '\t')) k.pop_back();
     while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
     if (k == "data_dir") cfg.dataDir = v;
+    else if (k == "files_root") cfg.filesRoot = v;
     else if (k == "listen") cfg.listenAddr = v;
     else if (k == "port") cfg.port = toInt(v, cfg.port);
     else if (k == "workers") cfg.workers = toInt(v, cfg.workers);
@@ -63,6 +64,7 @@ std::string configUsage(const char* program) {
   os << "用法: " << program << " [选项]\n"
      << "  --config=<file>    读取 key=value 配置文件\n"
      << "  --data-dir=<path>  数据根目录（默认 /var/lib/cloudvault）\n"
+     << "  --files-root=<path> 文件树允许根（默认 <data-dir>/files；客户端只能在其内建目录/上传/下载）\n"
      << "  --listen=<addr>    监听地址（默认 0.0.0.0）\n"
      << "  --port=<n>         监听端口（默认 8080）\n"
      << "  --workers=<n>      工作线程数（默认 4）\n"
@@ -70,8 +72,8 @@ std::string configUsage(const char* program) {
      << "  --log-file=<path>  日志路径（默认输出到 stdout）\n"
      << "  --log-level=<lv>   debug|info|warn|error（默认 info）\n"
      << "  --help             显示帮助\n"
-     << "\n环境变量：CV_CONFIG / CV_DATA_DIR / CV_LISTEN / CV_PORT / CV_WORKERS /\n"
-     << "          CV_CHUNK_SIZE / CV_LOG_FILE / CV_LOG_LEVEL\n";
+     << "\n环境变量：CV_CONFIG / CV_DATA_DIR / CV_FILES_ROOT / CV_LISTEN / CV_PORT /\n"
+     << "          CV_WORKERS / CV_CHUNK_SIZE / CV_LOG_FILE / CV_LOG_LEVEL\n";
   return os.str();
 }
 
@@ -92,6 +94,7 @@ Config loadConfig(int argc, char** argv) {
   }
 
   cfg.dataDir = envOr("CV_DATA_DIR", cfg.dataDir);
+  cfg.filesRoot = envOr("CV_FILES_ROOT", cfg.filesRoot);
   cfg.listenAddr = envOr("CV_LISTEN", cfg.listenAddr);
   cfg.port = toInt(envOr("CV_PORT", ""), cfg.port);
   cfg.workers = toInt(envOr("CV_WORKERS", ""), cfg.workers);
@@ -113,6 +116,7 @@ Config loadConfig(int argc, char** argv) {
       std::exit(0);
     }
     if (!take("data-dir").empty()) cfg.dataDir = take("data-dir");
+    if (!take("files-root").empty()) cfg.filesRoot = take("files-root");
     if (!take("listen").empty()) cfg.listenAddr = take("listen");
     if (!take("port").empty()) cfg.port = toInt(take("port"), cfg.port);
     if (!take("workers").empty()) cfg.workers = toInt(take("workers"), cfg.workers);

@@ -53,8 +53,10 @@ FileTreeDialog::FileTreeDialog(const QUrl &dirsUrl, const QUrl &filesUrl, Mode m
     : QDialog(parent), m_dirsUrl(dirsUrl), m_filesUrl(filesUrl), m_mode(mode),
       m_initialPath(initialPath), m_allowCreateDir(allowCreateDir)
 {
-    setWindowTitle(mode == Mode::SelectDir ? QStringLiteral("选择目录")
-                                           : QStringLiteral("选择文件"));
+    setWindowTitle(m_allowCreateDir
+                       ? QStringLiteral("选择上传位置（可在其中新建文件夹）")
+                       : (mode == Mode::SelectDir ? QStringLiteral("选择目录")
+                                                  : QStringLiteral("选择文件")));
     resize(600, 500);
 
     auto *vbox = new QVBoxLayout(this);
@@ -95,19 +97,17 @@ FileTreeDialog::FileTreeDialog(const QUrl &dirsUrl, const QUrl &filesUrl, Mode m
 
     hbox->addStretch(1);
 
-    if (m_allowCreateDir) {
-        // 浏览/新建模式：用【关闭】代替【确定】（真实动作是建文件夹）
-        m_closeBtn = new QPushButton(QStringLiteral("关闭"), this);
-        m_closeBtn->setDefault(true);
-        connect(m_closeBtn, &QPushButton::clicked, this, &FileTreeDialog::onClose);
-        hbox->addWidget(m_closeBtn);
-    } else {
-        m_okBtn = new QPushButton(QStringLiteral("确定"), this);
-        m_okBtn->setDefault(true);
-        m_okBtn->setEnabled(false);   // 未选合法节点前禁用
-        connect(m_okBtn, &QPushButton::clicked, this, &FileTreeDialog::onOk);
-        hbox->addWidget(m_okBtn);
-    }
+    // 【确定】在所有模式下都提供：选择目录/文件后确认。
+    // allowCreateDir 只是额外多一个【新建文件夹】入口（建完可继续选或直接确定）。
+    m_okBtn = new QPushButton(QStringLiteral("确定"), this);
+    m_okBtn->setDefault(true);
+    m_okBtn->setEnabled(false);   // 未选合法节点前禁用
+    connect(m_okBtn, &QPushButton::clicked, this, &FileTreeDialog::onOk);
+    hbox->addWidget(m_okBtn);
+
+    auto *cancelBtn = new QPushButton(QStringLiteral("取消"), this);
+    connect(cancelBtn, &QPushButton::clicked, this, &FileTreeDialog::onClose);
+    hbox->addWidget(cancelBtn);
 
     vbox->addLayout(hbox);
 
@@ -280,11 +280,13 @@ void FileTreeDialog::handleDirsReply(int status, bool networkError, const QByteA
 {
     if (networkError || status != 200) {
         m_loadError = true;
-        m_loadErrorMsg = networkError
-            ? QStringLiteral("网络错误，无法连接 %1（请检查服务器地址与网络是否可达）。")
-                  .arg(m_dirsUrl.toString())
-            : QStringLiteral("拉取目录列表失败（HTTP %1）：%2")
+        // status > 0 说明服务器确实应答了（如 404 路由不存在 / 500），应如实报告状态码，
+        // 别一律说成"网络错误"——否则会把"服务端版本过旧"误导成"连不上"。
+        m_loadErrorMsg = (status > 0)
+            ? QStringLiteral("服务器应答 HTTP %1：%2（路由不存在或服务端版本过旧？）")
                   .arg(status)
+                  .arg(m_dirsUrl.toString())
+            : QStringLiteral("网络错误，无法连接 %1（请检查地址与网络是否可达）。")
                   .arg(m_dirsUrl.toString());
     } else {
         QJsonParseError perr;
@@ -303,11 +305,11 @@ void FileTreeDialog::handleFilesReply(int status, bool networkError, const QByte
 {
     if (networkError || status != 200) {
         m_loadError = true;
-        m_loadErrorMsg = networkError
-            ? QStringLiteral("网络错误，无法连接 %1（请检查服务器地址与网络是否可达）。")
-                  .arg(m_filesUrl.toString())
-            : QStringLiteral("拉取文件列表失败（HTTP %1）：%2")
+        m_loadErrorMsg = (status > 0)
+            ? QStringLiteral("服务器应答 HTTP %1：%2（路由不存在或服务端版本过旧？）")
                   .arg(status)
+                  .arg(m_filesUrl.toString())
+            : QStringLiteral("网络错误，无法连接 %1（请检查地址与网络是否可达）。")
                   .arg(m_filesUrl.toString());
     } else {
         QJsonParseError perr;

@@ -45,6 +45,10 @@ class FileRepository {
   bool createDir(const std::string& path, bool& created, std::string& err);
   bool listDirs(std::vector<std::string>& out, std::string& err);
 
+  // 全部目录路径（已登记目录 dir_node + 文件所属目录 file_dir 及其所有祖先，
+  // 含根 ''），用于文件树建树。祖先展开在 C++ 侧完成，不写递归 SQL。
+  bool listDirsAll(std::vector<std::string>& out, std::string& err);
+
   bool addChunkIfAbsent(const std::string& hash, std::int64_t size, std::string& err);
 
  private:

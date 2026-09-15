@@ -144,14 +144,12 @@ QWidget *MainWindow::createTopBar()
     m_serverEdit->setMinimumWidth(240);
 
     m_healthBtn = new QPushButton(QStringLiteral("健康检查"), row1);
-    m_uploadBtn = new QPushButton(QStringLiteral("选择文件并上传"), row1);
+    m_uploadBtn = new QPushButton(QStringLiteral("选择文件并上传（可多选）"), row1);
     m_listBtn = new QPushButton(QStringLiteral("列出文件"), row1);
-    m_downloadBtn = new QPushButton(QStringLiteral("下载选中文件"), row1);
+    m_downloadBtn = new QPushButton(QStringLiteral("下载选中文件（可多选）"), row1);
     m_chunkUploadBtn = new QPushButton(QStringLiteral("分块上传（断点续传）"), row1);
     m_cancelUploadBtn = new QPushButton(QStringLiteral("取消上传"), row1);
     m_dlResumeBtn = new QPushButton(QStringLiteral("分块下载（断点续传）"), row1);
-    m_mkdirBtn = new QPushButton(QStringLiteral("创建目录"), row1);
-    m_dlPathBtn = new QPushButton(QStringLiteral("按路径下载"), row1);
     m_clearLogBtn = new QPushButton(QStringLiteral("清空日志"), row1);
 
     connect(m_healthBtn, &QPushButton::clicked, this, &MainWindow::onHealthCheck);
@@ -161,8 +159,6 @@ QWidget *MainWindow::createTopBar()
     connect(m_chunkUploadBtn, &QPushButton::clicked, this, &MainWindow::onChunkedUpload);
     connect(m_cancelUploadBtn, &QPushButton::clicked, this, &MainWindow::onCancelUpload);
     connect(m_dlResumeBtn, &QPushButton::clicked, this, &MainWindow::onResumableDownload);
-    connect(m_mkdirBtn, &QPushButton::clicked, this, &MainWindow::onCreateDir);
-    connect(m_dlPathBtn, &QPushButton::clicked, this, &MainWindow::onDownloadByPath);
     connect(m_clearLogBtn, &QPushButton::clicked, this, &MainWindow::onClearLog);
 
     QHBoxLayout *layout1 = new QHBoxLayout(row1);
@@ -176,22 +172,22 @@ QWidget *MainWindow::createTopBar()
     layout1->addWidget(m_chunkUploadBtn);
     layout1->addWidget(m_cancelUploadBtn);
     layout1->addWidget(m_dlResumeBtn);
-    layout1->addWidget(m_mkdirBtn);
-    layout1->addWidget(m_dlPathBtn);
     layout1->addWidget(m_clearLogBtn);
     layout1->addStretch(1);
 
-    // 第二行：进度条 + 进度文案（分块上传 / 分块下载共用，仅在会话进行中更新）
+    // 第二行：进度条 + 进度文案 + 结果标识（✓/✗ 简化反馈）
     QWidget *row2 = new QWidget(this);
     m_progressLabel = new QLabel(QStringLiteral("进度：空闲"), row2);
     m_progressBar = new QProgressBar(row2);
     m_progressBar->setRange(0, 1);
     m_progressBar->setValue(0);
     m_progressBar->setMinimumWidth(200);
+    m_statusLabel = new QLabel(QString(), row2);   // 成功/失败的简化标识
     QHBoxLayout *layout2 = new QHBoxLayout(row2);
     layout2->setContentsMargins(0, 0, 0, 0);
     layout2->addWidget(m_progressLabel);
     layout2->addWidget(m_progressBar, 1);
+    layout2->addWidget(m_statusLabel);
 
     barLayout->addWidget(row1);
     barLayout->addWidget(row2);
@@ -209,7 +205,7 @@ QWidget *MainWindow::createCenter()
         {QStringLiteral("ID"), QStringLiteral("名称"), QStringLiteral("大小"),
          QStringLiteral("时间"), QStringLiteral("Hash 前 8 位"), QStringLiteral("是否秒传")});
     m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_table->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_table->setSelectionMode(QAbstractItemView::ExtendedSelection);   // 支持多选下载
     m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_table->verticalHeader()->setVisible(false);
     m_table->horizontalHeader()->setStretchLastSection(true);
@@ -293,31 +289,55 @@ void MainWindow::onHealthCheck()
 
 void MainWindow::onUpload()
 {
-    const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("选择要上传的文件"));
-    if (path.isEmpty()) {
+    const QStringList paths =
+        QFileDialog::getOpenFileNames(this, QStringLiteral("选择要上传的文件（可多选）"));
+    if (paths.isEmpty()) {
         return;   // 用户取消
     }
 
-    // 目标目录：用远端文件树对话框选（相对路径；根目录 = 空串）。
-    // 对话框并发拉 /api/v1/dirs + /api/v1/files 合成树；initialPath 传 m_lastDir 便于默认选中。
+    // 自由选择上传位置：远端文件树对话框（可在其中【新建文件夹】）选目标目录
     FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
                        buildUrl(QStringLiteral("/api/v1/files")),
                        FileTreeDialog::Mode::SelectDir, m_lastDir,
-                       /*allowCreateDir=*/false, this);
+                       /*allowCreateDir=*/true, this);
     if (dlg.exec() != QDialog::Accepted) {
         return;   // 用户取消
     }
-    const QString dir = dlg.selectedPath();   // 根目录 = 空串（不带首尾 '/'）
+    const QString dir = dlg.selectedPath();   // 根目录 = 空串
     m_lastDir = dir;
 
+    m_upQueue = paths;
+    m_upDir = dir;
+    m_upOk = 0;
+    m_upFail = 0;
+    m_upBatch = true;
+    showStatus(QStringLiteral("… 上传中 0/%1").arg(paths.size()), true);
+    startNextUpload();
+}
+
+// 顺序上传：取队列首元素发整文件 POST；全部完成后给 ✓/✗ 汇总标识
+void MainWindow::startNextUpload()
+{
+    if (m_upQueue.isEmpty()) {
+        m_upBatch = false;
+        showStatus(m_upFail == 0 ? QStringLiteral("✓ 上传成功 %1 个").arg(m_upOk)
+                                 : QStringLiteral("✗ 成功 %1 / 失败 %2")
+                                       .arg(m_upOk)
+                                       .arg(m_upFail),
+                   m_upFail == 0);
+        return;
+    }
+    const QString path = m_upQueue.takeFirst();
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        QMessageBox::warning(this, QStringLiteral("无法读取文件"), file.errorString());
+        appendLog(QStringLiteral("POST"), buildUrl(QStringLiteral("/api/v1/files")), 0, 0,
+                  QStringLiteral("✗ 无法读取本机文件：%1（%2）").arg(path, file.errorString()));
+        ++m_upFail;
+        QTimer::singleShot(0, this, [this] { startNextUpload(); });
         return;
     }
     const QByteArray data = file.readAll();
     file.close();
-
     const QString name = QFileInfo(path).fileName();
 
     QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/files")));
@@ -325,17 +345,15 @@ void MainWindow::onUpload()
                   QStringLiteral("application/octet-stream"));
     // 文件名按 RFC 3986 百分号编码后放进请求头，服务端会 urlDecode 还原
     req.setRawHeader("X-CV-Name", QUrl::toPercentEncoding(name));
-    if (!dir.isEmpty()) {
-        req.setRawHeader("X-CV-Dir", QUrl::toPercentEncoding(dir));
+    if (!m_upDir.isEmpty()) {
+        req.setRawHeader("X-CV-Dir", QUrl::toPercentEncoding(m_upDir));
     }
     req.setHeader(QNetworkRequest::ContentLengthHeader, data.size());
 
     appendLog(QStringLiteral("POST"), req.url(), 0, 0,
-              QStringLiteral("准备上传：%1（%2，目标目录=%3，请求头 X-CV-Name=%4）")
+              QStringLiteral("上传 %1（%2，目标目录=%3）")
                   .arg(path, formatSize(data.size()),
-                       dir.isEmpty() ? QStringLiteral("(根目录)") : dir,
-                       QString::fromUtf8(QUrl::toPercentEncoding(name))));
-
+                       m_upDir.isEmpty() ? QStringLiteral("(根目录)") : m_upDir));
     sendRequest(req, "POST", data);
 }
 
@@ -347,25 +365,77 @@ void MainWindow::onListFiles()
 
 void MainWindow::onDownload()
 {
-    const QString id = currentFileId();
-    if (id.isEmpty()) {
-        QMessageBox::information(this, QStringLiteral("请先选择文件"),
-                                 QStringLiteral("请在列表中选中一行，再点击【下载选中文件】。"));
+    // 多选下载：表格支持 ExtendedSelection，这里取全部选中行
+    const QModelIndexList rows = m_table->selectionModel()->selectedRows();
+    if (rows.isEmpty()) {
+        QMessageBox::information(
+            this, QStringLiteral("请先选择文件"),
+            QStringLiteral("请在列表中选中一行或多行（Ctrl / Shift 多选），再点【下载选中文件（可多选）】。"));
         return;
     }
 
-    const QString name = currentFileName();
-    const QString savePath =
-        QFileDialog::getSaveFileName(this, QStringLiteral("保存到"), name);
-    if (savePath.isEmpty()) {
-        return;   // 用户取消
+    QList<QPair<QString, QString>> picked;
+    for (const QModelIndex &idx : rows) {
+        const QString id = m_table->item(idx.row(), 0) ? m_table->item(idx.row(), 0)->text() : QString();
+        const QString name =
+            m_table->item(idx.row(), 1) ? m_table->item(idx.row(), 1)->text() : QString();
+        if (!id.isEmpty()) {
+            picked.append(qMakePair(id, name.isEmpty() ? id : name));
+        }
+    }
+    if (picked.isEmpty()) {
+        return;
     }
 
-    m_downloading = true;
-    m_downloadId = id;
-    m_downloadPath = savePath;
+    // 单个文件：沿用"另存为"选文件名；多个文件：选一个保存目录，逐个落盘
+    if (picked.size() == 1) {
+        const QString savePath =
+            QFileDialog::getSaveFileName(this, QStringLiteral("保存到"), picked.first().second);
+        if (savePath.isEmpty()) {
+            return;   // 用户取消
+        }
+        m_dlBatch = false;
+        m_dlQueue.clear();
+        m_downloading = true;
+        m_downloadId = picked.first().first;
+        m_downloadPath = savePath;
+        QNetworkRequest req(
+            buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(m_downloadId)));
+        sendRequest(req, "GET");
+        return;
+    }
 
-    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(id)));
+    const QString dir = QFileDialog::getExistingDirectory(
+        this, QStringLiteral("选择保存目录（%1 个文件）").arg(picked.size()));
+    if (dir.isEmpty()) {
+        return;   // 用户取消
+    }
+    m_dlQueue = picked;
+    m_dlDir = dir;
+    m_dlOk = 0;
+    m_dlFail = 0;
+    m_dlBatch = true;
+    showStatus(QStringLiteral("… 下载中 0/%1").arg(picked.size()), true);
+    startNextDownload();
+}
+
+// 顺序下载：取队列首元素发 GET；全部完成后给 ✓/✗ 汇总标识
+void MainWindow::startNextDownload()
+{
+    if (m_dlQueue.isEmpty()) {
+        m_dlBatch = false;
+        showStatus(m_dlFail == 0 ? QStringLiteral("✓ 下载成功 %1 个").arg(m_dlOk)
+                                 : QStringLiteral("✗ 成功 %1 / 失败 %2")
+                                       .arg(m_dlOk)
+                                       .arg(m_dlFail),
+                   m_dlFail == 0);
+        return;
+    }
+    const QPair<QString, QString> item = m_dlQueue.takeFirst();
+    m_downloadId = item.first;
+    m_downloadPath = m_dlDir + QLatin1Char('/') + item.second;
+    m_downloading = true;
+    QNetworkRequest req(buildUrl(QStringLiteral("/api/v1/files/%1/content").arg(m_downloadId)));
     sendRequest(req, "GET");
 }
 
@@ -932,16 +1002,6 @@ void MainWindow::handleChunkedReply(const QString &step, int seq, int status, bo
         handleDownloadChunkReply(status, networkError, errorString, raw, dlTotal, dlStart);
         return;
     }
-    if (step == QStringLiteral("dlpath")) {
-        // 按路径下载（边界受限）：与上传会话无关，同样跳过取消守卫
-        handleDownloadPathReply(status, networkError, errorString, raw);
-        return;
-    }
-    if (step == QStringLiteral("mkdir")) {
-        // 创建目录：一次性请求，直接回传结果
-        handleMkdirReply(status, raw);
-        return;
-    }
     if (m_cancelRequested && step != QStringLiteral("cancel")) {
         return;   // 取消中的在途请求直接丢弃
     }
@@ -1380,7 +1440,7 @@ void MainWindow::finishDownload(bool ok)
 }
 
 // ---------------------------------------------------------------------------
-//  目录管理 + 按路径下载（边界受限）
+//  路径校验（供文件树对话框"新建文件夹"复用）
 // ---------------------------------------------------------------------------
 
 // 客户端侧路径预检：与服务端 sanitizeRelPath 同规则。
@@ -1427,110 +1487,6 @@ bool MainWindow::validRelPathInput(const QString &in, QString *why)
         }
     }
     return true;
-}
-
-void MainWindow::onCreateDir()
-{
-    // 文件树对话框（目录模式 + 新建文件夹按钮）：对话框内自行完成 POST /api/v1/dirs，
-    // 成功后自动刷新树并选中新目录；本模式下以【关闭】结束。
-    FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
-                       buildUrl(QStringLiteral("/api/v1/files")),
-                       FileTreeDialog::Mode::SelectDir, m_lastDir,
-                       /*allowCreateDir=*/true, this);
-    dlg.exec();
-}
-
-void MainWindow::handleMkdirReply(int status, const QByteArray &raw)
-{
-    const QString bodyText = formatBody(raw);
-    appendLog(QStringLiteral("mkdir"), buildUrl(QStringLiteral("/api/v1/dirs")), status, 0,
-              bodyText);
-    if (status == 201) {
-        QMessageBox::information(this, QStringLiteral("创建目录"),
-                                 QStringLiteral("目录创建成功。\n%1").arg(bodyText));
-        return;
-    }
-    if (status == 200) {
-        QMessageBox::information(this, QStringLiteral("创建目录"),
-                                 QStringLiteral("目录已存在（幂等成功）。\n%1").arg(bodyText));
-        return;
-    }
-    if (status == 403) {
-        QMessageBox::warning(this, QStringLiteral("越界拒绝"),
-                             QStringLiteral("服务端拒绝该路径（越界 / 符号链接）：%1").arg(bodyText));
-        return;
-    }
-    QMessageBox::warning(this, QStringLiteral("创建目录失败"),
-                         QStringLiteral("HTTP %1：%2").arg(status).arg(bodyText));
-}
-
-void MainWindow::onDownloadByPath()
-{
-    if (m_pathDlActive) {
-        QMessageBox::information(this, QStringLiteral("正在下载"),
-                                 QStringLiteral("已有按路径下载进行中。"));
-        return;
-    }
-    // 用远端文件树对话框选要下载的文件（initialPath 传上次目录 m_lastDir，便于定位）
-    FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
-                       buildUrl(QStringLiteral("/api/v1/files")),
-                       FileTreeDialog::Mode::SelectFile, m_lastDir,
-                       /*allowCreateDir=*/false, this);
-    if (dlg.exec() != QDialog::Accepted) {
-        return;   // 用户取消
-    }
-    const QString path = dlg.selectedPath();   // 文件的相对路径（如 docs/report.txt）
-    if (path.isEmpty() || !dlg.isFile()) {
-        return;   // 未选文件
-    }
-    m_lastDir = path.section(QLatin1Char('/'), 0, -2);   // 记忆父目录，下次高亮
-
-    const QString defName = path.section(QLatin1Char('/'), -1);
-    const QString savePath =
-        QFileDialog::getSaveFileName(this, QStringLiteral("保存到"), defName);
-    if (savePath.isEmpty()) {
-        return;   // 用户取消
-    }
-
-    m_pathDlActive = true;
-    m_pathDlSavePath = savePath;
-
-    QUrl url = buildUrl(QStringLiteral("/api/v1/download"));
-    url.setQuery(QStringLiteral("path=%1").arg(
-        QString::fromUtf8(QUrl::toPercentEncoding(path))));
-    QNetworkRequest req(url);
-    QNetworkReply *r = sendRequest(req, "GET");
-    r->setProperty("cvStep", QStringLiteral("dlpath"));
-    appendLog(QStringLiteral("GET"), url, 0, 0,
-              QStringLiteral("按路径下载：%1 -> %2").arg(path, savePath));
-}
-
-void MainWindow::handleDownloadPathReply(int status, bool networkError,
-                                         const QString &errorString, const QByteArray &raw)
-{
-    m_pathDlActive = false;
-    const QUrl url = buildUrl(QStringLiteral("/api/v1/download"));
-    if (networkError || status != 200) {
-        const QString msg = status > 0
-            ? QStringLiteral("HTTP %1：%2").arg(status).arg(formatBody(raw))
-            : errorString;
-        appendLog(QStringLiteral("按路径下载"), url, status, 0,
-                  QStringLiteral("[下载失败] %1").arg(msg));
-        QMessageBox::warning(this, QStringLiteral("按路径下载失败"), msg);
-        return;
-    }
-    QFile out(m_pathDlSavePath);
-    if (!out.open(QIODevice::WriteOnly)) {
-        QMessageBox::warning(this, QStringLiteral("保存失败"), out.errorString());
-        return;
-    }
-    out.write(raw);
-    out.close();
-    appendLog(QStringLiteral("按路径下载"), url, 200, 0,
-              QStringLiteral("已保存到 %1（%2）").arg(m_pathDlSavePath, formatSize(raw.size())));
-    QMessageBox::information(this, QStringLiteral("按路径下载"),
-                             QStringLiteral("下载完成：%1（%2）")
-                                 .arg(m_pathDlSavePath, formatSize(raw.size())));
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,8 +1623,18 @@ void MainWindow::handleReply(QNetworkReply *reply, const QByteArray &raw)
 
     if (reply->error() != QNetworkReply::NoError) {
         appendLog(method, url, status, elapsed,
-                  QStringLiteral("[网络错误] %1").arg(reply->errorString()));
-        m_downloading = false;   // 下载失败时清掉待落盘状态
+                  QStringLiteral("✗ 网络错误：%1").arg(reply->errorString()));
+        if (m_upBatch) {   // 批量上传：记失败并继续下一个
+            ++m_upFail;
+            QTimer::singleShot(0, this, [this] { startNextUpload(); });
+        }
+        if (m_downloading) {
+            m_downloading = false;   // 下载失败时清掉待落盘状态
+            if (m_dlBatch) {
+                ++m_dlFail;
+                QTimer::singleShot(0, this, [this] { startNextDownload(); });
+            }
+        }
         return;
     }
 
@@ -1689,26 +1655,35 @@ void MainWindow::handleReply(QNetworkReply *reply, const QByteArray &raw)
 void MainWindow::handleUploadReply(const QByteArray &raw)
 {
     const QJsonDocument doc = QJsonDocument::fromJson(raw);
-    if (!doc.isObject()) {
-        return;
+    if (doc.isObject()) {
+        const QJsonObject obj = doc.object();
+
+        const QString id =
+            QString::number(obj.value(QStringLiteral("id")).toVariant().toLongLong());
+        const bool instant = obj.value(QStringLiteral("instant")).toBool();
+        m_instantById.insert(id, instant);
+
+        // 上传响应按契约不带 created_at，用本地当前时间兜底（文件确实是刚刚传上去的）；
+        // 保持与服务端的毫秒单位一致，显示时由 formatTime 归一化
+        const qint64 createdAt = obj.contains(QStringLiteral("created_at"))
+            ? obj.value(QStringLiteral("created_at")).toVariant().toLongLong()
+            : QDateTime::currentMSecsSinceEpoch();
+
+        // 上传成功后直接把这条补进列表，省得用户再点一次【列出文件】
+        addRow(id, obj.value(QStringLiteral("name")).toString(),
+               obj.value(QStringLiteral("size")).toVariant().toLongLong(),
+               obj.value(QStringLiteral("hash")).toString(),
+               instant ? QStringLiteral("是") : QStringLiteral("否"), createdAt);
     }
-    const QJsonObject obj = doc.object();
 
-    const QString id = QString::number(obj.value(QStringLiteral("id")).toVariant().toLongLong());
-    const bool instant = obj.value(QStringLiteral("instant")).toBool();
-    m_instantById.insert(id, instant);
-
-    // 上传响应按契约不带 created_at，用本地当前时间兜底（文件确实是刚刚传上去的）；
-    // 保持与服务端的毫秒单位一致，显示时由 formatTime 归一化
-    const qint64 createdAt = obj.contains(QStringLiteral("created_at"))
-        ? obj.value(QStringLiteral("created_at")).toVariant().toLongLong()
-        : QDateTime::currentMSecsSinceEpoch();
-
-    // 上传成功后直接把这条补进列表，省得用户再点一次【列出文件】
-    addRow(id, obj.value(QStringLiteral("name")).toString(),
-           obj.value(QStringLiteral("size")).toVariant().toLongLong(),
-           obj.value(QStringLiteral("hash")).toString(),
-           instant ? QStringLiteral("是") : QStringLiteral("否"), createdAt);
+    if (m_upBatch) {
+        ++m_upOk;
+        showStatus(QStringLiteral("… 上传中 %1/%2")
+                       .arg(m_upOk + m_upFail)
+                       .arg(m_upOk + m_upFail + m_upQueue.size()),
+                   true);
+        startNextUpload();
+    }
 }
 
 void MainWindow::handleListReply(const QByteArray &raw)
@@ -1757,15 +1732,38 @@ void MainWindow::handleDownloadReply(const QByteArray &raw)
     QFile out(m_downloadPath);
     if (!out.open(QIODevice::WriteOnly)) {
         appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_downloadPath), 0, 0,
-                  QStringLiteral("[落盘失败] %1").arg(out.errorString()));
+                  QStringLiteral("✗ 落盘失败：%1").arg(out.errorString()));
+        if (m_dlBatch) {
+            ++m_dlFail;
+            QTimer::singleShot(0, this, [this] { startNextDownload(); });
+        }
         return;
     }
     const qint64 written = out.write(raw);
     out.close();
 
     appendLog(QStringLiteral("下载"), QUrl::fromLocalFile(m_downloadPath), 200, 0,
-              QStringLiteral("已保存 id=%1 到 %2（写入 %3，响应 %4）")
-                  .arg(m_downloadId, m_downloadPath, formatSize(written), formatSize(raw.size())));
+              QStringLiteral("✓ 已保存 id=%1 到 %2（%3）")
+                  .arg(m_downloadId, m_downloadPath, formatSize(written)));
+
+    if (m_dlBatch) {
+        ++m_dlOk;
+        if (m_dlOk == 1 && m_dlQueue.isEmpty()) {
+            // 单元素队列兜底：直接收尾
+        }
+        startNextDownload();
+    }
+}
+
+// 顶部结果标识：✓ 绿色 / ✗ 红色（简化反馈，不用看日志也能判断成败）
+void MainWindow::showStatus(const QString &text, bool ok)
+{
+    if (!m_statusLabel) {
+        return;
+    }
+    m_statusLabel->setText(text);
+    m_statusLabel->setStyleSheet(ok ? QStringLiteral("color:#1a7f37; font-weight:bold;")
+                                    : QStringLiteral("color:#cf222e; font-weight:bold;"));
 }
 
 // ---------------------------------------------------------------------------

@@ -126,6 +126,24 @@ cmake --install build
 
 ### 2.7 可配置项一览
 
+**运行时选项（`--xxx` / 环境变量 `CV_XXX` / 配置文件 key）**
+
+| 选项 | 默认值 | 说明 |
+|---|---|---|
+| `--data-dir` / `CV_DATA_DIR` / `data_dir` | `/var/lib/cloudvault` | 数据根目录（元数据库 / 内容库 / 临时分块） |
+| `--files-root` / `CV_FILES_ROOT` / `files_root` | `<data-dir>/files` | **文件树允许根**：客户端只能在该目录内建目录 / 上传 / 下载。显式配置，**不随服务端启动目录（cwd）变化**；相对路径会按 cwd 转成绝对路径 |
+| `--listen` / `CV_LISTEN` / `listen` | `0.0.0.0` | 监听地址 |
+| `--port` / `CV_PORT` / `port` | `8080` | 监听端口 |
+| `--workers` / `CV_WORKERS` / `workers` | `4` | HTTP 工作线程数 |
+| `--chunk-size` / `CV_CHUNK_SIZE` / `chunk_size` | `5242880` | 分块大小（字节） |
+| `--log-file` / `CV_LOG_FILE` / `log_file` | 空（stdout） | 日志文件 |
+| `--log-level` / `CV_LOG_LEVEL` / `log_level` | `info` | `debug` / `info` / `warn` / `error` |
+
+> 想把文件树落到别处（如独立数据盘）：`--files-root=/mnt/data/cvfiles`。
+> `/healthz` 会回显当前生效的 `data_dir` 与 `files_root`，便于核对。
+
+**构建选项（CMake）**
+
 | 选项 | 默认值 | 说明 |
 |---|---|---|
 | `CMAKE_BUILD_TYPE` | `Release` | `Release` / `Debug` / `RelWithDebInfo` / `MinSizeRel` |
@@ -212,6 +230,10 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke.sh   # 指定其他端口
 | PUT | `/api/v1/uploads/:id/chunk/:seq` | 上传单个分块（幂等，可带 `X-Chunk-SHA256`） |
 | POST | `/api/v1/uploads/:id/complete` | 合并分块落库 |
 | DELETE | `/api/v1/uploads/:id` | 取消会话 |
+| POST | `/api/v1/dirs` | 创建目录（规范化 + 符号链接/越界拒绝） |
+| GET | `/api/v1/dirs` | 列出已登记目录 |
+| GET | `/api/v1/tree` | 嵌套文件树（目录在前/文件在后、name 升序；供客户端树选择） |
+| GET | `/api/v1/download` | 按路径下载（仅限已记录文件，严格越界校验） |
 
 ```bash
 # 1) 健康检查
@@ -307,7 +329,32 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke_chunked.sh   # 指定端口
 |---|---|---|---|
 | POST | `/api/v1/dirs` | JSON `{path}` | `201 {path,created:true}` 新建 / `200 {path,exists:true}` 幂等 |
 | GET | `/api/v1/dirs` | — | `{"total":N,"items":[path,...]}` |
+| GET | `/api/v1/tree` | — | `{"total_dirs":N,"total_files":M,"root":[<node>...]}`（见下） |
 | GET | `/api/v1/download` | `?path=dir/name`（百分号编码）或头 `X-CV-Path` | `200` 全文 / `206` Range；未记录 `404`；非法 `400`；越界 `403` |
+
+#### `GET /api/v1/tree`　嵌套文件树（供客户端文件树选择对话框）
+
+不分页、不鉴权。把 `dir_node` 的全部目录路径 + `file_node` 的 `(dir,name,size,id)` 在内存里按路径段建树（**不写递归 SQL**）：
+
+- 目录节点：`{"type":"dir","name","path","children":[...]}`；`path` 为规范化相对路径（`/` 分隔，根目录为空串不出现在树中）。
+- 文件节点：`{"type":"file","name","path","size","id"}`；`path` 为 `dir/name`（根目录文件即 `name`）。
+- **排序**：每层的子节点**目录在前、文件在后**，同类内按 `name` 字典序升序。
+- **空目录必须出现**：无文件的目录以 `children:[]` 呈现（已被 `dir_node` 登记或仅含文件目录的祖先均会展开）。
+- 统计：`total_dirs` = 非根目录节点数；`total_files` = 文件数（受 `listFiles` 的 500 条上限约束）。
+
+建树数据源：`FileRepository::listDirsAll()`（已登记目录 + 文件所属目录及其全部祖先，去重后返回）与 `listFiles()`；目录/文件的父关系在 C++ 侧按路径段推导，key 上用 `"D:"`/`"F:"` 前缀隔离命名空间，避免同名目录与文件冲突。
+
+```bash
+curl -s localhost:8080/api/v1/tree
+# 返回示例：
+# {"total_dirs":2,"total_files":3,"root":[
+#   {"type":"dir","name":"docs","path":"docs","children":[
+#     {"type":"dir","name":"backup","path":"docs/backup","children":[]},
+#     {"type":"file","name":"readme.txt","path":"docs/readme.txt","size":1234,"id":3}
+#   ]},
+#   {"type":"file","name":"a.txt","path":"a.txt","size":56,"id":1}
+# ]}
+```
 
 **边界与校验规则**（`sanitizeRelPath` 统一裁决）：
 
@@ -348,7 +395,7 @@ curl -s "localhost:8080/api/v1/download?path=..%2Fsecret" -o -              # 40
 - 整文件上传 / 列表 / 下载（下载支持 `Range: bytes=` → `206`）
 - 分块上传协议 + 断点续传 + 秒传：`init` → `PUT chunk` → `complete` → `DELETE`，含会话复用、DB+磁盘双重校验自愈、闲置会话 GC
 - 端到端冒烟脚本 `testdata/smoke_chunked.sh`（覆盖续传 / 秒传 / 空文件 / Range）
-- 边界受限目录树：`POST/GET /api/v1/dirs` + 按路径下载 `GET /api/v1/download`
+- 边界受限目录树：`POST/GET /api/v1/dirs`、嵌套文件树 `GET /api/v1/tree`、按路径下载 `GET /api/v1/download`
   （路径规范化清洗、`..`/绝对路径/符号链接拒绝、越界 403）
 
 **明确未实现（后续模块）**
