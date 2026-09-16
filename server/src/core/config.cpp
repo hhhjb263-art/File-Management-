@@ -1,8 +1,10 @@
 #include "core/config.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 
 namespace cv {
@@ -27,6 +29,15 @@ std::size_t toSize(const std::string& s, std::size_t def) {
   } catch (...) {
     return def;
   }
+}
+
+// 仅用于配置文件值的本地小写化（不引入额外依赖）
+std::string toLowerLocal(const std::string& s) {
+  std::string out = s;
+  for (char& c : out) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  return out;
 }
 
 // 解析 key=value 配置文件；忽略空行与 # 注释。
@@ -56,6 +67,9 @@ bool loadFile(const std::string& path, Config& cfg, std::string& err) {
     else if (k == "tls_port") cfg.tlsPort = toInt(v, cfg.tlsPort);
     else if (k == "tls_cert") cfg.tlsCert = v;
     else if (k == "tls_key") cfg.tlsKey = v;
+    else if (k == "auth_token") cfg.authToken = v;
+    else if (k == "http") cfg.httpEnabled = (toLowerLocal(v) != "off");
+    else if (k == "data_key") cfg.dataKey = v;
   }
   return true;
 }
@@ -77,9 +91,13 @@ std::string configUsage(const char* program) {
      << "  --tls-port=<n>     HTTPS 监听端口（默认 0 = 关闭；与 HTTP 可同时开）\n"
      << "  --tls-cert=<path>  PEM 证书路径（启用 HTTPS 必填）\n"
      << "  --tls-key=<path>   PEM 私钥路径（启用 HTTPS 必填）\n"
+      << "  --auth-token=<s>   API Bearer Token（非空即启用鉴权，除 /healthz 外全接口强制）\n"
+     << "  --http=<on|off>    明文 HTTP 监听开关（默认 on；off 时仅保留 HTTPS）\n"
+     << "  --data-key=<path>  静态数据加密密钥文件（64 hex 或 32 字节原文；非空即启用 blob 加密）\n"
      << "  --help             显示帮助\n"
      << "\n环境变量：CV_CONFIG / CV_DATA_DIR / CV_FILES_ROOT / CV_LISTEN / CV_PORT /\n"
-     << "          CV_WORKERS / CV_CHUNK_SIZE / CV_LOG_FILE / CV_LOG_LEVEL\n";
+     << "          CV_WORKERS / CV_CHUNK_SIZE / CV_LOG_FILE / CV_LOG_LEVEL /\n"
+     << "          CV_TLS_PORT / CV_TLS_CERT / CV_TLS_KEY / CV_AUTH_TOKEN / CV_HTTP / CV_DATA_KEY\n";
   return os.str();
 }
 
@@ -110,6 +128,11 @@ Config loadConfig(int argc, char** argv) {
   cfg.tlsPort = toInt(envOr("CV_TLS_PORT", ""), cfg.tlsPort);
   cfg.tlsCert = envOr("CV_TLS_CERT", cfg.tlsCert);
   cfg.tlsKey = envOr("CV_TLS_KEY", cfg.tlsKey);
+  cfg.authToken = envOr("CV_AUTH_TOKEN", cfg.authToken);
+  if (!envOr("CV_HTTP", "").empty()) {
+    cfg.httpEnabled = (toLowerLocal(envOr("CV_HTTP", "")) != "off");
+  }
+  cfg.dataKey = envOr("CV_DATA_KEY", cfg.dataKey);
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -135,6 +158,9 @@ Config loadConfig(int argc, char** argv) {
     if (!take("tls-port").empty()) cfg.tlsPort = toInt(take("tls-port"), cfg.tlsPort);
     if (!take("tls-cert").empty()) cfg.tlsCert = take("tls-cert");
     if (!take("tls-key").empty()) cfg.tlsKey = take("tls-key");
+    if (!take("auth-token").empty()) cfg.authToken = take("auth-token");
+    if (!take("http").empty()) cfg.httpEnabled = (toLowerLocal(take("http")) != "off");
+    if (!take("data-key").empty()) cfg.dataKey = take("data-key");
   }
 
   if (cfg.workers < 1) cfg.workers = 1;
@@ -142,6 +168,52 @@ Config loadConfig(int argc, char** argv) {
   if (cfg.tlsPort < 0 || cfg.tlsPort > 65535) cfg.tlsPort = 0;
   if (cfg.chunkSize == 0) cfg.chunkSize = 5u * 1024u * 1024u;
   return cfg;
+}
+
+bool loadDataKeyFile(const std::string& path, std::vector<unsigned char>& out,
+                      std::string& err) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open()) {
+    err = "cannot open data key file: " + path;
+    return false;
+  }
+  std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+  // 兼容 hex 文件末尾的换行 / 空白
+  auto isWs = [](unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+  };
+  std::size_t a = 0, b = content.size();
+  while (a < b && isWs(static_cast<unsigned char>(content[a]))) ++a;
+  while (b > a && isWs(static_cast<unsigned char>(content[b - 1]))) --b;
+  std::string s = content.substr(a, b - a);
+
+  auto hexVal = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return c - 'A' + 10;
+  };
+
+  if (s.size() == 64) {
+    bool allHex = true;
+    for (char c : s) {
+      bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+      if (!ok) { allHex = false; break; }
+    }
+    if (allHex) {
+      out.resize(32);
+      for (std::size_t i = 0; i < 32; ++i) {
+        out[i] = static_cast<unsigned char>(hexVal(s[2 * i]) * 16 + hexVal(s[2 * i + 1]));
+      }
+      return true;
+    }
+  }
+  if (s.size() == 32) {
+    out.assign(s.begin(), s.end());
+    return true;
+  }
+  err = "data key must be 64 hex chars (32 bytes) or 32 raw bytes: " + path;
+  return false;
 }
 
 }  // namespace cv

@@ -9,6 +9,13 @@
 #include <fstream>
 #include <sstream>
 #include <system_error>
+#include <vector>
+
+#ifdef CV_HAVE_OPENSSL
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#endif
 
 #include "core/sha256.h"
 
@@ -16,6 +23,11 @@ namespace cv {
 namespace fs = std::filesystem;
 
 namespace {
+
+// 加密 blob 磁盘格式：magic(4) + nonce(12) + tag(16) + ciphertext
+constexpr char kBlobMagic[4] = {'C', 'V', 'B', '1'};
+constexpr std::size_t kNonceLen = 12;
+constexpr std::size_t kTagLen = 16;
 
 bool writeFileAtomic(const std::string& finalPath, const std::string& data,
                      std::string& err) {
@@ -55,6 +67,126 @@ bool readFileAll(const std::string& path, std::string& out, std::string& err) {
   return true;
 }
 
+#ifdef CV_HAVE_OPENSSL
+
+// AES-256-GCM 加密：明文 → magic + nonce(12) + tag(16) + ciphertext。
+// 每个 blob 使用独立随机 nonce；tag 用于解密时验证完整性与真实性。
+bool evpEncrypt(const std::vector<unsigned char>& key, const std::string& plaintext,
+                std::string& blob, std::string& err) {
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) {
+    err = "EVP_CIPHER_CTX_new failed";
+    return false;
+  }
+  std::vector<unsigned char> nonce(kNonceLen, 0);
+  if (RAND_bytes(nonce.data(), static_cast<int>(kNonceLen)) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    err = "RAND_bytes failed";
+    return false;
+  }
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kNonceLen), nullptr) != 1 ||
+      EVP_EncryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    err = "EVP init failed";
+    return false;
+  }
+  std::string ct;
+  ct.reserve(plaintext.size());
+  int len = 0;
+  if (!plaintext.empty()) {
+    ct.resize(plaintext.size());
+    if (EVP_EncryptUpdate(ctx, reinterpret_cast<unsigned char*>(&ct[0]), &len,
+                          reinterpret_cast<const unsigned char*>(plaintext.data()),
+                          static_cast<int>(plaintext.size())) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      err = "EVP encrypt failed";
+      return false;
+    }
+    ct.resize(static_cast<std::size_t>(len));
+  }
+  if (EVP_EncryptFinal_ex(ctx, nullptr, &len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    err = "EVP final failed";
+    return false;
+  }
+  std::vector<unsigned char> tag(kTagLen, 0);
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, static_cast<int>(kTagLen), tag.data()) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    err = "EVP get tag failed";
+    return false;
+  }
+  EVP_CIPHER_CTX_free(ctx);
+
+  blob.clear();
+  blob.reserve(4 + kNonceLen + kTagLen + ct.size());
+  blob.append(kBlobMagic, 4);
+  blob.append(reinterpret_cast<const char*>(nonce.data()), kNonceLen);
+  blob.append(reinterpret_cast<const char*>(tag.data()), kTagLen);
+  blob.append(ct);
+  return true;
+}
+
+// AES-256-GCM 解密：magic + nonce(12) + tag(16) + ciphertext → 明文。
+// tag 校验失败（数据损坏或密钥错误）返回 false。
+bool evpDecrypt(const std::vector<unsigned char>& key, const std::string& blob,
+                std::string& out, std::string& err) {
+  if (blob.size() < 4 + kNonceLen + kTagLen) {
+    err = "blob too short to be encrypted";
+    return false;
+  }
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(blob.data());
+  if (std::memcmp(p, kBlobMagic, 4) != 0) {
+    err = "bad blob magic";
+    return false;
+  }
+  const unsigned char* nonce = p + 4;
+  const unsigned char* tag = p + 4 + kNonceLen;
+  const unsigned char* ct = p + 4 + kNonceLen + kTagLen;
+  const std::size_t ctLen = blob.size() - (4 + kNonceLen + kTagLen);
+
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) {
+    err = "EVP_CIPHER_CTX_new failed";
+    return false;
+  }
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kNonceLen), nullptr) != 1 ||
+      EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    err = "EVP init failed";
+    return false;
+  }
+  std::string pt;
+  pt.resize(ctLen);
+  int len = 0;
+  if (ctLen > 0) {
+    if (EVP_DecryptUpdate(ctx, reinterpret_cast<unsigned char*>(&pt[0]), &len, ct,
+                          static_cast<int>(ctLen)) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      err = "EVP decrypt failed";
+      return false;
+    }
+    pt.resize(static_cast<std::size_t>(len));
+  }
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, static_cast<int>(kTagLen),
+                          const_cast<unsigned char*>(tag)) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    err = "EVP set tag failed";
+    return false;
+  }
+  if (EVP_DecryptFinal_ex(ctx, nullptr, &len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    err = "EVP tag verify failed (data corrupted or wrong key)";
+    return false;
+  }
+  EVP_CIPHER_CTX_free(ctx);
+  out = std::move(pt);
+  return true;
+}
+
+#endif  // CV_HAVE_OPENSSL
+
 }  // namespace
 
 ContentStore::ContentStore(std::string root) : root_(std::move(root)) {}
@@ -69,7 +201,19 @@ bool ContentStore::validHash(const std::string& hex) {
 }
 
 std::string ContentStore::pathOf(const std::string& hex) const {
-  return root_ + "/" + hex.substr(0, 2) + "/" + hex;
+  // 加密开启时落盘文件名追加 .enc 后缀，与明文 blob 物理区分（内容仍按 sha256 去重）。
+  return root_ + "/" + hex.substr(0, 2) + "/" + hex + (encEnabled_ ? ".enc" : "");
+}
+
+std::string ContentStore::resolvePath(const std::string& hex) const {
+  // 读取/存在性/删除时实际落盘路径：加密优先 <hash>.enc，否则回退同名明文 <hash>，
+  // 以便从明文库平滑迁移（旧 blob 仍为明文，新 blob 为 .enc）。两者皆无则返回首选路径。
+  std::error_code ec;
+  const std::string enc = pathOf(hex);             // 加密时即 <hash>.enc，否则明文
+  if (fs::exists(enc, ec)) return enc;
+  const std::string plain = root_ + "/" + hex.substr(0, 2) + "/" + hex;
+  if (fs::exists(plain, ec)) return plain;
+  return enc;
 }
 
 bool ContentStore::init(std::string& err) {
@@ -82,10 +226,27 @@ bool ContentStore::init(std::string& err) {
   return true;
 }
 
+bool ContentStore::setDataKey(const std::vector<unsigned char>& key, std::string& err) {
+#ifdef CV_HAVE_OPENSSL
+  if (key.size() != 32) {
+    err = "data key must be 32 bytes (256 bits) for AES-256-GCM";
+    return false;
+  }
+  key_ = key;
+  encEnabled_ = true;
+  return true;
+#else
+  (void)key;
+  err = "static data encryption requires a TLS-capable build (CV_HAVE_OPENSSL); "
+        "rebuild with CV_ENABLE_TLS=ON and OpenSSL installed";
+  return false;
+#endif
+}
+
 bool ContentStore::exists(const std::string& hex) const {
   if (!validHash(hex)) return false;
   std::error_code ec;
-  return fs::exists(pathOf(hex), ec);
+  return fs::exists(resolvePath(hex), ec);
 }
 
 bool ContentStore::put(const std::string& hex, const std::string& data, std::string& err) {
@@ -102,6 +263,15 @@ bool ContentStore::put(const std::string& hex, const std::string& data, std::str
     err = "create dir failed: " + ec.message();
     return false;
   }
+
+#ifdef CV_HAVE_OPENSSL
+  if (encEnabled_) {
+    // 加密开启：内容用 AES-256-GCM 加密后落盘；落盘文件名追加 .enc 后缀（内容仍按 sha256 去重/秒传）。
+    std::string blob;
+    if (!evpEncrypt(key_, data, blob, err)) return false;
+    return writeFileAtomic(pathOf(hex), blob, err);
+  }
+#endif
   return writeFileAtomic(pathOf(hex), data, err);
 }
 
@@ -110,7 +280,28 @@ bool ContentStore::get(const std::string& hex, std::string& out, std::string& er
     err = "invalid content hash";
     return false;
   }
-  return readFileAll(pathOf(hex), out, err);
+  const std::string p = resolvePath(hex);
+  std::string raw;
+  if (!readFileAll(p, raw, err)) return false;
+  // 是否解密完全由文件名 .enc 后缀决定（不做内容嗅探，避免伪造明文绕过加密完整性校验）。
+  const bool isEncrypted = (p.size() >= 4 && p.compare(p.size() - 4, 4, ".enc") == 0);
+#ifdef CV_HAVE_OPENSSL
+  if (isEncrypted) {
+    if (!evpDecrypt(key_, raw, out, err)) {
+      err = "decrypt blob failed (" + hex + "): " + err;
+      return false;
+    }
+    return true;
+  }
+#else
+  // 未编译 OpenSSL 的二进制读不了密文：干净报错，绝不把密文当内容返回
+  if (isEncrypted) {
+    err = "blob is encrypted but this binary was built without OpenSSL support";
+    return false;
+  }
+#endif
+  out = raw;
+  return true;
 }
 
 bool ContentStore::drop(const std::string& hex, std::string& err) {
@@ -119,9 +310,13 @@ bool ContentStore::drop(const std::string& hex, std::string& err) {
     return false;
   }
   std::error_code ec;
-  bool removed = fs::remove(pathOf(hex), ec);
-  if (!removed) {
-    err = "remove failed: " + ec.message();
+  // 同时尝试 .enc（加密）与同名明文（迁移前遗留），两者皆删，避免漏删 .enc 造成孤立 blob。
+  const std::string enc = root_ + "/" + hex.substr(0, 2) + "/" + hex + ".enc";
+  const std::string plain = root_ + "/" + hex.substr(0, 2) + "/" + hex;
+  const bool removedEnc = fs::remove(enc, ec);
+  const bool removedPlain = fs::remove(plain, ec);
+  if (!removedEnc && !removedPlain) {
+    err = "blob not found: " + hex;
     return false;
   }
   return true;
@@ -192,88 +387,6 @@ bool ContentStore::readRange(const std::vector<std::string>& chunkHashes,
   return true;
 }
 
-bool ContentStore::materialize(const std::string& hex, const std::string& targetAbs,
-                               std::string& err) {
-  if (!validHash(hex)) {
-    err = "invalid hash";
-    return false;
-  }
-  std::error_code ec;
-  fs::path src = fs::path(pathOf(hex));
-  if (!fs::exists(src, ec)) {
-    err = "blob missing: " + hex;
-    return false;
-  }
-  fs::path dst = fs::path(targetAbs);
-  // 覆盖旧镜像（重传同名文件时保持指向最新内容）
-  fs::remove(dst, ec);
-  // 优先硬链接：同一数据目录内零拷贝；跨设备等场景退回复制
-  ec.clear();
-  fs::create_hard_link(src, dst, ec);
-  if (ec) {
-    std::error_code cec;
-    fs::copy_file(src, dst, fs::copy_options::overwrite_existing, cec);
-    if (cec) {
-      err = "materialize failed: link=" + ec.message() + " copy=" + cec.message();
-      return false;
-    }
-  }
-  return true;
-}
-
-bool ContentStore::materializeChunked(const std::vector<std::string>& chunkHashes,
-                                      const std::string& targetAbs, std::string& err) {
-  for (const std::string& h : chunkHashes) {
-    if (!validHash(h)) {
-      err = "invalid chunk hash";
-      return false;
-    }
-    if (!exists(h)) {
-      err = "blob missing: " + h;
-      return false;
-    }
-  }
-  std::error_code ec;
-  fs::path dst = fs::path(targetAbs);
-  fs::path tmp = dst;
-  tmp += ".tmp";
-  {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-      err = "cannot open tmp for write: " + tmp.string();
-      return false;
-    }
-    for (const std::string& h : chunkHashes) {
-      std::ifstream in(pathOf(h), std::ios::binary);
-      if (!in.is_open()) {
-        err = "cannot open blob: " + h;
-        fs::remove(tmp, ec);
-        return false;
-      }
-      out << in.rdbuf();   // 逐块流式拼接：峰值 ≈ 1 个分块，不整文件入内存
-      if (!out.good()) {
-        err = "write failed: " + tmp.string();
-        fs::remove(tmp, ec);
-        return false;
-      }
-    }
-    out.flush();
-    if (!out.good()) {
-      err = "flush failed: " + tmp.string();
-      fs::remove(tmp, ec);
-      return false;
-    }
-  }
-  fs::remove(dst, ec);
-  fs::rename(tmp, dst, ec);
-  if (ec) {
-    fs::remove(tmp, ec);
-    err = "rename failed: " + ec.message();
-    return false;
-  }
-  return true;
-}
-
 bool ContentStore::materializeFromChunks(const std::vector<std::string>& chunkHashes,
                                         const std::string& targetAbs, std::string& err) {
   if (targetAbs.empty()) {
@@ -287,7 +400,8 @@ bool ContentStore::materializeFromChunks(const std::vector<std::string>& chunkHa
       err = "cannot open tmp for write: " + tmp;
       return false;
     }
-    // 逐块读入写出：任何时刻内存里只有一个分块
+    // 逐块读入写出：任何时刻内存里只有一个分块。
+    // 经 get() 读取会自动解密（加密开启时），故镜像即明文拼接结果。
     for (const std::string& h : chunkHashes) {
       if (!validHash(h)) {
         out.close();
@@ -296,15 +410,16 @@ bool ContentStore::materializeFromChunks(const std::vector<std::string>& chunkHa
         err = "invalid chunk hash";
         return false;
       }
-      std::ifstream in(pathOf(h), std::ios::binary);
-      if (!in.is_open()) {
+      std::string part;
+      if (!get(h, part, err)) {
         out.close();
         std::error_code rec;
         fs::remove(tmp, rec);
-        err = "chunk blob missing: " + h;
         return false;
       }
-      out << in.rdbuf();
+      if (!part.empty()) {
+        out.write(part.data(), static_cast<std::streamsize>(part.size()));
+      }
       if (!out.good()) {
         out.close();
         std::error_code rec;
@@ -350,6 +465,21 @@ bool ContentStore::putFromFile(const std::string& hex, const std::string& srcPat
     err = "create blob dir failed: " + ec.message();
     return false;
   }
+
+#ifdef CV_HAVE_OPENSSL
+  if (encEnabled_) {
+    // 加密开启：零拷贝搬移失效，必须先读明文再加密落盘。源文件稍后清理。
+    std::string data;
+    if (!readFileAll(srcPath, data, err)) return false;
+    std::string blob;
+    if (!evpEncrypt(key_, data, blob, err)) return false;
+    if (!writeFileAtomic(dst.string(), blob, err)) return false;
+    std::error_code rec;
+    fs::remove(fs::path(srcPath), rec);
+    return true;
+  }
+#endif
+
   // 同盘 rename = 零拷贝搬移（tmp → blobs），避免 tmp 与 blob 双份占盘
   ec.clear();
   fs::rename(fs::path(srcPath), dst, ec);

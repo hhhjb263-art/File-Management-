@@ -95,6 +95,10 @@ public:
     static QString formatTime(qint64 epoch);   // 时间列格式化：入口把服务端的毫秒归一化成秒，再转本地时间字符串
     static QString formatBody(const QByteArray &raw);  // 响应原文（过长截断）
 
+    // TOFU 证书指纹固定：在 sslErrors 信号里做"首次信任即记住、之后指纹变化即拒绝"。
+    // trustTls=true 表示勾选了「允许使用自签名证书（首次需确认）」；parent 用于弹窗归属。
+    static void applyCertPinning(QNetworkReply *reply, bool trustTls, QWidget *parent);
+
 private slots:
     void onHealthCheck();   // 【健康检查】 GET /healthz
     void onUpload();        // 【选择文件并上传】 POST /api/v1/files（整文件，保留）
@@ -114,6 +118,7 @@ private slots:
     void onSelectionChanged();   // 列表选中行变化 -> 拉取并渲染预览
     void onForcePreview();       // 【仍要预览】超过体积上限时由用户显式确认
     void onReplyFinished(QNetworkReply *reply);
+    void onShowCertPin();      // 【证书…】查看/清除当前服务器已固定的证书指纹(TOFU)
 
 private:
     // ---- 界面搭建 ----
@@ -128,6 +133,8 @@ private:
     // 支持 GET / POST / PUT / DELETE；verb 记到 cvVerb 属性上供日志使用。
     QNetworkReply *sendRequest(const QNetworkRequest &request, const QByteArray &verb,
                                const QByteArray &body = QByteArray());
+    // 从顶部服务器地址输入框推导「host:port」，与 applyCertPinning 的 key 保持一致
+    QString currentHostPort() const;
     // 请求完成后的统一收口：写日志 + 按 cvStep（分块会话）或 URL 分派业务处理
     void handleReply(QNetworkReply *reply, const QByteArray &raw);
     void handleUploadReply(int status, const QByteArray &raw);
@@ -226,6 +233,7 @@ private:
 
     // ---- 成员 ----
     QLineEdit *m_serverEdit = nullptr;
+    QLineEdit *m_tokenEdit = nullptr;   // 访问令牌（Bearer），留空表示不带 Token
     QPushButton *m_healthBtn = nullptr;
     QPushButton *m_uploadBtn = nullptr;
     QPushButton *m_listBtn = nullptr;
@@ -236,7 +244,9 @@ private:
     QPushButton *m_dlResumeBtn = nullptr;       // 【分块下载（断点续传）】
     QLabel *m_statusLabel = nullptr;            // 顶部结果标识（✓ 成功 / ✗ 失败）
     QLabel *m_spaceLabel = nullptr;             // 顶部：服务器剩余空间显示
-    QCheckBox *m_trustTls = nullptr;            // 信任自签名证书（HTTPS 自签场景）
+    QCheckBox *m_trustTls = nullptr;            // 允许使用自签名证书（TOFU，首次需确认）
+    QPushButton *m_certPinBtn = nullptr;         // 【证书…】查看/清除已固定的证书指纹(TOFU)
+    bool m_plaintextWarned = false;              // 明文 http 携带令牌的告警去重标记（避免刷屏）
     QTimer *m_spaceTimer = nullptr;             // 空间显示定时刷新
     QProgressBar *m_progressBar = nullptr;     // 分块上传进度：已传块数 / 总块数
     QLabel *m_progressLabel = nullptr;         // 进度文案（含 upload_id / 续传命中）

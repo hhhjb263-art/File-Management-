@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 
 namespace cv {
 
@@ -23,6 +24,17 @@ struct Config {
   std::string tlsCert;             // PEM 证书路径
   std::string tlsKey;              // PEM 私钥路径
 
+  // API 认证：非空则启用 Bearer Token 鉴权（除 /healthz 外全接口强制）。
+  // 空 = 不启用（向后兼容）。三通道：--auth-token / CV_AUTH_TOKEN / auth_token。
+  std::string authToken = "";
+  // 明文 HTTP 监听开关：false 即 --http=off（仅保留 HTTPS）。默认 true（开）。
+  bool httpEnabled = true;
+
+  // 静态数据加密密钥文件路径：非空即启用 blob 落盘加密（AES-256-GCM）。
+  // 空 = 不加密（向后兼容）。三通道：--data-key / CV_DATA_KEY / data_key。
+  // 密钥文件支持 64 个十六进制字符（32 字节）或直接 32 字节原始数据。
+  std::string dataKey = "";
+
   std::string dbPath() const { return dataDir + "/meta/cloudvault.db"; }
   std::string blobRoot() const { return dataDir + "/blobs"; }
   std::string tmpRoot() const { return dataDir + "/tmp"; }
@@ -34,6 +46,10 @@ struct Config {
 
 // 解析 argc/argv、环境变量（CV_*）与 --config 指定的 key=value 文件。
 Config loadConfig(int argc, char** argv);
+
+// 加载静态加密密钥文件：支持 64 个十六进制字符（32 字节）或 32 字节原始数据。
+// 文件不存在 / 长度不对 → 返回 false 并填充 err。成功则将 32 字节密钥写入 out。
+bool loadDataKeyFile(const std::string& path, std::vector<unsigned char>& out, std::string& err);
 
 // 命令行帮助文本。
 std::string configUsage(const char* program);

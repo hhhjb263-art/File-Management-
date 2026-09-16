@@ -138,6 +138,12 @@ cmake --install build
 | `--chunk-size` / `CV_CHUNK_SIZE` / `chunk_size` | `5242880` | 分块大小（字节） |
 | `--log-file` / `CV_LOG_FILE` / `log_file` | 空（stdout） | 日志文件 |
 | `--log-level` / `CV_LOG_LEVEL` / `log_level` | `info` | `debug` / `info` / `warn` / `error` |
+| `--auth-token` / `CV_AUTH_TOKEN` / `auth_token` | 空（**不启用**） | API Bearer Token；非空即启用鉴权（见 §4.3） |
+| `--http` / `CV_HTTP` / `http` | `on` | 明文 HTTP 监听开关；`off` 仅保留 HTTPS（须配 TLS，否则启动报错，见 §4.3） |
+| `--tls-port` / `CV_TLS_PORT` / `tls_port` | `0`（关） | HTTPS 监听端口（需 `--tls-cert` / `--tls-key`） |
+| `--tls-cert` / `CV_TLS_CERT` / `tls_cert` | 空 | HTTPS PEM 证书路径 |
+| `--tls-key` / `CV_TLS_KEY` / `tls_key` | 空 | HTTPS PEM 私钥路径 |
+| `--data-key` / `CV_DATA_KEY` / `data_key` | 空（**不加密**） | 静态数据加密密钥文件（64 hex 或 32 字节原文）；非空即启用 blob 落盘加密（见 §4.5） |
 
 > 想把文件树落到别处（如独立数据盘）：`--files-root=/mnt/data/cvfiles`。
 > `/healthz` 会回显当前生效的 `data_dir` 与 `files_root`，便于核对。
@@ -461,13 +467,136 @@ curl -s "localhost:8080/api/v1/download?path=..%2Fsecret" -o -              # 40
 
 ---
 
+## 4.3 API 认证（Bearer Token）+ 明文 HTTP 关闭
+
+抓包审计发现：TLS 只保护信道，不解决"谁来敲门"；且明文 8080 仍在监听。现增加应用层鉴权与明文端口开关。
+
+### 配置（三通道等价：命令行 > 环境变量 > 配置文件 > 默认值）
+
+| 选项 | 命令行 | 环境变量 | 配置文件键 | 默认 |
+|---|---|---|---|---|
+| API Token | `--auth-token=<secret>` | `CV_AUTH_TOKEN` | `auth_token` | 空（**不启用**） |
+| 明文 HTTP | `--http=on\|off` | `CV_HTTP` | `http` | `on`（开） |
+
+- **认证默认关闭**（向后兼容）。启动时按如下规则打日志（**绝不打印 token 明文**）：
+  - 已配置 token → `INFO  鉴权已启用：除 /healthz 外全部接口强制 Authorization: Bearer <token>（同时兼容 X-CV-Token 头）`
+  - 未配置 token + 已开 HTTPS 且监听地址 ≠ `127.0.0.1` → `WARN  未启用鉴权，任何能访问该端口(HTTPS) 的人都可读写全部文件`
+  - 未配置 token 的其他情况 → `WARN  认证未启用：任何人可读写全部文件（生产环境请用 --auth-token）`
+- **明文 HTTP 默认开启**：`--http=off` 仅关闭明文监听，仅保留 HTTPS。
+
+### 行为
+
+- 启用后，**除 `GET /healthz` 外所有请求**必须带 `Authorization: Bearer <token>`。
+- 兼容历史头 `X-CV-Token: <token>`（直接携带 token，无 `Bearer ` 前缀）；两种头任选其一即可。
+- 缺失 / 不匹配 → `401`，**响应体说明原因，且不再 dispatch 后续处理**：
+  ```json
+  {"error":"missing or invalid Authorization token (use: Authorization: Bearer <token>)","status":401}
+  ```
+- **恒定时间比较**：Token 比对不用 `==`，而是先异或折叠长度差、再对公共前缀逐字节异或累加差异，且**不提前 return**，比较时长与首个不同字节位置无关，避免时序侧信道。`/healthz` 始终免认证（保持探活）。
+- `GET /healthz` 免认证（保持探活），但**启用认证时不再返回 `data_dir` / `files_root`**（避免泄露服务器路径），仅返回 `status` / `version` / `tls_port` / `disk_free_bytes` / `disk_total_bytes`。
+- `--http=off` 且未配置 `--tls-port`（或 TLS 未编译 / 证书缺失）→ **启动直接报错退出**，杜绝"零监听"静默状态；TLS 证书缺失 / 未编译时报错信息亦明确。
+
+```bash
+# 启用 Token 鉴权（任选一种配置通道）
+./cloudvault-server --auth-token='s3cr3t' --tls-port=8443 --tls-cert=cert.pem --tls-key=key.pem
+
+# 不带 Token 访问 → 401
+curl -s localhost:8443/api/v1/files
+# {"error":"unauthorized","status":401}
+
+# 带 Token → 200
+curl -s -H 'Authorization: Bearer s3cr3t' localhost:8443/api/v1/files
+
+# 关闭明文 HTTP，仅留 HTTPS
+./cloudvault-server --auth-token='s3cr3t' --http=off --tls-port=8443 --tls-cert=cert.pem --tls-key=key.pem
+
+# 仅关 HTTP 却不配 TLS → 启动失败并明确报错
+./cloudvault-server --http=off
+# [error] 配置冲突：--http=off（明文 HTTP 已关闭）但未配置 --tls-port，...
+```
+
+---
+
+## 4.4 keep-alive（连接复用）
+
+每连接默认支持 keep-alive：一个 worker 线程全程持有该连接，循环「读请求 → 处理 → 写响应」，
+避免每个请求都重建 TCP/TLS 握手（抓包实测原实现每请求一次完整握手、无任何会话复用）。
+仅支持 `Content-Length` 定长帧（与现有实现一致），不引入 chunked。
+
+**响应头**：可继续时 `Connection: keep-alive`，要关闭时显式 `Connection: close`（HTTP/1.1 默认 keep-alive，仍显式写出以最大化兼容性）。
+
+**关闭本连接的触发条件**：
+
+- 客户端请求头带 `Connection: close`；
+- 请求解析失败（返回 `400`）；
+- 单连接累计请求数达到上限（默认 `200`，超出后本次响应标记关闭，下一轮直接断开）；
+- 读下一请求超时（SO_RCVTIMEO = 30s）或对端关闭 —— **超时静默关闭，不刷 WARN**，避免日志被空连接刷屏。
+
+**关键正确性**：keep-alive 下 `recv` 可能一次多读「下一请求的开头字节」。实现会把当前请求
+之后的残留字节保留为 `residue`，作为下一次 `readRequest` 的起点，否则后续请求会解析错乱。
+`readRequest` 在拼出「恰好一个完整请求」后才把多余字节切出留给下一轮，且 `raw` 被截断到本请求边界再交给 `parseRequest`。
+
+> 现有「请求队列 + worker 线程池」模型不变：一个连接仍由一个 worker 全程持有，不改为长连接跨 worker。
+
+## 4.5 静态数据加密（blob 落盘加密）
+
+目标：内容库 blob 落盘加密，拿到磁盘也无法直接读出文件内容。默认关闭（向后兼容），
+配置密钥后即启用。
+
+### 配置（三通道等价）
+
+| 选项 | 命令行 | 环境变量 | 配置文件键 | 默认 |
+|---|---|---|---|---|
+| 静态加密密钥 | `--data-key=<path>` | `CV_DATA_KEY` | `data_key` | 空（**不加密**） |
+
+- 密钥文件支持两种格式：**64 个十六进制字符（32 字节）**，或 **32 字节原始数据**（两种都支持，自动识别；文件首尾空白/换行会被忽略）。
+- 密钥文件不存在 / 长度不对（既非 64 hex 也非 32 字节）→ **启动报错退出**。
+- 已配置 `--data-key` 但二进制未编译 OpenSSL（`CV_HAVE_OPENSSL` 未定义）→ **启动报错退出**（绝不手写加密）。
+
+启用示例：
+
+```bash
+# 生成 32 字节随机密钥（hex 形式）
+openssl rand -hex 32 > /etc/cloudvault/data.key
+./cloudvault-server --data-key=/etc/cloudvault/data.key --tls-port=8443 --tls-cert=cert.pem --tls-key=key.pem
+```
+
+### 加密格式
+
+blob 文件落盘布局（每个 blob 独立随机 nonce）：
+
+```
+magic(4 字节 "CVB1") + nonce(12) + tag(16) + ciphertext
+```
+
+- 算法：**OpenSSL EVP AES-256-GCM**；每 blob 独立随机 12 字节 nonce；`tag` 用于解密时校验完整性与真实性（被篡改会解密失败）。
+- **只加密内容，不加密文件名 / 哈希**：blob 文件名仍是明文 sha256 十六进制（用于内容寻址与秒传），文件名本身不含机密。
+- 覆盖全部读写路径：`put` / `putFromFile` / `get` / `readRange` / `materializeFromChunks`；`getChunked`、`readRange`（GCM 不可 seek → 先整块解密再切片，blob 即分块、通常 ≤5MiB，可接受）均经 `get` 自然解密。
+- `putFromFile` 在未加密时是「同盘 rename 零拷贝搬移」；加密开启后该优化**自然失效**：必须先读明文再加密落盘（源文件随后清理），未加密时仍保留原零拷贝行为。
+
+### 两个必须知晓的取舍（开启加密时自动生效）
+
+1. **文件树镜像落盘自动关闭**：镜像本质是明文副本，会让加密形同虚设。故启用加密后，物理镜像树不再生成；下载走分块拼装路径（见下）。启动会打一条 `WARN` 说明此取舍。
+2. **Range 下载自动走「分块拼装 + 解密」**：镜像直读快路径（`serveFileContent` 的快捷分支）在加密开启时被跳过，Range 下载统一经 `readRange` 分块拼装并解密，日志显示 `[分块拼装]`。单次吞吐略降，但安全性提升。
+
+### 自查
+
+加密生效后，落盘 blob 不得含明文片段：
+
+```bash
+# 应无任何有意义的明文输出（strings 找不到可读片段）
+strings blobs/xx/<sha256> | head
+```
+
+---
+
 ## 5. 今天做 / 没做的边界
 
 **已实现**
 
 - 分层工程骨架 + CMake + 核心自检
 - 配置（命令行 > 环境变量 > 配置文件 > 默认值）、结构化日志
-- HTTP/1.1 服务器：POSIX socket + 线程池 + 路径参数路由（每连接单请求后关闭）
+- HTTP/1.1 服务器：POSIX socket + 线程池 + 路径参数路由；支持 **keep-alive**（单连接复用、上限 200 请求、读超时静默关闭、完整切走上一请求 body 残留），不再每请求一次握手（见 §4.4）
 - SHA-256 内容寻址存储：5MB 分块、原子写入（临时文件 + rename）、去重
 - SQLite 元数据：chunk / file_node / file_chunk / file_version / upload_session / upload_chunk / dir_node / file_dir / upload_dir 建表，写入走事务
 - 整文件上传 / 列表 / 下载（下载支持 `Range: bytes=` → `206`）
@@ -475,6 +604,8 @@ curl -s "localhost:8080/api/v1/download?path=..%2Fsecret" -o -              # 40
 - 端到端冒烟脚本 `testdata/smoke_chunked.sh`（覆盖续传 / 秒传 / 空文件 / Range）
 - 边界受限目录树：`POST/GET /api/v1/dirs`、嵌套文件树 `GET /api/v1/tree`、按路径下载 `GET /api/v1/download`
   （路径规范化清洗、`..`/绝对路径/符号链接拒绝、越界 403）
+- API 鉴权：Bearer Token（`--auth-token` / `CV_AUTH_TOKEN` / `auth_token`，兼容 `X-CV-Token` 头；恒定时间比较，不提前 return），除 `/healthz` 外全接口强制 401（JSON 说明原因，不再 dispatch）；明文 HTTP 可按 `--http=off` 关闭（必须与 TLS 二选一，否则启动报错）
+- 静态数据加密：blob 落盘 AES-256-GCM（每 blob 独立随机 nonce，`magic+nonce+tag+ciphertext` 格式；只加密内容、不加密文件名/哈希）；`--data-key` / `CV_DATA_KEY` / `data_key` 配置，覆盖 `put`/`putFromFile`/`get`/`readRange`/`materializeFromChunks` 全路径；启用后自动关闭文件树明文镜像、Range 走分块拼装 + 解密（见 §4.5）
 
 **明确未实现（后续模块）**
 

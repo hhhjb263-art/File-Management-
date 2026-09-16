@@ -21,6 +21,10 @@
 //   PUT  /api/v1/uploads/:id/chunk/:seq  上传单个分块（幂等）
 //   POST /api/v1/uploads/:id/complete     合并分块落库（落入 init 登记的目录）
 //   DELETE /api/v1/uploads/:id       取消会话
+//
+// 鉴权：--auth-token / CV_AUTH_TOKEN / auth_token 非空时启用 Bearer Token 鉴权，
+//   除 /healthz 外全接口强制 Authorization: Bearer；缺失/不匹配 → 401（恒定时间比较）。
+// 明文 HTTP：--http=on|off（默认 on）；off 时仅保留 HTTPS（须同时配置 TLS，否则启动报错）。
 
 #include <algorithm>
 #include <cerrno>
@@ -418,12 +422,14 @@ void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const c
     // 镜像是完整连续文件，比分块拼装（开多个 blob、seek、拷贝拼接）快得多，
     // 也对操作系统预读 / 页缓存友好。镜像可能缺失（空间不足被跳过 / 旧版本上传），
     // 此时回退到按分块拼装，行为不变。
+    // 静态加密开启时镜像落盘已被自动关闭，故强制走「分块拼装 + 解密」（日志显示 [分块拼装]）。
     std::string slice;
     bool servedFromMirror = false;
     {
       const std::string mirrorPath = diskFilePath(cfg, row.dir, row.name);
       std::error_code mec;
-      if (fs::file_size(mirrorPath, mec) == static_cast<std::uintmax_t>(total) && !mec) {
+      if (!store.encryptionEnabled() &&
+          fs::file_size(mirrorPath, mec) == static_cast<std::uintmax_t>(total) && !mec) {
         std::ifstream in(mirrorPath, std::ios::binary);
         if (in.is_open()) {
           in.seekg(rstart);
@@ -658,6 +664,34 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // 静态数据加密：--data-key / CV_DATA_KEY / data_key 非空即启用 blob 落盘加密。
+  // 密钥文件格式：64 hex（32 字节）或 32 字节原文；缺失/长度不对 → 启动报错退出。
+  // 已配置密钥但二进制未编译 OpenSSL → 启动报错退出（无法加密）。
+  bool encEnabled = false;
+  if (!cfg.dataKey.empty()) {
+#ifdef CV_HAVE_OPENSSL
+    std::vector<unsigned char> dataKey;
+    if (!loadDataKeyFile(cfg.dataKey, dataKey, err)) {
+      CV_LOG_ERROR("加载静态加密密钥失败: " << err);
+      return 1;
+    }
+    if (!store.setDataKey(dataKey, err)) {
+      CV_LOG_ERROR("启用静态加密失败: " << err);
+      return 1;
+    }
+    encEnabled = true;
+    // 取舍：加密后文件树镜像若为明文副本会让加密形同虚设，故自动关闭镜像落盘；
+    // Range 下载改走「分块拼装 + 解密」（日志显示 [分块拼装]），镜像直读快路径不再可用。
+    CV_LOG_WARN("静态数据加密已启用：文件树镜像落盘已自动关闭，Range 下载将走分块拼装 + 解密路径"
+                "（安全性提升，单次下载吞吐略降）。");
+#else
+    CV_LOG_ERROR("已配置 --data-key 但本二进制未编译 OpenSSL（CV_ENABLE_TLS=OFF），无法启用静态加密；"
+                 "请使用编译期启用 TLS 的二进制。");
+    return 1;
+#endif
+  }
+  const bool mirrorEnabled = !encEnabled;
+
   Db db;
   if (!db.open(cfg.dbPath(), err)) {
     CV_LOG_ERROR("打开元数据库失败: " << err);
@@ -671,6 +705,22 @@ int main(int argc, char** argv) {
   FileRepository repo(db);
   UploadRepository up(db);
   net::HttpServer server;
+
+  // 启用 API Bearer Token 鉴权（空 = 不启用，向后兼容）
+  server.setAuthToken(cfg.authToken);
+  if (cfg.authToken.empty()) {
+    // 仅在“暴露面”较大时（HTTPS 且监听非本地）升级为更醒目的风险告警；
+    // 纯明文 HTTP 或仅本地监听也告警，但措辞区分。
+    if (cfg.tlsPort > 0 && cfg.listenAddr != "127.0.0.1") {
+      CV_LOG_WARN("未启用鉴权，任何能访问该端口(HTTPS) 的人都可读写全部文件");
+    } else {
+      CV_LOG_WARN("认证未启用：任何人可读写全部文件（生产环境请用 --auth-token）");
+    }
+  } else {
+    // 不打印 token 明文
+    CV_LOG_INFO("鉴权已启用：除 /healthz 外全部接口强制 Authorization: Bearer <token>"
+                "（同时兼容 X-CV-Token 头）");
+  }
 
   // ---- 启动期会话 GC：清理闲置超时的未完成会话及其临时文件 ----
   {
@@ -693,8 +743,11 @@ int main(int argc, char** argv) {
     json::Value v = json::Value::object();
     v.set("status", "ok");
     v.set("version", kVersion);
-    v.set("data_dir", cfg.dataDir);
-    v.set("files_root", filesRoot(cfg));   // 客户端可操作的目录树根（便于自查）
+    // 启用鉴权时不再泄露服务器路径（data_dir/files_root），仅暴露运维状态
+    if (cfg.authToken.empty()) {
+      v.set("data_dir", cfg.dataDir);
+      v.set("files_root", filesRoot(cfg));
+    }
     std::error_code sec;
     const fs::space_info sinfo = fs::space(cfg.dataDir, sec);
     v.set("disk_free_bytes",
@@ -777,9 +830,12 @@ int main(int argc, char** argv) {
     }
 
     // 物理镜像树（尽力而为；内容仍以 blob + DB 为权威，失败仅告警）
-    std::string mirrorErr;
-    if (!store.materializeFromChunks(chunkHashes, diskFilePath(cfg, dir, name), mirrorErr)) {
-      CV_LOG_WARN("镜像文件树失败 id=" << id << ": " << mirrorErr);
+    // 静态加密开启时镜像已自动关闭（避免明文副本），此路径跳过。
+    if (mirrorEnabled) {
+      std::string mirrorErr;
+      if (!store.materializeFromChunks(chunkHashes, diskFilePath(cfg, dir, name), mirrorErr)) {
+        CV_LOG_WARN("镜像文件树失败 id=" << id << ": " << mirrorErr);
+      }
     }
 
     json::Value v = json::Value::object();
@@ -852,9 +908,11 @@ int main(int argc, char** argv) {
       resp.setError(500, std::string("db failed: ") + perr);
       return;
     }
-    std::string mirrorErr;
-    if (!store.materializeFromChunks({}, diskFilePath(cfg, dir, name), mirrorErr)) {
-      CV_LOG_WARN("镜像文件树失败 id=" << id << ": " << mirrorErr);
+    if (mirrorEnabled) {
+      std::string mirrorErr;
+      if (!store.materializeFromChunks({}, diskFilePath(cfg, dir, name), mirrorErr)) {
+        CV_LOG_WARN("镜像文件树失败 id=" << id << ": " << mirrorErr);
+      }
     }
     json::Value v = json::Value::object();
     v.set("id", static_cast<long long>(id));
@@ -929,7 +987,7 @@ int main(int argc, char** argv) {
                  std::error_code rec;
                  fs::rename(diskFilePath(cfg, row.dir, row.name),
                             diskFilePath(cfg, row.dir, newName), rec);
-                 if (rec) {
+                 if (rec && mirrorEnabled) {
                    std::string mirrorErr;
                    std::vector<std::string> chunkHashes;
                    if (repo.chunkHashesOf(row.id, chunkHashes, perr)) {
@@ -1552,13 +1610,16 @@ int main(int argc, char** argv) {
                    return;
                  }
                  // 物理镜像树（尽力而为；空间不足则跳过，失败仅告警，内容仍以 blob + DB 为权威）
-                 std::string mirrorErr;
-                 if (freeSpaceBelow(cfg, static_cast<std::int64_t>(s.size))) {
-                   CV_LOG_WARN("跳过镜像（空间不足）file_id=" << fileId);
-                 } else if (!store.materializeFromChunks(chunkHashes,
-                                                        diskFilePath(cfg, dir, s.name),
-                                                        mirrorErr)) {
-                   CV_LOG_WARN("镜像文件树失败 file_id=" << fileId << ": " << mirrorErr);
+                 // 静态加密开启时镜像已自动关闭（避免明文副本），此路径跳过。
+                 if (mirrorEnabled) {
+                   std::string mirrorErr;
+                   if (freeSpaceBelow(cfg, static_cast<std::int64_t>(s.size))) {
+                     CV_LOG_WARN("跳过镜像（空间不足）file_id=" << fileId);
+                   } else if (!store.materializeFromChunks(chunkHashes,
+                                                          diskFilePath(cfg, dir, s.name),
+                                                          mirrorErr)) {
+                     CV_LOG_WARN("镜像文件树失败 file_id=" << fileId << ": " << mirrorErr);
+                   }
                  }
                  up.setStatus(id, "completed", perr);
                  // 清理临时分块文件与会话分块记录（会话行保留供查询）
@@ -1601,13 +1662,17 @@ int main(int argc, char** argv) {
                  CV_LOG_INFO("取消会话 upload_id=" << id);
                });
 
-  if (!server.listen(cfg.listenAddr, cfg.port, cfg.workers, err)) {
-    CV_LOG_ERROR("监听失败: " << err);
-    return 1;
+  // 明文 HTTP 监听（可经 --http=off 关闭，仅保留 HTTPS）
+  if (cfg.httpEnabled) {
+    if (!server.listen(cfg.listenAddr, cfg.port, cfg.workers, err)) {
+      CV_LOG_ERROR("HTTP 监听失败: " << err);
+      return 1;
+    }
+    CV_LOG_INFO("监听(明文) " << cfg.listenAddr << ":" << cfg.port << "  数据目录 " << cfg.dataDir
+                             << "  工作线程 " << cfg.workers);
+  } else {
+    CV_LOG_INFO("明文 HTTP 已按 --http=off 关闭，仅保留 HTTPS");
   }
-
-  CV_LOG_INFO("监听 " << cfg.listenAddr << ":" << cfg.port << "  数据目录 " << cfg.dataDir
-                      << "  工作线程 " << cfg.workers);
 
   // TLS 双模式：配置了 --tls-port 且证书/私钥齐全 → 额外开 HTTPS 监听（与 HTTP 并行）。
   // 用户显式要求 HTTPS 而二进制不支持时直接退出（静默降级是安全 footgun）。
@@ -1628,6 +1693,11 @@ int main(int argc, char** argv) {
     CV_LOG_ERROR("本二进制未编译 TLS 支持（CV_ENABLE_TLS=OFF 或缺少 OpenSSL），无法启用 HTTPS");
     return 1;
 #endif
+  } else if (!cfg.httpEnabled) {
+    // --http=off 但未配置任何 TLS → 将出现“零监听”静默状态，必须显式报错退出
+    CV_LOG_ERROR("配置冲突：--http=off（明文 HTTP 已关闭）但未配置 --tls-port，"
+                 "服务端将无任何监听端口。请配置 TLS(--tls-port/--tls-cert/--tls-key)或保持 HTTP 开启。");
+    return 1;
   }
   {
     const std::int64_t freeBytes = diskFreeBytes(cfg.dataDir);

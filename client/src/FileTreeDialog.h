@@ -31,7 +31,8 @@ public:
     // allowCreateDir: 是否显示【新建文件夹】按钮；为 true 时以【关闭】代替【确定】
     FileTreeDialog(const QUrl &dirsUrl, const QUrl &filesUrl, Mode mode,
                    const QString &initialPath, bool allowCreateDir,
-                   QWidget *parent = nullptr, bool trustTls = true);
+                   QWidget *parent = nullptr, bool trustTls = true,
+                   const QString &authToken = QString());
     ~FileTreeDialog();
 
     // exec() 返回 Accepted 时调用方才取值；Rejected 不取值（取消 / 关闭）
@@ -77,6 +78,7 @@ private:
     QString m_initialPath;
     bool m_allowCreateDir;
     bool m_trustTls = true;       // 信任自签名证书（HTTPS 场景）
+    QString m_authToken;          // 访问令牌（Bearer）；来自 MainWindow 的输入框，留空不带 Token
 
     QTreeWidget *m_tree = nullptr;
     QLabel *m_status = nullptr;

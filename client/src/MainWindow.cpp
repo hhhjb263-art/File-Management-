@@ -34,13 +34,18 @@
 #include <QDir>
 #include <QJsonArray>
 #include <QMenu>
+#include <QSslCertificate>
 #include <QSslError>
+#include <QSettings>
+#include <QLoggingCategory>
 #include <QProgressBar>
 #include <QStandardPaths>
 #include <QTimer>
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QAbstractButton>
+#include <QDialog>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileDialog>
@@ -134,6 +139,18 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     QWidget *center = new QWidget(this);
     QVBoxLayout *mainLayout = new QVBoxLayout(center);
     mainLayout->addWidget(createTopBar());
+
+    // 访问令牌：启动时从 QSettings 回填；编辑完成后持久化（键 authToken）。
+    // 组织名/应用名取自 main.cpp（QCoreApplication::applicationName = cloudvault-client）。
+    {
+        QSettings s;
+        m_tokenEdit->setText(s.value(QStringLiteral("authToken")).toString());
+        connect(m_tokenEdit, &QLineEdit::editingFinished, this, [this]() {
+            QSettings s;
+            // 与发送端一致：存 trimmed 后的值，避免首尾空格被持久化后又原样回填
+            s.setValue(QStringLiteral("authToken"), m_tokenEdit->text().trimmed());
+        });
+    }
     mainLayout->addWidget(createCenter(), 1);
 
     m_log = new QPlainTextEdit(center);
@@ -168,6 +185,13 @@ QWidget *MainWindow::createTopBar()
     m_serverEdit->setClearButtonEnabled(true);
     m_serverEdit->setMinimumWidth(240);
 
+    QLabel *tokenLabel = new QLabel(QStringLiteral("访问令牌："), row1);
+    m_tokenEdit = new QLineEdit(row1);
+    m_tokenEdit->setEchoMode(QLineEdit::Password);   // 密码框，避免令牌泄露
+    m_tokenEdit->setPlaceholderText(QStringLiteral("访问令牌（可留空）"));
+    m_tokenEdit->setClearButtonEnabled(true);
+    m_tokenEdit->setMinimumWidth(200);
+
     m_healthBtn = new QPushButton(QStringLiteral("健康检查"), row1);
     m_uploadBtn = new QPushButton(QStringLiteral("选择文件并上传（可多选）"), row1);
     m_listBtn = new QPushButton(QStringLiteral("列出文件"), row1);
@@ -190,6 +214,8 @@ QWidget *MainWindow::createTopBar()
     layout1->setContentsMargins(0, 0, 0, 0);
     layout1->addWidget(label);
     layout1->addWidget(m_serverEdit);
+    layout1->addWidget(tokenLabel);
+    layout1->addWidget(m_tokenEdit);
     layout1->addWidget(m_healthBtn);
     layout1->addWidget(m_uploadBtn);
     layout1->addWidget(m_listBtn);
@@ -207,10 +233,15 @@ QWidget *MainWindow::createTopBar()
     m_progressBar->setRange(0, 1);
     m_progressBar->setValue(0);
     m_progressBar->setMinimumWidth(200);
-    m_trustTls = new QCheckBox(QStringLiteral("信任自签名证书"), row2);
-    m_trustTls->setChecked(true);   // 私有云常见自签名证书；不信任时可手动取消
+    m_trustTls = new QCheckBox(QStringLiteral("允许使用自签名证书（首次需确认）"), row2);
+    m_trustTls->setChecked(true);   // 默认勾选：首次连接会弹确认框并记住证书指纹
     m_trustTls->setToolTip(QStringLiteral(
-        "HTTPS 服务器使用自签名证书时需要勾选；取消后 Qt 将按标准证书链校验（可防中间人）"));
+        "勾选后采用 TOFU 证书指纹固定：首次连接会弹框让你确认并记住服务器证书指纹，"
+        "之后指纹变化将被拒绝（疑似中间人）；取消勾选则按标准证书链校验"
+        "（自签名证书会被拒）。仅影响 HTTPS。"));
+    m_certPinBtn = new QPushButton(QStringLiteral("证书…"), row2);
+    m_certPinBtn->setToolTip(QStringLiteral("查看 / 清除当前服务器已固定的证书指纹（TOFU）"));
+    connect(m_certPinBtn, &QPushButton::clicked, this, &MainWindow::onShowCertPin);
     m_statusLabel = new QLabel(QString(), row2);   // 成功/失败的简化标识
     m_spaceLabel = new QLabel(QStringLiteral("服务器空间：查询中…"), row2);   // 剩余空间
     m_spaceLabel->setToolTip(QStringLiteral("来自 GET /api/v1/storage；每 60 秒自动刷新"));
@@ -349,7 +380,8 @@ void MainWindow::onUpload()
     FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
                        buildUrl(QStringLiteral("/api/v1/files")),
                        FileTreeDialog::Mode::SelectDir, m_lastDir,
-                       /*allowCreateDir=*/true, this, m_trustTls->isChecked());
+                       /*allowCreateDir=*/true, this, m_trustTls->isChecked(),
+                       m_tokenEdit->text());
     if (dlg.exec() != QDialog::Accepted) {
         return;   // 用户取消
     }
@@ -852,7 +884,8 @@ void MainWindow::onChunkedUpload()
     FileTreeDialog dlg(buildUrl(QStringLiteral("/api/v1/dirs")),
                        buildUrl(QStringLiteral("/api/v1/files")),
                        FileTreeDialog::Mode::SelectDir, m_lastDir,
-                       /*allowCreateDir=*/false, this, m_trustTls->isChecked());
+                       /*allowCreateDir=*/false, this, m_trustTls->isChecked(),
+                       m_tokenEdit->text());
     if (dlg.exec() != QDialog::Accepted) {
         return;   // 用户取消
     }
@@ -2141,8 +2174,10 @@ QUrl MainWindow::buildUrl(const QString &path) const
     }
     // 容忍只填 IP 或 IP:端口 —— 缺 scheme 时补 http://
     // （旧实现在缺 scheme 时静默退回默认地址，导致用户填了服务器 IP 也连不上）
-    if (!base.startsWith(QStringLiteral("http://"))
-        && !base.startsWith(QStringLiteral("https://"))) {
+    // scheme 判断大小写不敏感：用户输入 HTTPS://host 不应被拼成畸形 URL
+    const QString lower = base.toLower();
+    if (!lower.startsWith(QStringLiteral("http://"))
+        && !lower.startsWith(QStringLiteral("https://"))) {
         base.prepend(QStringLiteral("http://"));
     }
     QUrl url(base + path);
@@ -2152,28 +2187,205 @@ QUrl MainWindow::buildUrl(const QString &path) const
     return url;
 }
 
+// ---- TOFU 证书指纹固定 ----
+namespace {
+// 进程内"正在等待用户决策（确认框已弹出、尚未批准）"的主机集合。
+// 语义是"待决策"，绝非"已批准"：命中它的并发请求必须 fail-closed（不忽略证书错误），
+// 绝不能当成已信任而自动放行。仅用于防止同一主机并发多请求时重复弹确认框。
+// MainWindow 与 FileTreeDialog 共用（applyCertPinning 是静态函数），符合"本次进程内"语义。
+QSet<QString> g_pinPendingHosts;
+
+// 把十六进制指纹按 2 字符一组用冒号分隔，便于人眼比对（如 AA:BB:CC:DD:…）
+QString formatFingerprint(const QByteArray &digest)
+{
+    const QString hex = QString::fromLatin1(digest.toHex()).toUpper();
+    QString out;
+    out.reserve(hex.size() * 3 / 2);
+    for (int i = 0; i < hex.size(); i += 2) {
+        if (!out.isEmpty()) {
+            out.append(QLatin1Char(':'));
+        }
+        out.append(hex.mid(i, 2));
+    }
+    return out;
+}
+}   // namespace
+
+// 在 sslErrors 信号里做 TOFU 证书指纹固定：
+//   · 未勾选信任   -> 完全不介入，走 Qt 标准证书链校验（自签名会被拒）
+//   · 首次连接     -> 弹确认框，信任则记住指纹并放行；取消则请求失败
+//   · 已记录且一致 -> 静默放行
+//   · 已记录不一致 -> 绝不放行，弹警告框（无"继续"按钮），需手动清除信任
+// key = host:port；指纹 = 对端证书 SHA-256 十六进制。纯 HTTP 不受影响。
+void MainWindow::applyCertPinning(QNetworkReply *reply, bool trustTls, QWidget *parent)
+{
+    const QUrl u = reply->url();
+    if (u.scheme() != QStringLiteral("https")) {
+        return;   // 纯 HTTP 不受影响
+    }
+    if (!trustTls) {
+        return;   // 未勾选：完全不介入，交给 Qt 标准证书链校验（自签名会被拒）
+    }
+    const QSslCertificate cert = reply->sslConfiguration().peerCertificate();
+    if (cert.isNull()) {
+        return;   // 无对端证书（协商失败等）交给标准证书链校验
+    }
+    const QByteArray digest = cert.digest(QCryptographicHash::Sha256);
+    const QString fp = QString::fromLatin1(digest.toHex());   // 原始十六进制（存储/比对用）
+    const QString fpView = formatFingerprint(digest);         // 人眼友好：AA:BB:CC:…
+
+    int port = u.port();
+    if (port < 0) {
+        port = 443;   // HTTPS 默认端口
+    }
+    const QString key = QStringLiteral("%1:%2").arg(u.host()).arg(port);
+
+    QSettings s;
+    const QString recorded = s.value(QStringLiteral("pinnedFingerprint/") + key).toString();
+    if (!recorded.isEmpty()) {
+        if (recorded.compare(fp, Qt::CaseInsensitive) == 0) {
+            reply->ignoreSslErrors();   // 指纹一致 -> 静默放行
+            return;
+        }
+        // 指纹变化 -> 疑似中间人：绝不忽略，弹警告框，且不提供"继续"按钮
+        QMessageBox::warning(
+            parent, QStringLiteral("⚠ 证书指纹不匹配（可能存在中间人攻击）"),
+            QStringLiteral("与已固定（记住）的服务器证书指纹不一致，可能存在中间人攻击！\n\n"
+                           "服务器：%1\n已固定指纹：%2\n本次指纹：%3\n\n"
+                           "本次连接已被拒绝。如确认是服务器换证，请点主窗口第二行"
+                           "【证书…】清除该主机信任后再重新连接。")
+                .arg(key,
+                     formatFingerprint(QByteArray::fromHex(recorded.toLatin1())),
+                     fpView));
+        return;   // 不调用 ignoreSslErrors -> 请求按证书错误失败
+    }
+
+    // 首次连接该主机。若已有同主机的确认框正在弹（嵌套事件循环期间并发请求到达），
+    // 必须 fail-closed：绝不自动信任、也不重复弹框，让该请求按证书错误失败。
+    // 宁可多失败一个请求，也不能在用户确认前就放行（尤其是带着 Bearer 令牌外发）。
+    if (g_pinPendingHosts.contains(key)) {
+        return;   // 待决策期间：不忽略证书错误 -> 请求失败
+    }
+    g_pinPendingHosts.insert(key);   // 标记"正在等待用户决策"，防并发请求重复弹确认框
+
+    // 首次连接：弹确认框，让用户核对指纹与服务器一致后再信任
+    const QString subject = cert.subjectDisplayName();
+    const QString issuer = cert.issuerDisplayName();
+    const QString valid = QStringLiteral("%1 ~ %2").arg(
+        cert.effectiveDate().toString(Qt::ISODate), cert.expiryDate().toString(Qt::ISODate));
+    QMessageBox box(QMessageBox::Question, QStringLiteral("首次连接该服务器"),
+                    QStringLiteral("即将信任并记住该服务器的证书指纹（TOFU：自签名证书可用，"
+                                   "但不放松认证）。请核对指纹与服务器一致：\n\n"
+                                   "服务器：%1\n证书指纹(SHA-256)：%2\n使用者：%3\n"
+                                   "签发者：%4\n有效期：%5\n\n"
+                                   "点「信任」则记住该指纹并继续；点「取消」本次不信任，连接将失败。")
+                        .arg(key, fpView, subject, issuer, valid),
+                    QMessageBox::NoButton, parent);
+    QPushButton *yesBtn = box.addButton(QStringLiteral("信任"), QMessageBox::YesRole);
+    QPushButton *noBtn = box.addButton(QStringLiteral("取消"), QMessageBox::NoRole);
+    box.setDefaultButton(noBtn);
+    box.setEscapeButton(noBtn);
+    Q_UNUSED(yesBtn)
+    if (box.clickedButton() == yesBtn) {
+        s.setValue(QStringLiteral("pinnedFingerprint/") + key, fp);
+        qInfo() << "已记住服务器证书指纹（TOFU）：" << key << fp;
+        reply->ignoreSslErrors();   // 信任并放行
+    }
+    // 不论信任或取消，决策完成后都移除标记，避免同主机后续连接被永久跳过弹窗；
+    // 取消时不调用 ignoreSslErrors -> 该请求按证书错误失败（用户在日志看到网络错误）。
+    g_pinPendingHosts.remove(key);
+}
+
+QString MainWindow::currentHostPort() const
+{
+    // 复用 buildUrl 解析服务器地址（含缺省 scheme / 默认端口 8080），
+    // 保证与 applyCertPinning 里用 reply->url() 推导的 host:port 完全一致。
+    const QUrl url = buildUrl(QStringLiteral("/"));
+    return QStringLiteral("%1:%2").arg(url.host()).arg(url.port());
+}
+
+// 查看 / 清除当前服务器已固定的证书指纹（TOFU）。只读展示，提供「清除该主机信任」。
+void MainWindow::onShowCertPin()
+{
+    const QString key = currentHostPort();
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("证书指纹固定（TOFU）"));
+    auto *vbox = new QVBoxLayout(&dlg);
+
+    auto *label = new QLabel(&dlg);
+    label->setWordWrap(true);
+    label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    const auto refresh = [&]() {
+        QSettings rs;
+        const QString rec = rs.value(QStringLiteral("pinnedFingerprint/") + key).toString();
+        label->setText(rec.isEmpty()
+                           ? QStringLiteral("服务器：%1\n状态：未固定（尚未信任过该服务器证书）").arg(key)
+                           : QStringLiteral("服务器：%1\n状态：已固定指纹\n证书指纹(SHA-256)：%2")
+                                 .arg(key, formatFingerprint(QByteArray::fromHex(rec.toLatin1()))));
+    };
+    refresh();
+    vbox->addWidget(label);
+
+    auto *hbox = new QHBoxLayout();
+    auto *clearBtn = new QPushButton(QStringLiteral("清除该主机信任"), &dlg);
+    auto *closeBtn = new QPushButton(QStringLiteral("关闭"), &dlg);
+    closeBtn->setDefault(true);
+    hbox->addWidget(clearBtn);
+    hbox->addStretch(1);
+    hbox->addWidget(closeBtn);
+    vbox->addLayout(hbox);
+
+    connect(clearBtn, &QPushButton::clicked, &dlg, [&]() {
+        QSettings ws;
+        ws.remove(QStringLiteral("pinnedFingerprint/") + key);
+        g_pinPendingHosts.remove(key);   // 同时清掉进程内待决策标记，下次连接需重新确认
+        clearBtn->setEnabled(false);
+        refresh();
+    });
+    connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    dlg.exec();
+}
+
 QNetworkReply *MainWindow::sendRequest(const QNetworkRequest &request, const QByteArray &verb,
                                        const QByteArray &body)
 {
+    // 复制请求以追加 Bearer 令牌头（原始请求为 const 引用，不可改）
+    QNetworkRequest req(request);
+    const QString token = m_tokenEdit ? m_tokenEdit->text().trimmed() : QString();
+    if (!token.isEmpty()) {
+        req.setRawHeader(QByteArrayLiteral("Authorization"),
+                         QByteArrayLiteral("Bearer ") + token.toUtf8());
+    }
+
+    // 安全提示：非空令牌却走明文 http，令牌会明文上网 -> 日志 WARN + 状态栏提示（不弹模态框打断流程）
+    if (req.url().scheme() == QStringLiteral("http") && !token.isEmpty()) {
+        if (!m_plaintextWarned) {
+            m_plaintextWarned = true;
+            appendLog(QStringLiteral("WARN"), req.url(), 0, 0,
+                      QStringLiteral("访问令牌将以明文发送（当前为 http 明文连接），建议改用 https 以避免令牌泄露。"));
+            showStatus(QStringLiteral("⚠ 令牌将以明文发送，建议改用 https"), false);
+        }
+    } else {
+        m_plaintextWarned = false;   // 条件不满足时复位，下次再出现可重新提示
+    }
+
     QNetworkReply *reply = nullptr;
     if (verb == "GET") {
-        reply = m_nam->get(request);
+        reply = m_nam->get(req);
     } else if (verb == "PUT") {
-        reply = m_nam->put(request, body);
+        reply = m_nam->put(req, body);
     } else if (verb == "DELETE") {
-        reply = m_nam->deleteResource(request);
+        reply = m_nam->deleteResource(req);
     } else {
-        reply = m_nam->post(request, body);
+        reply = m_nam->post(req, body);
     }
     // 记下实际动词，供日志显示（原有的 operation() 只能区分 GET / 非 GET）
     reply->setProperty("cvVerb", QString::fromUtf8(verb));
 
-    // HTTPS 自签名证书：勾选"信任自签名证书"时忽略证书错误（私有云常见场景）；
-    // 未勾选则按标准证书链校验，握手失败表现为 sslErrors -> 网络错误
-    connect(reply, &QNetworkReply::sslErrors, this, [this, reply](const QList<QSslError> &) {
-        if (m_trustTls && m_trustTls->isChecked()) {
-            reply->ignoreSslErrors();
-        }
+    // HTTPS 证书：TOFU 指纹固定（替换原"勾选即忽略所有证书错误"）。
+    // 首次信任即记住指纹，之后指纹变化即拒绝；纯 HTTP 不受影响。
+    connect(reply, &QNetworkReply::sslErrors, this, [this, reply]() {
+        applyCertPinning(reply, m_trustTls && m_trustTls->isChecked(), this);
     });
 
     QElapsedTimer timer;

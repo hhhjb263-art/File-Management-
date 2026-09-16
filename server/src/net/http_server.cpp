@@ -41,6 +41,8 @@ std::string statusText(int code) {
     case 204: return "No Content";
     case 206: return "Partial Content";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 409: return "Conflict";
@@ -73,6 +75,27 @@ std::vector<std::string> splitPath(const std::string& path) {
   }
   if (!cur.empty()) out.push_back(cur);
   return out;
+}
+
+// 恒定时间字符串比较（防时序侧信道）：
+//   1) 比较上界取 max(len_a, len_b)，逐字节异或累加；
+//   2) 长度差以 std::size_t 全程参与 diff（不再截断到 uchar，避免“长度差恰为 256 倍数”时折入值为 0）；
+//   3) 不提前 return，比较时长与首个不同字节位置无关。
+// 因此“长度不同 ⇒ 必不相等”，且安全抗时序侧信道。
+bool constantTimeEqual(const std::string& a, const std::string& b) {
+  // 长度差直接以 size_t 参与（不截断），保证长度不同必使 diff 非零
+  std::size_t diff = a.size() ^ b.size();
+  const std::size_t n = a.size() < b.size() ? a.size() : b.size();
+  for (std::size_t i = 0; i < n; ++i) {
+    diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+  }
+  // 较长串多出的字节也参与 diff（长度差已使 diff 非零，这里仅保持恒定时长）
+  const std::string& longer = a.size() < b.size() ? b : a;
+  const std::size_t m = a.size() + b.size() - n;  // == max(len_a, len_b)
+  for (std::size_t i = n; i < m; ++i) {
+    diff |= static_cast<unsigned char>(longer[i]);
+  }
+  return diff == 0;
 }
 
 HttpServer* g_server = nullptr;
@@ -109,6 +132,23 @@ void Response::setError(int code, const std::string& message) {
 }
 
 HttpServer::~HttpServer() { shutdown(); }
+
+void HttpServer::setAuthToken(const std::string& token) { authToken_ = token; }
+
+bool HttpServer::authorized(const Request& req) const {
+  // 期望请求头：Authorization: Bearer <token>
+  // 兼容历史头：X-CV-Token: <token>（直接携带 token，无前缀）
+  std::string token;
+  std::string hdr = req.header("authorization");
+  const std::string prefix = "Bearer ";
+  if (hdr.size() > prefix.size() && hdr.compare(0, prefix.size(), prefix) == 0) {
+    token = hdr.substr(prefix.size());
+  } else {
+    token = req.header("x-cv-token");
+  }
+  if (token.empty()) return false;
+  return constantTimeEqual(token, authToken_);
+}
 
 namespace {
 // 建立 TCP 监听 socket（bind+listen），失败返回 -1 并填充 err
@@ -316,46 +356,103 @@ void HttpServer::workerLoop() {
 }
 
 void HttpServer::handleClient(const Conn& conn) {
-  std::string raw;
-  std::string err;
-  Response resp;
+  // keep-alive：一个 worker 全程持有该连接，循环处理多个请求。
+  // residue 保存上次请求读剩的字节（可能是下一请求的开头）。
+  std::string residue;
+  constexpr std::size_t kMaxRequestsPerConn = 200;
 
-  if (!readRequest(conn, raw, err)) {
-    CV_LOG_DEBUG(std::string("读取请求失败: ") + err);
-    closeConn(conn);
-    return;
-  }
+  for (std::size_t reqCount = 0; reqCount < kMaxRequestsPerConn; ++reqCount) {
+    std::string raw;
+    std::string err;
+    if (!readRequest(conn, residue, raw, err)) {
+      // 读失败（读超时 / 对端关闭 / 请求被截断）：静默关闭，不刷 WARN
+      closeConn(conn);
+      return;
+    }
 
-  Request req;
-  if (!parseRequest(raw, req, err)) {
-    resp.setError(400, err);
-  } else if (!dispatch(req, resp)) {
-    resp.setError(404, "no route for " + req.method + " " + req.path);
-  }
+    Request req;
+    Response resp;
+    bool parsed = parseRequest(raw, req, err);
+    bool keepAlive = true;
 
-  std::ostringstream head;
-  head << "HTTP/1.1 " << resp.status << ' ' << statusText(resp.status) << "\r\n"
-       << "Content-Type: " << resp.contentType << "\r\n"
-       << "Content-Length: " << resp.body.size() << "\r\n";
-  for (const auto& kv : resp.extraHeaders) {
-    head << kv.first << ": " << kv.second << "\r\n";
+    if (!parsed) {
+      resp.setError(400, err);
+      keepAlive = false;  // 解析失败 → 关闭
+    } else if (toLower(req.header("transfer-encoding")).find("chunked") != std::string::npos) {
+      // 协议面：仅支持 Content-Length 定长帧，显式拒绝 chunked，防前置反代场景的请求走私
+      resp.setError(501, "Transfer-Encoding: chunked is not supported; use Content-Length");
+      keepAlive = false;
+    } else if (!authToken_.empty() && req.path != "/healthz" && !authorized(req)) {
+      // 启用鉴权且非探活接口：缺 Token 或不匹配 → 401（JSON 说明原因，恒定时间比较），不 dispatch
+      resp.setError(401, "missing or invalid Authorization token (use: Authorization: Bearer <token>)");
+      keepAlive = false;  // 鉴权失败 → 关闭
+    } else if (!dispatch(req, resp)) {
+      resp.setError(404, "no route for " + req.method + " " + req.path);
+    }
+
+    // 解析成功且已 dispatch 时，再按客户端的 Connection 头决定是否复用
+    if (keepAlive && parsed) {
+      std::string connHdr = toLower(req.header("connection"));
+      if (connHdr.find("close") != std::string::npos) keepAlive = false;
+    }
+    // 达到单连接请求上限：本响应标记关闭，下一轮循环即退出
+    if (reqCount + 1 >= kMaxRequestsPerConn) keepAlive = false;
+
+    std::ostringstream head;
+    head << "HTTP/1.1 " << resp.status << ' ' << statusText(resp.status) << "\r\n"
+         << "Content-Type: " << resp.contentType << "\r\n"
+         << "Content-Length: " << resp.body.size() << "\r\n";
+    for (const auto& kv : resp.extraHeaders) {
+      head << kv.first << ": " << kv.second << "\r\n";
+    }
+    head << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n\r\n";
+    std::string headStr = head.str();
+    if (!writeAll(conn, headStr.data(), headStr.size())) { closeConn(conn); return; }
+    if (!resp.body.empty()) {
+      if (!writeAll(conn, resp.body.data(), resp.body.size())) { closeConn(conn); return; }
+    }
+
+    if (!keepAlive) { closeConn(conn); return; }
+    // 否则继续：residue 已在 readRequest 内保留为下一请求的开头
   }
-  head << "Connection: close\r\n\r\n";
-  std::string headStr = head.str();
-  writeAll(conn, headStr.data(), headStr.size());
-  if (!resp.body.empty()) writeAll(conn, resp.body.data(), resp.body.size());
-  closeConn(conn);
 }
 
 
-bool HttpServer::readRequest(const Conn& conn, std::string& raw, std::string& err) {
+bool HttpServer::readRequest(const Conn& conn, std::string& residue, std::string& raw,
+                             std::string& err) {
   raw.clear();
+  // 复用上次 keep-alive 读剩的字节（可能已含下一个完整请求的开头）
+  if (!residue.empty()) {
+    raw = std::move(residue);
+    residue.clear();
+  }
   char buf[8192];
   std::size_t headerEnd = std::string::npos;
   std::size_t contentLength = 0;
   bool headersDone = false;
 
-  while (true) {
+  // 从当前已有字节（含 residue）中解析请求头并提取 Content-Length
+  auto tryParseHeaders = [&]() -> bool {
+    std::size_t he = raw.find("\r\n\r\n");
+    if (he == std::string::npos) return false;
+    headerEnd = he;
+    headersDone = true;
+    std::string head = raw.substr(0, he);
+    std::string lower = toLower(head);
+    auto pos = lower.find("content-length:");
+    if (pos != std::string::npos) {
+      contentLength = std::strtoull(head.c_str() + pos + 15, nullptr, 10);
+    }
+    return true;
+  };
+
+  bool complete = false;
+  if (tryParseHeaders()) {
+    std::size_t bodyHave = raw.size() - (headerEnd + 4);
+    if (bodyHave >= contentLength) complete = true;
+  }
+
+  while (!complete) {
     ssize_t n = 0;
     if (!connRead(conn, buf, sizeof(buf), n, err)) return false;
     if (n < 0) {
@@ -370,31 +467,33 @@ bool HttpServer::readRequest(const Conn& conn, std::string& raw, std::string& er
         err = "connection closed";
         return false;
       }
-      break;  // 无 body 的请求
+      // 对端已关闭：若当前已含完整请求（头齐 + body 到齐）则按完整请求处理，否则报错
+      if (headersDone && (raw.size() - (headerEnd + 4)) >= contentLength) {
+        complete = true;
+        break;
+      }
+      err = "connection closed before request complete";
+      return false;
     }
     raw.append(buf, static_cast<std::size_t>(n));
 
-    if (!headersDone) {
-      headerEnd = raw.find("\r\n\r\n");
-      if (headerEnd != std::string::npos) {
-        headersDone = true;
-        std::string head = raw.substr(0, headerEnd);
-        std::string lower = toLower(head);
-        auto pos = lower.find("content-length:");
-        if (pos != std::string::npos) {
-          contentLength = std::strtoull(head.c_str() + pos + 15, nullptr, 10);
-        }
-      }
-    }
-
+    if (!headersDone) tryParseHeaders();
     if (headersDone) {
       std::size_t bodyHave = raw.size() - (headerEnd + 4);
-      if (bodyHave >= contentLength) break;
+      if (bodyHave >= contentLength) { complete = true; break; }
     }
     if (raw.size() > kMaxRequestBytes) {
       err = "request too large";
       return false;
     }
+  }
+
+  // 关键正确性：一个 recv 可能多读了「下一个请求」的开头字节。
+  // 必须把当前请求之后的残留切出来留给下一次读，否则后续请求会解析错乱。
+  std::size_t total = headerEnd + 4 + contentLength;
+  if (raw.size() > total) {
+    residue = raw.substr(total);
+    raw.resize(total);  // raw 只保留（恰好一个）当前请求
   }
   return true;
 }
