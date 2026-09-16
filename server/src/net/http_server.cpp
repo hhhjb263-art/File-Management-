@@ -210,14 +210,19 @@ bool HttpServer::listenTls(const std::string& addr, int port, const std::string&
       return false;
     }
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    auto sslErrText = [] {
+      char buf[256] = {0};
+      ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
+      ERR_clear_error();
+      return std::string(buf);
+    };
     if (SSL_CTX_use_certificate_chain_file(ctx, certPath.c_str()) != 1) {
-      err = "load certificate failed: " + certPath +
-            " (" + std::to_string(ERR_get_error()) + ")";
+      err = "load certificate failed: " + certPath + " (" + sslErrText() + ")";
       SSL_CTX_free(ctx);
       return false;
     }
     if (SSL_CTX_use_PrivateKey_file(ctx, keyPath.c_str(), SSL_FILETYPE_PEM) != 1) {
-      err = "load private key failed: " + keyPath;
+      err = "load private key failed: " + keyPath + " (" + sslErrText() + ")";
       SSL_CTX_free(ctx);
       return false;
     }
