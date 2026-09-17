@@ -25,6 +25,7 @@
 #include "FileTreeDialog.h"
 
 #include <algorithm>
+#include <functional>
 
 #include <QCryptographicHash>
 #include <QDesktopServices>
@@ -74,6 +75,11 @@ namespace {
 
 // 日志里单条响应最多展示的字节数，避免大文件把日志区刷爆
 constexpr int kMaxBodyInLog = 4096;
+
+// TOFU 证书判定的日志出口：由 MainWindow 构造时绑定到界面日志面板。
+// 声明提前到这里，使构造函数可用；定义见本文件后部 TOFU 段。
+std::function<void(const QString &)> g_touLog;
+void touLog(const QString &msg);
 
 // 二进制响应体在日志里只展示前 N 字节的十六进制摘要（避免整段乱码）
 constexpr qsizetype kBodyBinaryPreviewBytes = 48;
@@ -160,6 +166,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     mainLayout->addWidget(m_log, 1);
 
     setCentralWidget(center);
+
+    // TOFU 决策日志接到界面日志面板（证书判定过程必须可见）
+    g_touLog = [this](const QString &msg) {
+        appendLog(QStringLiteral("TOFU"), QUrl(), 0, 0, msg);
+    };
 
     // 服务器剩余空间：启动即查询一次，之后每 60 秒自动刷新
     m_spaceTimer = new QTimer(this);
@@ -2195,6 +2206,17 @@ namespace {
 // MainWindow 与 FileTreeDialog 共用（applyCertPinning 是静态函数），符合"本次进程内"语义。
 QSet<QString> g_pinPendingHosts;
 
+// TOFU 决策日志出口：由 MainWindow 构造时绑定到界面日志面板。
+// 目的：证书相关的判定（未勾选 / 取不到证书 / 等待确认 / 用户信任或取消 / 指纹不匹配）
+// 必须直接显示在客户端日志区，否则用户只看到底层 SSL 错误、无从判断卡在哪一步。
+void touLog(const QString &msg)
+{
+    if (g_touLog) {
+        g_touLog(msg);
+    }
+    qWarning() << "TOFU:" << msg;   // 同时保留到 stderr，便于抓日志
+}
+
 // 把十六进制指纹按 2 字符一组用冒号分隔，便于人眼比对（如 AA:BB:CC:DD:…）
 QString formatFingerprint(const QByteArray &digest)
 {
@@ -2225,7 +2247,8 @@ void MainWindow::applyCertPinning(QNetworkReply *reply, const QList<QSslError> &
         return;   // 纯 HTTP 不受影响
     }
     if (!trustTls) {
-        qWarning() << "TOFU: 未勾选自签名信任，证书错误不介入 ->" << u.toString();
+        touLog(QStringLiteral("[证书] 未勾选「允许使用自签名证书」，不介入（走 Qt 标准证书链校验）-> ")
+               + u.toString());
         return;   // 未勾选：完全不介入，交给 Qt 标准证书链校验（自签名会被拒）
     }
     // 证书来源：优先 sslConfiguration 的对端证书；为空则从错误列表里取第一个非空证书
@@ -2244,7 +2267,8 @@ void MainWindow::applyCertPinning(QNetworkReply *reply, const QList<QSslError> &
         for (const QSslError &e : errors) {
             es << e.errorString();
         }
-        qWarning() << "TOFU: 无对端证书，指纹固定不可用 ->" << u.toString() << es;
+        touLog(QStringLiteral("[证书] 取不到服务器证书，无法指纹固定 -> ") + u.toString()
+               + QStringLiteral(" 错误：") + es.join(QStringLiteral(" | ")));
         QMessageBox::warning(parent, QStringLiteral("无法读取服务器证书"),
                              QStringLiteral("TLS 握手失败，且未能取得服务器证书，无法进行指纹固定（TOFU）。\n\n错误：%1\n\n本次连接已被拒绝。请检查服务器是否正确提供证书后重试。").arg(es.join('\n')));
         return;
@@ -2263,10 +2287,14 @@ void MainWindow::applyCertPinning(QNetworkReply *reply, const QList<QSslError> &
     const QString recorded = s.value(QStringLiteral("pinnedFingerprint/") + key).toString();
     if (!recorded.isEmpty()) {
         if (recorded.compare(fp, Qt::CaseInsensitive) == 0) {
+            touLog(QStringLiteral("[证书] 指纹与已固定记录一致，放行 -> ") + key);
             reply->ignoreSslErrors();   // 指纹一致 -> 静默放行
             return;
         }
         // 指纹变化 -> 疑似中间人：绝不忽略，弹警告框，且不提供"继续"按钮
+        touLog(QStringLiteral("[证书] 指纹不匹配（疑似中间人），已拒绝 -> ") + key
+               + QStringLiteral(" 已固定=") + recorded.left(16) + QStringLiteral("… 本次=")
+               + fp.left(16) + QStringLiteral("…"));
         QMessageBox::warning(
             parent, QStringLiteral("⚠ 证书指纹不匹配（可能存在中间人攻击）"),
             QStringLiteral("与已固定（记住）的服务器证书指纹不一致，可能存在中间人攻击！\n\n\n\n服务器：%1\n\n已固定指纹：%2\n\n本次指纹：%3\n\n\n\n本次连接已被拒绝。如确认是服务器换证，请点主窗口第二行【证书…】清除该主机信任后再重新连接。")
@@ -2280,9 +2308,12 @@ void MainWindow::applyCertPinning(QNetworkReply *reply, const QList<QSslError> &
     // 必须 fail-closed：绝不自动信任、也不重复弹框，让该请求按证书错误失败。
     // 宁可多失败一个请求，也不能在用户确认前就放行（尤其是带着 Bearer 令牌外发）。
     if (g_pinPendingHosts.contains(key)) {
+        touLog(QStringLiteral("[证书] 确认框已弹出、等待你的决定，此并发请求按失败处理 -> ") + key);
         return;   // 待决策期间：不忽略证书错误 -> 请求失败
     }
     g_pinPendingHosts.insert(key);   // 标记"正在等待用户决策"，防并发请求重复弹确认框
+    touLog(QStringLiteral("[证书] 首次连接，弹出指纹确认框（请核对后点【信任】）-> ") + key
+           + QStringLiteral(" 指纹=") + fpView);
 
     // 首次连接：弹确认框，让用户核对指纹与服务器一致后再信任
     const QString subject = cert.subjectDisplayName();
@@ -2300,8 +2331,10 @@ void MainWindow::applyCertPinning(QNetworkReply *reply, const QList<QSslError> &
     Q_UNUSED(yesBtn)
     if (box.clickedButton() == yesBtn) {
         s.setValue(QStringLiteral("pinnedFingerprint/") + key, fp);
-        qInfo() << "已记住服务器证书指纹（TOFU）：" << key << fp;
+        touLog(QStringLiteral("[证书] 你选择了【信任】，已记住指纹并放行 -> ") + key);
         reply->ignoreSslErrors();   // 信任并放行
+    } else {
+        touLog(QStringLiteral("[证书] 你选择了【取消】，本次连接按失败处理 -> ") + key);
     }
     // 不论信任或取消，决策完成后都移除标记，避免同主机后续连接被永久跳过弹窗；
     // 取消时不调用 ignoreSslErrors -> 该请求按证书错误失败（用户在日志看到网络错误）。
