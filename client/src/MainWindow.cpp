@@ -2324,10 +2324,13 @@ void MainWindow::applyCertPinning(QNetworkReply *reply, const QList<QSslError> &
                     QStringLiteral("即将信任并记住该服务器的证书指纹（TOFU：自签名证书可用，但不放松认证）。请核对指纹与服务器一致：\n\n\n\n服务器：%1\n\n证书指纹(SHA-256)：%2\n\n使用者：%3\n\n签发者：%4\n\n有效期：%5\n\n\n\n点「信任」则记住该指纹并继续；点「取消」本次不信任，连接将失败。")
                         .arg(key, fpView, subject, issuer, valid),
                     QMessageBox::NoButton, parent);
-    QPushButton *yesBtn = box.addButton(QStringLiteral("信任"), QMessageBox::YesRole);
-    QPushButton *noBtn = box.addButton(QStringLiteral("取消"), QMessageBox::NoRole);
-    box.setDefaultButton(noBtn);
-    box.setEscapeButton(noBtn);
+    // 文案写清后果：避免把"取消"误当成"关闭弹窗"——取消＝本次连接失败
+    QPushButton *yesBtn =
+        box.addButton(QStringLiteral("信任并继续（记住该指纹）"), QMessageBox::YesRole);
+    QPushButton *noBtn =
+        box.addButton(QStringLiteral("不信任（本次连接失败）"), QMessageBox::NoRole);
+    box.setDefaultButton(noBtn);   // 安全默认：按 Enter 不会盲目信任
+    box.setEscapeButton(noBtn);    // 按 Esc 同样按"不信任"处理
     Q_UNUSED(yesBtn)
     if (box.clickedButton() == yesBtn) {
         s.setValue(QStringLiteral("pinnedFingerprint/") + key, fp);
