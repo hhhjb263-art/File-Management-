@@ -2332,12 +2332,19 @@ void MainWindow::applyCertPinning(QNetworkReply *reply, const QList<QSslError> &
     box.setDefaultButton(noBtn);   // 安全默认：按 Enter 不会盲目信任
     box.setEscapeButton(noBtn);    // 按 Esc 同样按"不信任"处理
     Q_UNUSED(yesBtn)
+    // ⚠️ 关键：必须 exec() 才会真正显示确认框。
+    // 曾经漏掉这一句（对话框只被构造、从未显示），导致 clickedButton() 恒为空、
+    // 每次都静默走进"不信任"分支——用户看到的却是"没有弹窗但连接失败"。
+    box.exec();
     if (box.clickedButton() == yesBtn) {
         s.setValue(QStringLiteral("pinnedFingerprint/") + key, fp);
-        touLog(QStringLiteral("[证书] 你选择了【信任】，已记住指纹并放行 -> ") + key);
+        touLog(QStringLiteral("[证书] 你选择了【信任并继续】，已记住指纹并放行 -> ") + key);
         reply->ignoreSslErrors();   // 信任并放行
+    } else if (box.clickedButton() == noBtn) {
+        touLog(QStringLiteral("[证书] 你选择了【不信任】，本次连接按失败处理 -> ") + key);
     } else {
-        touLog(QStringLiteral("[证书] 你选择了【取消】，本次连接按失败处理 -> ") + key);
+        touLog(QStringLiteral("[证书] 确认框未返回结果（异常或被动关闭），本次连接按失败处理 -> ")
+               + key);
     }
     // 不论信任或取消，决策完成后都移除标记，避免同主机后续连接被永久跳过弹窗；
     // 取消时不调用 ignoreSslErrors -> 该请求按证书错误失败（用户在日志看到网络错误）。
