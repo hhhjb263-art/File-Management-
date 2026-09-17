@@ -2217,18 +2217,37 @@ QString formatFingerprint(const QByteArray &digest)
 //   · 已记录且一致 -> 静默放行
 //   · 已记录不一致 -> 绝不放行，弹警告框（无"继续"按钮），需手动清除信任
 // key = host:port；指纹 = 对端证书 SHA-256 十六进制。纯 HTTP 不受影响。
-void MainWindow::applyCertPinning(QNetworkReply *reply, bool trustTls, QWidget *parent)
+void MainWindow::applyCertPinning(QNetworkReply *reply, const QList<QSslError> &errors,
+                                  bool trustTls, QWidget *parent)
 {
     const QUrl u = reply->url();
     if (u.scheme() != QStringLiteral("https")) {
         return;   // 纯 HTTP 不受影响
     }
     if (!trustTls) {
+        qWarning() << "TOFU: 未勾选自签名信任，证书错误不介入 ->" << u.toString();
         return;   // 未勾选：完全不介入，交给 Qt 标准证书链校验（自签名会被拒）
     }
-    const QSslCertificate cert = reply->sslConfiguration().peerCertificate();
+    // 证书来源：优先 sslConfiguration 的对端证书；为空则从错误列表里取第一个非空证书
+    QSslCertificate cert = reply->sslConfiguration().peerCertificate();
     if (cert.isNull()) {
-        return;   // 无对端证书（协商失败等）交给标准证书链校验
+        for (const QSslError &e : errors) {
+            if (!e.certificate().isNull()) {
+                cert = e.certificate();
+                break;
+            }
+        }
+    }
+    if (cert.isNull()) {
+        // 拿不到证书就无法指纹固定：fail-closed，但让用户看到原因（不再静默吞掉）
+        QStringList es;
+        for (const QSslError &e : errors) {
+            es << e.errorString();
+        }
+        qWarning() << "TOFU: 无对端证书，指纹固定不可用 ->" << u.toString() << es;
+        QMessageBox::warning(parent, QStringLiteral("无法读取服务器证书"),
+                             QStringLiteral("TLS 握手失败，且未能取得服务器证书，无法进行指纹固定（TOFU）。\n\n错误：%1\n\n本次连接已被拒绝。请检查服务器是否正确提供证书后重试。").arg(es.join('\n')));
+        return;
     }
     const QByteArray digest = cert.digest(QCryptographicHash::Sha256);
     const QString fp = QString::fromLatin1(digest.toHex());   // 原始十六进制（存储/比对用）
@@ -2250,10 +2269,7 @@ void MainWindow::applyCertPinning(QNetworkReply *reply, bool trustTls, QWidget *
         // 指纹变化 -> 疑似中间人：绝不忽略，弹警告框，且不提供"继续"按钮
         QMessageBox::warning(
             parent, QStringLiteral("⚠ 证书指纹不匹配（可能存在中间人攻击）"),
-            QStringLiteral("与已固定（记住）的服务器证书指纹不一致，可能存在中间人攻击！\n\n"
-                           "服务器：%1\n已固定指纹：%2\n本次指纹：%3\n\n"
-                           "本次连接已被拒绝。如确认是服务器换证，请点主窗口第二行"
-                           "【证书…】清除该主机信任后再重新连接。")
+            QStringLiteral("与已固定（记住）的服务器证书指纹不一致，可能存在中间人攻击！\n\n\n\n服务器：%1\n\n已固定指纹：%2\n\n本次指纹：%3\n\n\n\n本次连接已被拒绝。如确认是服务器换证，请点主窗口第二行【证书…】清除该主机信任后再重新连接。")
                 .arg(key,
                      formatFingerprint(QByteArray::fromHex(recorded.toLatin1())),
                      fpView));
@@ -2274,11 +2290,7 @@ void MainWindow::applyCertPinning(QNetworkReply *reply, bool trustTls, QWidget *
     const QString valid = QStringLiteral("%1 ~ %2").arg(
         cert.effectiveDate().toString(Qt::ISODate), cert.expiryDate().toString(Qt::ISODate));
     QMessageBox box(QMessageBox::Question, QStringLiteral("首次连接该服务器"),
-                    QStringLiteral("即将信任并记住该服务器的证书指纹（TOFU：自签名证书可用，"
-                                   "但不放松认证）。请核对指纹与服务器一致：\n\n"
-                                   "服务器：%1\n证书指纹(SHA-256)：%2\n使用者：%3\n"
-                                   "签发者：%4\n有效期：%5\n\n"
-                                   "点「信任」则记住该指纹并继续；点「取消」本次不信任，连接将失败。")
+                    QStringLiteral("即将信任并记住该服务器的证书指纹（TOFU：自签名证书可用，但不放松认证）。请核对指纹与服务器一致：\n\n\n\n服务器：%1\n\n证书指纹(SHA-256)：%2\n\n使用者：%3\n\n签发者：%4\n\n有效期：%5\n\n\n\n点「信任」则记住该指纹并继续；点「取消」本次不信任，连接将失败。")
                         .arg(key, fpView, subject, issuer, valid),
                     QMessageBox::NoButton, parent);
     QPushButton *yesBtn = box.addButton(QStringLiteral("信任"), QMessageBox::YesRole);
@@ -2384,8 +2396,9 @@ QNetworkReply *MainWindow::sendRequest(const QNetworkRequest &request, const QBy
 
     // HTTPS 证书：TOFU 指纹固定（替换原"勾选即忽略所有证书错误"）。
     // 首次信任即记住指纹，之后指纹变化即拒绝；纯 HTTP 不受影响。
-    connect(reply, &QNetworkReply::sslErrors, this, [this, reply]() {
-        applyCertPinning(reply, m_trustTls && m_trustTls->isChecked(), this);
+    connect(reply, &QNetworkReply::sslErrors, this,
+            [this, reply](const QList<QSslError> &errors) {
+        applyCertPinning(reply, errors, m_trustTls && m_trustTls->isChecked(), this);
     });
 
     QElapsedTimer timer;

@@ -8,6 +8,7 @@
 #include <QMainWindow>
 #include <QMap>
 #include <QPair>
+#include <QSslError>
 #include <QSet>
 #include <QString>
 #include <QStringList>
@@ -97,7 +98,8 @@ public:
 
     // TOFU 证书指纹固定：在 sslErrors 信号里做"首次信任即记住、之后指纹变化即拒绝"。
     // trustTls=true 表示勾选了「允许使用自签名证书（首次需确认）」；parent 用于弹窗归属。
-    static void applyCertPinning(QNetworkReply *reply, bool trustTls, QWidget *parent);
+    static void applyCertPinning(QNetworkReply *reply, const QList<QSslError> &errors,
+                                 bool trustTls, QWidget *parent);
 
 private slots:
     void onHealthCheck();   // 【健康检查】 GET /healthz

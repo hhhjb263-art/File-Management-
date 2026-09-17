@@ -236,8 +236,8 @@ void FileTreeDialog::onCreateFolder()
     req.setHeader(QNetworkRequest::ContentLengthHeader, payload.size());
     applyAuthToken(req, m_authToken);
     QNetworkReply *r = m_nam->post(req, payload);
-    connect(r, &QNetworkReply::sslErrors, this, [this, r]() {
-        MainWindow::applyCertPinning(r, m_trustTls, this);
+    connect(r, &QNetworkReply::sslErrors, this, [this, r](const QList<QSslError> &errors) {
+        MainWindow::applyCertPinning(r, errors, m_trustTls, this);
     });
     connect(r, &QNetworkReply::finished, this, [this, r, full]() {
         const int st = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -267,8 +267,9 @@ void FileTreeDialog::loadData()
         QNetworkRequest req(m_dirsUrl);
         applyAuthToken(req, m_authToken);
         QNetworkReply *r = m_nam->get(req);
-        connect(r, &QNetworkReply::sslErrors, this, [this, r]() {
-            MainWindow::applyCertPinning(r, m_trustTls, this);   // TOFU 指纹固定
+        connect(r, &QNetworkReply::sslErrors, this,
+                [this, r](const QList<QSslError> &errors) {
+            MainWindow::applyCertPinning(r, errors, m_trustTls, this);   // TOFU 指纹固定
         });
         ++m_pending;
         connect(r, &QNetworkReply::finished, this, [this, r]() {
@@ -285,8 +286,9 @@ void FileTreeDialog::loadData()
         QNetworkRequest req(m_filesUrl);
         applyAuthToken(req, m_authToken);
         QNetworkReply *r = m_nam->get(req);
-        connect(r, &QNetworkReply::sslErrors, this, [this, r]() {
-            MainWindow::applyCertPinning(r, m_trustTls, this);   // TOFU 指纹固定
+        connect(r, &QNetworkReply::sslErrors, this,
+                [this, r](const QList<QSslError> &errors) {
+            MainWindow::applyCertPinning(r, errors, m_trustTls, this);   // TOFU 指纹固定
         });
         ++m_pending;
         connect(r, &QNetworkReply::finished, this, [this, r]() {
