@@ -139,6 +139,41 @@ QString AppController::unsupportedNotice() const
                           "标签、全文检索。相关入口已置灰。");
 }
 
+// ---- 自动刷新（加法式；读写 Settings 并立即落盘）----
+
+bool AppController::autoRefresh() const
+{
+    return Settings::instance().autoRefreshEnabled();
+}
+
+void AppController::setAutoRefresh(bool on)
+{
+    Settings &s = Settings::instance();
+    if (s.autoRefreshEnabled() == on) {
+        return;
+    }
+    s.setAutoRefreshEnabled(on);
+    s.sync(); // 立即落盘，重启后仍生效
+    emit autoRefreshChanged();
+}
+
+int AppController::autoRefreshInterval() const
+{
+    return Settings::instance().autoRefreshIntervalSec();
+}
+
+void AppController::setAutoRefreshInterval(int sec)
+{
+    Settings &s = Settings::instance();
+    const int clamped = qBound(5, sec, 3600); // 合法范围 5..3600 秒
+    if (s.autoRefreshIntervalSec() == clamped) {
+        return;
+    }
+    s.setAutoRefreshIntervalSec(clamped);
+    s.sync(); // 立即落盘
+    emit autoRefreshIntervalChanged();
+}
+
 void AppController::saveSettings()
 {
     Settings &s = Settings::instance();

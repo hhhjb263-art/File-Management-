@@ -71,6 +71,10 @@ signals:
 
     void errorOccurred(const QString &message);      // 供 QML 弹确认框 / 提示
     void statusMessage(const QString &message, bool ok);
+    // refresh() 结束时**恰好发一次**（成功 true / 失败 false），供界面驱动
+    // 「自动刷新失败即暂停 / 成功即恢复」。**不要**用它弹提示文案（Main.qml 的
+    // toast 接线对任何非空 message 都会弹，会退化成每轮弹窗）。
+    void refreshFinished(bool ok);
     void uploadRequested(const QString &dir);          // QML 打开文件选择框后调 Transfer.upload
     void downloadRequested(const QStringList &fileIds); // QML 或上层转交 Transfer.download
     void logMessage(const QString &level, const QString &text);

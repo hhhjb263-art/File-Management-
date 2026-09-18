@@ -34,6 +34,33 @@ Item {
     // 令牌可见性
     property bool tokenVisible: false
 
+    // ---- 自动刷新：回灌抑制（避免 currentIndex ↔ 秒值 双向映射产生信号回环）----
+    property bool autoRefreshSyncing: false
+    readonly property var autoRefreshOptions: [
+        { label: qsTr("15 秒"), seconds: 15 },
+        { label: qsTr("30 秒"), seconds: 30 },
+        { label: qsTr("60 秒"), seconds: 60 },
+        { label: qsTr("120 秒"), seconds: 120 }
+    ]
+
+    // 秒值 → 索引（不在列表内时回落到「30 秒」）
+    function intervalIndexFor(secs) {
+        for (let i = 0; i < page.autoRefreshOptions.length; ++i) {
+            if (page.autoRefreshOptions[i].seconds === secs)
+                return i
+        }
+        return 1
+    }
+
+    // 从 App 回灌自动刷新控件（首次进入 + 外部改动）。程序化赋值不触发 onActivated / 用户 toggled，
+    // 叠加 syncing 标记双保险，杜绝写回回环。
+    function syncAutoRefresh() {
+        page.autoRefreshSyncing = true
+        autoRefreshSwitch.checked = App.autoRefresh
+        intervalBox.currentIndex = page.intervalIndexFor(App.autoRefreshInterval)
+        page.autoRefreshSyncing = false
+    }
+
     function defaultPortFor(scheme) {
         return scheme === "http" ? "8080" : "8443"
     }
@@ -149,6 +176,7 @@ Item {
     Component.onCompleted: {
         syncFromApp()
         refreshFingerprint()
+        syncAutoRefresh()
     }
 
     Connections {
@@ -157,6 +185,14 @@ Item {
             if (!page.syncing)
                 page.syncFromApp()
             page.refreshFingerprint()
+        }
+        function onAutoRefreshChanged() {
+            autoRefreshSwitch.checked = App.autoRefresh
+        }
+        function onAutoRefreshIntervalChanged() {
+            page.autoRefreshSyncing = true
+            intervalBox.currentIndex = page.intervalIndexFor(App.autoRefreshInterval)
+            page.autoRefreshSyncing = false
         }
     }
 
@@ -396,6 +432,94 @@ Item {
                         wrapMode: Text.WordWrap
                         elide: Text.ElideRight
                     }
+                }
+            }
+
+            // ==========================================================
+            //  ①b 自动刷新
+            // ==========================================================
+            SectionCard {
+                Layout.fillWidth: true
+                Layout.leftMargin: page.contentMargin
+                Layout.rightMargin: page.contentMargin
+                title: qsTr("自动刷新")
+                subtitle: qsTr("开启后，停留在「文件」页时会按设定间隔自动刷新列表。")
+
+                // ---- 总开关 ----
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.spaceM
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.spaceXs
+                        Label {
+                            text: qsTr("自动刷新文件列表")
+                            color: Theme.textPrimary
+                            font.pointSize: Theme.fontBody
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr("仅当你停留在「文件」页时自动刷新；离开该页不会轮询。")
+                            color: Theme.textSecondary
+                            font.pointSize: Theme.fontSecondary
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+
+                    // 裸 Switch 可用：src/app/main.cpp 已把调色板钉死为浅色。
+                    Switch {
+                        id: autoRefreshSwitch
+                        onToggled: {
+                            if (!page.autoRefreshSyncing)
+                                App.autoRefresh = checked
+                        }
+                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: 1
+                    color: Theme.border
+                }
+
+                // ---- 刷新间隔（currentIndex ↔ 秒值 双向映射，syncing 防回环）----
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.spaceM
+
+                    Label {
+                        text: qsTr("刷新间隔")
+                        color: Theme.textSecondary
+                        font.pointSize: Theme.fontBody
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+                    ComboBox {
+                        id: intervalBox
+                        Layout.preferredWidth: 160
+                        Layout.preferredHeight: Theme.controlHeight
+                        implicitHeight: Theme.controlHeight
+                        font.pointSize: Theme.fontBody
+                        enabled: App.autoRefresh
+                        model: page.autoRefreshOptions
+                        textRole: "label"
+                        onActivated: {
+                            if (page.autoRefreshSyncing)
+                                return
+                            if (currentIndex >= 0 && currentIndex < page.autoRefreshOptions.length)
+                                App.autoRefreshInterval = page.autoRefreshOptions[currentIndex].seconds
+                        }
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    text: qsTr("服务器不可达时，自动刷新会自动暂停以避免反复卡顿；"
+                               + "恢复连接后点【刷新】即可再次启用。")
+                    color: Theme.textSecondary
+                    font.pointSize: Theme.fontSecondary
+                    wrapMode: Text.WordWrap
                 }
             }
 

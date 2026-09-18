@@ -34,6 +34,9 @@ class AppController : public QObject
     Q_PROPERTY(bool    busy              READ busy              NOTIFY busyChanged)
     // 服务端版本号（来自 /healthz 的 version 字段；未探活/不可用时为空）
     Q_PROPERTY(QString serverVersion     READ serverVersion     NOTIFY serverVersionChanged)
+    // 自动刷新配置（加法式）：读写 Settings 并立即落盘，供设置页绑定。
+    Q_PROPERTY(bool autoRefresh         READ autoRefresh         WRITE setAutoRefresh         NOTIFY autoRefreshChanged)
+    Q_PROPERTY(int  autoRefreshInterval READ autoRefreshInterval WRITE setAutoRefreshInterval NOTIFY autoRefreshIntervalChanged)
 
 public:
     explicit AppController(Backend *backend, QObject *parent = nullptr);
@@ -55,6 +58,12 @@ public:
 
     bool busy() const { return m_busy; }
 
+    // ---- 自动刷新（加法式；读写 Settings 并落盘）----
+    bool autoRefresh() const;
+    void setAutoRefresh(bool on);
+    int  autoRefreshInterval() const;
+    void setAutoRefreshInterval(int sec);
+
     // ---- 契约 §3 冻结方法 ----
     Q_INVOKABLE void healthCheck();     // GET /healthz（HttpBackend）或探活（其它后端）
     Q_INVOKABLE void refreshStorage();  // GET /api/v1/storage（经 Backend::usage）
@@ -72,6 +81,8 @@ signals:
     void serverVersionChanged();
     void trustSelfSignedChanged();
     void busyChanged();
+    void autoRefreshChanged();
+    void autoRefreshIntervalChanged();
 
     // 首次连接自签名服务器时请求人工确认（QML CertPinDialog 处理）
     void trustPromptRequested(const QString &hostPort,

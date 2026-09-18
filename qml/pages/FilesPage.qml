@@ -42,6 +42,33 @@ Item {
     // 请求跳转到设置页（错误态「检查令牌」引导）
     signal requestSettings()
 
+    // 请求主窗口弹出通知：复用 Main.qml 唯一的 window.showToast，不新造第二套 toast。
+    signal notify(string message, bool ok)
+
+    // 自动刷新：服务器不可达时暂停（L1 下 refresh() 为同步阻塞，超时 60s，
+    // 若持续轮询会反复冻结界面 —— 失败一次即停，不做重试风暴）。
+    property bool autoRefreshPaused: false
+
+    /*!
+        自动刷新定时器：以下四个条件**同时**满足才轮询 —— 缺一不可。
+          1) App.autoRefresh       —— 设置里的总开关
+          2) page.visible          —— StackLayout 会把非当前页置 visible=false，不在文件页不轮询
+          3) !Files.loading        —— 防重入堆叠（同步阻塞下堆叠会雪上加霜）
+          4) !page.autoRefreshPaused —— 失败后暂停
+        注意：不在此处（Component.onCompleted）调用 Files.refresh()，
+        以免与 Main.qml 启动时已有的 Files.refresh() 重复。
+    */
+    Timer {
+        id: autoRefreshTimer
+        interval: Math.max(5, App.autoRefreshInterval) * 1000
+        repeat: true
+        running: App.autoRefresh
+                 && page.visible
+                 && !Files.loading
+                 && !page.autoRefreshPaused
+        onTriggered: Files.refresh()
+    }
+
     // Ctrl+F 聚焦过滤框（仅本页可见时生效）
     Shortcut {
         sequence: "Ctrl+F"
@@ -191,6 +218,16 @@ Item {
         function onCurrentDirChanged() { page.rebuildCrumbs() }
         function onLoadingChanged() { if (Files.loading) page.listError = "" }
         function onErrorOccurred(message) { page.listError = message }
+        // 自动刷新：仅由 Files.refreshFinished 驱动（成功/失败各一次）——
+        // 不能用 statusMessage：Main.qml 的 toast 接线对任何非空 message 都会弹。
+        function onRefreshFinished(ok) {
+            if (ok) {
+                page.autoRefreshPaused = false
+            } else if (App.autoRefresh && !page.autoRefreshPaused) {
+                page.autoRefreshPaused = true
+                page.notify(qsTr("自动刷新已暂停：服务器不可达，可点【刷新】重试"), false)
+            }
+        }
         function onUploadRequested(dir) {
             uploadDialog.pendingDir = dir
             uploadDialog.open()
@@ -233,8 +270,28 @@ Item {
             GhostButton {
                 glyph: "⟳"
                 text: qsTr("刷新")
-                onClicked: Files.refresh()
+                onClicked: {
+                    // 手动重试：先解除暂停再刷新，使自动刷新重新武装；
+                    // 若仍失败，onRefreshFinished(false) 会立即再次暂停。
+                    page.autoRefreshPaused = false
+                    Files.refresh()
+                }
             }
+
+            // 自动刷新状态按钮（三态）。点击切换 App.autoRefresh；开启时清除暂停态。
+            GhostButton {
+                text: !App.autoRefresh
+                      ? qsTr("自动 ⟳ 关")
+                      : (page.autoRefreshPaused
+                         ? qsTr("自动 ⟳ 已暂停")
+                         : qsTr("自动 ⟳ %1s").arg(App.autoRefreshInterval))
+                onClicked: {
+                    App.autoRefresh = !App.autoRefresh
+                    if (App.autoRefresh)
+                        page.autoRefreshPaused = false
+                }
+            }
+
             SecondaryButton {
                 id: newBtn
                 glyph: "＋"

@@ -128,6 +128,7 @@ void FileController::refresh()
         setItems({});
         setEmptyText(QStringLiteral("未配置数据源"));
         emit errorOccurred(QStringLiteral("未配置数据源"));
+        emit refreshFinished(false); // 退出路径①：无数据源 → 视为失败
         return;
     }
 
@@ -147,6 +148,7 @@ void FileController::refresh()
                         QStringLiteral("列出目录「%1」失败：%2")
                             .arg(m_currentDir.isEmpty() ? QStringLiteral("根目录") : m_currentDir,
                                  r.error));
+        emit refreshFinished(false); // 退出路径②：列出失败
         return;
     }
 
@@ -156,6 +158,7 @@ void FileController::refresh()
                     QStringLiteral("已列出「%1」，共 %2 项")
                         .arg(m_currentDir.isEmpty() ? QStringLiteral("根目录") : m_currentDir)
                         .arg(r.value.size()));
+    emit refreshFinished(true); // 退出路径③：成功收尾
 }
 
 void FileController::enterDir(const QString &dir)

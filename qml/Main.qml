@@ -630,6 +630,14 @@ ApplicationWindow {
         }
     }
 
+    // 文件页自动刷新「已暂停」提示 —— 复用同一个 window.showToast（不新造第二套 toast）。
+    Connections {
+        target: filesPage
+        function onNotify(message, ok) {
+            window.showToast(message, ok)
+        }
+    }
+
     // ==================================================================
     //  快捷键
     // ==================================================================

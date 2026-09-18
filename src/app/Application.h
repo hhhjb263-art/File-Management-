@@ -32,6 +32,10 @@ public:
     void start();
     void registerContext(QQmlApplicationEngine *engine);
 
+    // 加法式访问器：暴露传输数据模型，供 main.cpp 的自检钩子（CV_SELFTEST_SEED_HISTORY）
+    // 种入假历史。仅返回指针，不改变任何既有装配 / 语义。
+    cv::TransferModel *transferModel() const { return m_transferModel; }
+
     // 说明：TLS 证书确认（TOFU）由 AppController 全权负责（它持有 fail-closed 守卫，
     // 且 API 已冻结在 docs/整合实现契约.md §8.3）。装配层**不得**再次注入信任回调——
     // HttpBackend::setTrustPrompt 是赋值语义，重复注入会互相覆盖，导致 QML 只连到其中一条

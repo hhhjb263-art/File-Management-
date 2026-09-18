@@ -10,6 +10,13 @@
  *      beginRemoveRows / endRemoveRows，整表清空才用 beginResetModel；
  *   2. 高频进度更新走 dataChanged 并**只指定进度相关角色**，绝不整表刷新；
  *   3. 只在主线程读写（网络 / IO 结果经信号回主线程后再改模型），不引入 QMutex。
+ *
+ * 历史分组（加法式，不改任何既有角色名 / 语义）：
+ *   当任务进入**终端态**（Completed / Failed / Canceled）时，该行从活动队列
+ *   `m_tasks` 移出，并头插到 `m_history`（最新在前，上限 200，超出丢弃最旧）。
+ *   历史数据不经角色暴露，而是由 `uploadHistoryAt()` / `downloadHistoryAt()`
+ *   以 QVariantMap 返回（键名与角色名同义 + sizeText / displayPath）。
+ *   约定：同一任务**只存在于 `m_tasks` 与 `m_history` 之一**。
  ****************************************************************************/
 #pragma once
 
@@ -28,6 +35,10 @@ class TransferModel : public QAbstractListModel
 {
     Q_OBJECT
     Q_PROPERTY(int count READ count NOTIFY countChanged)
+    // 历史分组（加法式）：统一 NOTIFY historyChanged。
+    Q_PROPERTY(int historyCount         READ historyCount         NOTIFY historyChanged)
+    Q_PROPERTY(int uploadHistoryCount   READ uploadHistoryCount   NOTIFY historyChanged)
+    Q_PROPERTY(int downloadHistoryCount READ downloadHistoryCount NOTIFY historyChanged)
 
 public:
     // 角色枚举：前 8 个对应契约冻结角色名，其余为辅助角色。
@@ -76,8 +87,23 @@ public:
     // 行数（供 QML `model.count` 绑定）。
     int count() const;
 
+    // ---- 历史分组（加法式，均 NOTIFY historyChanged）----
+    // 历史总数。
+    int historyCount() const;
+    // 历史中「已上传」（kind == TransferKind::Upload）的条数。
+    int uploadHistoryCount() const;
+    // 历史中「已下载」（kind == TransferKind::Download）的条数。
+    int downloadHistoryCount() const;
+    // 第 i 条「已上传」历史（0 = 最近一次；越界返回空 map）。
+    Q_INVOKABLE QVariantMap uploadHistoryAt(int i) const;
+    // 第 i 条「已下载」历史（0 = 最近一次；越界返回空 map）。
+    Q_INVOKABLE QVariantMap downloadHistoryAt(int i) const;
+    // 清空全部历史（仅清历史，不动活动队列）。
+    Q_INVOKABLE void clearHistory();
+
 signals:
     void countChanged();
+    void historyChanged();
 
 private:
     // TransferKind -> "upload" / "download"（机器可读 token）。
@@ -86,13 +112,26 @@ private:
     static QString stateToken(TransferState state);
     // TransferState -> 中文展示（供界面显示）。
     static QString stateLabel(TransferState state);
+    // 是否终端态（Completed / Failed / Canceled）—— 决定是否移入历史。
+    static bool isTerminalState(TransferState state);
 
     // 线性查行号：传输任务数量级很小，避免维护索引哈希带来的移位复杂度。
     int rowOf(const QString &taskId) const;
+    // 线性查历史索引（不存在返回 -1）——用于维护「同一 id 不同时存在于两处」。
+    int historyIndexOf(const QString &taskId) const;
     // 发出整行（全角色）dataChanged。
     void emitRowChanged(int row);
 
+    // 按 kind 取第 i 条历史（越界返回空 map）。
+    QVariantMap historyAtOfKind(TransferKind kind, int i) const;
+    // 把一条历史任务转成 QVariantMap（键名与角色同义 + sizeText / displayPath）。
+    QVariantMap historyMapFor(const TransferTask &task) const;
+
+    // 历史上限（超出丢弃最旧，即尾部）。
+    static constexpr int kHistoryLimit = 200;
+
     QList<TransferTask> m_tasks;
+    QList<TransferTask> m_history; // 头插：索引 0 = 最新
 };
 
 } // namespace cv

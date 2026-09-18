@@ -106,3 +106,5 @@ bin/
 client/build*/
 output/
 bin_shot/
+build_a/
+build_b/

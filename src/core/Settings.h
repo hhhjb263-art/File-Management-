@@ -50,6 +50,14 @@ public:
     int  fullScanIntervalMin() const;
     void setFullScanIntervalMin(int minutes);
 
+    // ---- 自动刷新（加法式）----
+    // 文件列表 / 任务队列的自动刷新配置。interval 合法范围 5..3600 秒，
+    // 越界一律钳制到边界（setter 落盘前钳制）。
+    bool autoRefreshEnabled() const;        // 默认 true
+    void setAutoRefreshEnabled(bool on);
+    int  autoRefreshIntervalSec() const;    // 默认 30
+    void setAutoRefreshIntervalSec(int sec);
+
     QVector<SyncPair> syncPairs() const;
     void              setSyncPairs(const QVector<SyncPair> &pairs);
 
