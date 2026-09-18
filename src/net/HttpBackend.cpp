@@ -85,6 +85,7 @@ namespace cv {
 namespace {
 
 constexpr int kTimeoutMs = 60000; // 单请求超时（含大分块 PUT / Range 下载）
+constexpr int kPreviewTimeoutMs = 15000; // 预览取内容区间专用超时（短请求；不改 kTimeoutMs 语义）
 
 // 失败结果的可识别前缀（见 HttpBackend.h 的 static 判定函数）
 const QString kUnsupportedPrefix = QStringLiteral("[unsupported] ");
@@ -327,6 +328,14 @@ void HttpBackend::requestAsync(Method method, const QString &path, const QByteAr
                                const QHash<QByteArray, QByteArray> &headers,
                                std::function<void(Response)> done)
 {
+    // 兼容重载：默认 60s（既有调用方语义不变）
+    requestAsync(method, path, body, headers, std::move(done), kTimeoutMs);
+}
+
+void HttpBackend::requestAsync(Method method, const QString &path, const QByteArray &body,
+                               const QHash<QByteArray, QByteArray> &headers,
+                               std::function<void(Response)> done, int timeoutMs)
+{
     QNetworkRequest req((QUrl(m_baseUrl + path)));
     req.setRawHeader("Accept", "application/json");
     if (!m_token.isEmpty())
@@ -356,7 +365,7 @@ void HttpBackend::requestAsync(Method method, const QString &path, const QByteAr
 
     // 保证 done **恰好一次**（finished 与 timeout 竞争时只取先到者）。
     auto fired  = std::make_shared<bool>(false);
-    auto finish = [reply, timer, fired, done](bool timedOut) {
+    auto finish = [reply, timer, fired, done, timeoutMs](bool timedOut) {
         if (*fired)
             return;
         *fired = true;
@@ -365,7 +374,7 @@ void HttpBackend::requestAsync(Method method, const QString &path, const QByteAr
         Response out;
         if (timedOut && !reply->isFinished()) {
             reply->abort();
-            out.error = QStringLiteral("请求超时（%1 ms）").arg(kTimeoutMs);
+            out.error = QStringLiteral("请求超时（%1 ms）").arg(timeoutMs);
         } else {
             out.status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
             out.body   = reply->readAll();
@@ -395,7 +404,7 @@ void HttpBackend::requestAsync(Method method, const QString &path, const QByteAr
                          applyCertPinning(reply, errors);
                      });
 
-    timer->start(kTimeoutMs);
+    timer->start(timeoutMs);
 }
 
 // =========================================================================
@@ -921,27 +930,18 @@ Ok HttpBackend::cancelUpload(const QString &uploadId)
     return r.ok() ? ok() : err(r.error);
 }
 
-Result<QByteArray> HttpBackend::getRange(const QString &fileId, qint64 offset, qint64 length)
+QByteArray HttpBackend::rangeHeader(qint64 offset, qint64 length)
 {
-    if (isDirId(fileId))
-        return Result<QByteArray>::fail(QStringLiteral("目录不支持按区间下载：%1").arg(fileId));
-    if (offset < 0)
-        return Result<QByteArray>::fail(QStringLiteral("offset 不能为负"));
+    return (length > 0 ? QStringLiteral("bytes=%1-%2").arg(offset).arg(offset + length - 1)
+                       : QStringLiteral("bytes=%1-").arg(offset))
+        .toLatin1();
+}
 
-    const QString range = length > 0
-                              ? QStringLiteral("bytes=%1-%2").arg(offset).arg(offset + length - 1)
-                              : QStringLiteral("bytes=%1-").arg(offset);
-
-    QHash<QByteArray, QByteArray> headers;
-    headers.insert("Range", range.toLatin1());
-
-    const Response r = request(Method::Get,
-                               QStringLiteral("/api/v1/files/") + pct(fileId)
-                                   + QStringLiteral("/content"),
-                               QByteArray(), headers);
-
+Result<QByteArray> HttpBackend::parseRangeBody(const Response &r, qint64 offset, qint64 length)
+{
     if (r.status == 416)
-        return Result<QByteArray>::fail(QStringLiteral("请求范围无效（HTTP 416）：%1").arg(range));
+        return Result<QByteArray>::fail(QStringLiteral("请求范围无效（HTTP 416）：%1")
+                                            .arg(QString::fromLatin1(rangeHeader(offset, length))));
     if (!r.ok())
         return Result<QByteArray>::fail(r.error);
 
@@ -952,12 +952,51 @@ Result<QByteArray> HttpBackend::getRange(const QString &fileId, qint64 offset, q
             return Result<QByteArray>::success(QByteArray());
         if (length <= 0)
             return Result<QByteArray>::success(r.body.mid(qsizetype(offset)));
-        return Result<QByteArray>::success(
-            r.body.mid(qsizetype(offset), qsizetype(length)));
+        return Result<QByteArray>::success(r.body.mid(qsizetype(offset), qsizetype(length)));
     }
 
     // 206：服务端已按区间返回
     return Result<QByteArray>::success(r.body);
+}
+
+Result<QByteArray> HttpBackend::getRange(const QString &fileId, qint64 offset, qint64 length)
+{
+    if (isDirId(fileId))
+        return Result<QByteArray>::fail(QStringLiteral("目录不支持按区间下载：%1").arg(fileId));
+    if (offset < 0)
+        return Result<QByteArray>::fail(QStringLiteral("offset 不能为负"));
+
+    QHash<QByteArray, QByteArray> headers;
+    headers.insert("Range", rangeHeader(offset, length));
+
+    const Response r = request(Method::Get,
+                               QStringLiteral("/api/v1/files/") + pct(fileId)
+                                   + QStringLiteral("/content"),
+                               QByteArray(), headers);
+    return parseRangeBody(r, offset, length);
+}
+
+void HttpBackend::getRangeAsync(const QString &fileId, qint64 offset, qint64 length,
+                                std::function<void(Result<QByteArray>)> done)
+{
+    // 与同步版一致的入参校验（不发请求）
+    if (isDirId(fileId)) {
+        done(Result<QByteArray>::fail(QStringLiteral("目录不支持按区间下载：%1").arg(fileId)));
+        return;
+    }
+    if (offset < 0) {
+        done(Result<QByteArray>::fail(QStringLiteral("offset 不能为负")));
+        return;
+    }
+
+    QHash<QByteArray, QByteArray> headers;
+    headers.insert("Range", rangeHeader(offset, length));
+
+    requestAsync(Method::Get,
+                 QStringLiteral("/api/v1/files/") + pct(fileId) + QStringLiteral("/content"),
+                 QByteArray(), headers,
+                 [offset, length, done](Response r) { done(parseRangeBody(r, offset, length)); },
+                 kPreviewTimeoutMs); // 预览短请求：15s，不改默认 60s 语义
 }
 
 Result<HttpBackend::UploadSessionInfo> HttpBackend::uploadSession(const QString &uploadId)

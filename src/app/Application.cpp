@@ -1,5 +1,7 @@
 #include "Application.h"
 
+#include <QDebug>
+#include <QLoggingCategory>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 
@@ -16,6 +18,25 @@
 #include "../net/HttpBackend.h"
 #include "../net/MockBackend.h"
 #include "../transfer/TransferManager.h"
+
+namespace {
+
+// 控制器的 logMessage(level, text) 信号 → 统一日志 sink。
+// Logging::install() 已 qInstallMessageHandler，会把 qInfo/qWarning/qCritical 同时写
+// stderr 与 cloudvault.log；level 映射：ERROR→qCritical，WARN→qWarning，其余→qInfo。
+void logToSink(const char *tag, const QString &level, const QString &text)
+{
+    const QString l = level.trimmed().toUpper();
+    const QString line = QStringLiteral("[%1] %2").arg(QString::fromLatin1(tag), text);
+    if (l == QLatin1String("ERROR") || l == QLatin1String("ERR") || l == QLatin1String("CRITICAL"))
+        qCritical().noquote() << line;
+    else if (l == QLatin1String("WARN") || l == QLatin1String("WARNING"))
+        qWarning().noquote() << line;
+    else
+        qInfo().noquote() << line;
+}
+
+} // namespace
 
 Application::Application(bool useMock, QObject *parent) : QObject(parent)
 {
@@ -49,6 +70,43 @@ void Application::start()
     m_transfers->setTaskModel(m_transferModel);
     m_shares = new cv::ShareController(this);
     m_stats = new cv::StatsController(m_backend, this);
+
+    // ---- 日志接线：把各控制器 logMessage(level,text) 接到统一日志 sink ----
+    // 修复：此前 FileController/AppController/TransferController/StatsController 的 logMessage
+    // **全无消费者**（TransferController 只是把 TransferManager 的信号转发成自己同样无人订阅的信号），
+    // 导致"列出目录失败"等关键信息永远进不了 cloudvault.log。Logging 已 qInstallMessageHandler，
+    // 这里把 qCritical/qWarning/qInfo 落到 stderr + 日志文件。
+    // 不重复：每路信号只在此接一次；TransferManager 的日志经 TransferController 转发这一条路径进入。
+    QObject::connect(m_files, &cv::FileController::logMessage, this,
+                     [](const QString &lv, const QString &tx) { logToSink("Files", lv, tx); });
+    QObject::connect(m_app, &cv::AppController::logMessage, this,
+                     [](const QString &lv, const QString &tx) { logToSink("App", lv, tx); });
+    QObject::connect(m_transfers, &cv::TransferController::logMessage, this,
+                     [](const QString &lv, const QString &tx) { logToSink("Transfer", lv, tx); });
+    QObject::connect(m_stats, &cv::StatsController::logMessage, this,
+                     [](const QString &lv, const QString &tx) { logToSink("Stats", lv, tx); });
+
+    // ---- 默认下载目录注入（启用 Settings::downloadDir()）+ 设置变更后重新注入 ----
+    applyDownloadDirSetting();
+    QObject::connect(m_app, &cv::AppController::downloadDirChanged, this,
+                     &Application::applyDownloadDirSetting);
+
+    // ---- 用量自动刷新：文件增 / 删 / 改名 / 新建文件夹成功 → 刷服务器用量 ----
+    QObject::connect(m_files, &cv::FileController::storageChanged, m_stats,
+                     &cv::StatsController::refresh);
+    // 上传/下载任务**成功结束**后同样刷新用量。复用既有信号 TransferManager::taskFinished
+    // （不新造语义重复的信号）；下载成功也刷一次（无害，且刷新走异步不阻塞）。
+    QObject::connect(m_transfer, &cv::TransferManager::taskFinished, this,
+                     [this](const QString &, bool ok, const QString &) {
+                         if (ok && m_stats)
+                             m_stats->refresh();
+                     });
+}
+
+void Application::applyDownloadDirSetting()
+{
+    if (m_transfer)
+        m_transfer->setDefaultDownloadDir(cv::Settings::instance().downloadDir());
 }
 
 void Application::registerContext(QQmlApplicationEngine *engine)

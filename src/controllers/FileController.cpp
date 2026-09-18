@@ -8,12 +8,19 @@
  ****************************************************************************/
 #include "FileController.h"
 
+#include "core/Util.h"          // Util::humanSize（预览元信息）
 #include "data/FileListModel.h" // cv::FileListModel / cv::FileRow（契约 §4）
 #include "net/Backend.h"
 #include "net/HttpBackend.h"    // uploadWholeFile（新建空文件，POST /api/v1/files）
 
+#include <QBuffer>
 #include <QCryptographicHash>
+#include <QDateTime>
+#include <QFileInfo>
+#include <QImage>
 #include <QList>
+#include <QStringDecoder>
+#include <QVariantMap>
 
 #include <algorithm>
 
@@ -205,16 +212,208 @@ QString FileController::fingerprintOf(const QVector<FileItem> &items)
     QStringList parts;
     parts.reserve(items.size());
     for (const FileItem &it : items) {
-        // 字段以 FileItem 真实定义为准：id / name / size / modified(UTC)
-        parts << QStringLiteral("%1|%2|%3|%4")
+        // 必须带 hash：服务端覆盖同名文件时**不改** created_at（modified 不变），只改内容，
+        // 故仅凭 id/name/size/mtime 检不到"同 size 覆盖"。hash = 内容 SHA-256，会随之变化。
+        // （字段取自 FileItem 真实定义；目录 hash 为空串，稳定、不误报。）
+        parts << QStringLiteral("%1|%2|%3|%4|%5")
                      .arg(it.id, it.name)
                      .arg(it.size)
-                     .arg(it.modified.isValid() ? it.modified.toMSecsSinceEpoch() : 0);
+                     .arg(it.modified.isValid() ? it.modified.toMSecsSinceEpoch() : 0)
+                     .arg(it.hash);
     }
     std::sort(parts.begin(), parts.end()); // 稳定：判定与后端返回顺序无关
     return QString::fromLatin1(QCryptographicHash::hash(parts.join(QLatin1Char('\n')).toUtf8(),
                                                         QCryptographicHash::Sha256)
                                    .toHex());
+}
+
+// ---------------------------------------------------------------------------
+//  文件预览（异步；绝不阻塞主线程）
+// ---------------------------------------------------------------------------
+
+QString FileController::previewKindFor(const FileItem &item)
+{
+    if (item.isDir)
+        return QStringLiteral("dir");
+    const QString ext = QFileInfo(item.name).suffix().toLower();
+
+    static const QStringList kImageExts = {QStringLiteral("png"),  QStringLiteral("jpg"),
+                                           QStringLiteral("jpeg"), QStringLiteral("gif"),
+                                           QStringLiteral("bmp"),  QStringLiteral("webp")};
+    if (kImageExts.contains(ext))
+        return QStringLiteral("image");
+
+    static const QStringList kTextExts = {
+        QStringLiteral("txt"),  QStringLiteral("md"),   QStringLiteral("markdown"),
+        QStringLiteral("json"), QStringLiteral("xml"),  QStringLiteral("csv"),
+        QStringLiteral("tsv"),  QStringLiteral("log"),  QStringLiteral("ini"),
+        QStringLiteral("cfg"),  QStringLiteral("conf"), QStringLiteral("yaml"),
+        QStringLiteral("yml"),  QStringLiteral("html"), QStringLiteral("htm"),
+        QStringLiteral("css"),  QStringLiteral("js"),   QStringLiteral("ts"),
+        QStringLiteral("cpp"),  QStringLiteral("c"),    QStringLiteral("h"),
+        QStringLiteral("hpp"),  QStringLiteral("py"),   QStringLiteral("java"),
+        QStringLiteral("sh"),   QStringLiteral("bat"),  QStringLiteral("sql"),
+        QStringLiteral("go"),   QStringLiteral("rs"),   QStringLiteral("toml")};
+    if (kTextExts.contains(ext))
+        return QStringLiteral("text");
+
+    return QStringLiteral("other");
+}
+
+void FileController::resetPreviewToIdle()
+{
+    m_previewMeta.clear();
+    m_previewText.clear();
+    m_previewImageUrl.clear();
+    m_previewError.clear();
+    m_previewState = QStringLiteral("idle");
+}
+
+void FileController::clearPreview()
+{
+    ++m_previewSeq; // 作废在途回包
+    resetPreviewToIdle();
+    emit previewChanged();
+}
+
+void FileController::requestPreview(const QString &fileId)
+{
+    if (fileId.isEmpty()) {
+        clearPreview();
+        return;
+    }
+
+    const int seq = ++m_previewSeq; // **独立**序号：与 m_refreshSeq 互不影响
+
+    // 在当前列表里找该文件（预览入口来自列表右键菜单，必然在此）。拷贝一份，异步回包时列表可能已变。
+    const FileItem *found = nullptr;
+    for (const FileItem &it : m_items) {
+        if (it.id == fileId) {
+            found = &it;
+            break;
+        }
+    }
+    if (!found) {
+        resetPreviewToIdle();
+        m_previewState = QStringLiteral("error");
+        m_previewError = QStringLiteral("文件不在当前列表中");
+        emit previewChanged();
+        return;
+    }
+    const FileItem item = *found;
+
+    // 元信息（键名冻结：id/name/isDir/sizeText/timeText/path/hash/kind）
+    const QString kind = previewKindFor(item);
+    QVariantMap   meta;
+    meta.insert(QStringLiteral("id"), item.id);
+    meta.insert(QStringLiteral("name"), item.name);
+    meta.insert(QStringLiteral("isDir"), item.isDir);
+    meta.insert(QStringLiteral("sizeText"), Util::humanSize(item.size));
+    meta.insert(QStringLiteral("timeText"),
+                item.modified.isValid()
+                    ? item.modified.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
+                    : QStringLiteral("-"));
+    meta.insert(QStringLiteral("path"), item.path);
+    meta.insert(QStringLiteral("hash"), item.hash);
+    meta.insert(QStringLiteral("kind"), kind);
+    m_previewMeta = meta;
+
+    if (!m_backend) {
+        m_previewState = QStringLiteral("error");
+        m_previewText.clear();
+        m_previewImageUrl.clear();
+        m_previewError = QStringLiteral("未配置数据源");
+        emit previewChanged();
+        return;
+    }
+
+    // 目录 / 其它类型：不支持预览（**仍保留元信息**）
+    if (kind == QStringLiteral("dir") || kind == QStringLiteral("other")) {
+        m_previewState = QStringLiteral("unsupported");
+        m_previewText.clear();
+        m_previewImageUrl.clear();
+        m_previewError.clear();
+        emit previewChanged();
+        return;
+    }
+
+    // 加载态 + 异步取片段（文本 64 KiB / 图片 4 MiB）
+    m_previewState = QStringLiteral("loading");
+    m_previewText.clear();
+    m_previewImageUrl.clear();
+    m_previewError.clear();
+    emit previewChanged();
+
+    const qint64 span =
+        (kind == QStringLiteral("image")) ? qint64(4 * 1024 * 1024) : qint64(64 * 1024);
+    m_backend->getRangeAsync(fileId, 0, span,
+                             [this, seq, kind](Result<QByteArray> r) {
+                                 handlePreviewReply(seq, kind, r);
+                             });
+}
+
+void FileController::handlePreviewReply(int seq, const QString &kind,
+                                        const Result<QByteArray> &reply)
+{
+    if (seq != m_previewSeq) {
+        return; // 乱序 / 已切换预览目标：丢弃，不发任何信号
+    }
+
+    if (!reply.ok) {
+        m_previewState = QStringLiteral("error");
+        m_previewText.clear();
+        m_previewImageUrl.clear();
+        m_previewError = friendlyError(reply.error);
+        emit previewChanged();
+        return;
+    }
+
+    const QByteArray data = reply.value;
+
+    if (kind == QStringLiteral("image")) {
+        QImage img;
+        if (!img.loadFromData(data)) {
+            m_previewState = QStringLiteral("unsupported"); // 解码失败 → 不支持
+            m_previewText.clear();
+            m_previewImageUrl.clear();
+            m_previewError.clear();
+            emit previewChanged();
+            return;
+        }
+        QByteArray png;
+        QBuffer    buf(&png);
+        buf.open(QIODevice::WriteOnly);
+        img.save(&buf, "PNG");
+        buf.close();
+        m_previewImageUrl = QStringLiteral("data:image/png;base64,") + png.toBase64();
+        m_previewText.clear();
+        m_previewError.clear();
+        m_previewState = QStringLiteral("image");
+        emit previewChanged();
+        return;
+    }
+
+    // 文本：含 NUL 或非合法 UTF-8 → 不支持
+    bool   badEncoding = data.contains('\0');
+    QString text;
+    if (!badEncoding) {
+        QStringDecoder dec(QStringDecoder::Utf8);
+        text = dec(data);
+        badEncoding = dec.hasError();
+    }
+    if (badEncoding) {
+        m_previewState = QStringLiteral("unsupported");
+        m_previewText.clear();
+        m_previewImageUrl.clear();
+        m_previewError.clear();
+        emit previewChanged();
+        return;
+    }
+    m_previewText = text;
+    m_previewImageUrl.clear();
+    m_previewError.clear();
+    m_previewState = QStringLiteral("text");
+    emit previewChanged();
 }
 
 void FileController::enterDir(const QString &dir)
@@ -320,6 +519,7 @@ void FileController::createFile(const QString &name)
     }
 
     emit statusMessage(QStringLiteral("✓ 新建文件成功"), true);
+    emit storageChanged(); // 成功 → 通知用例变更（Application 触发 Stats.refresh()）
     refresh();
 }
 
@@ -350,6 +550,7 @@ void FileController::rename(const QString &id, const QString &name)
     }
 
     emit statusMessage(QStringLiteral("✓ 重命名成功"), true);
+    emit storageChanged();
     refresh();
 }
 
@@ -374,6 +575,7 @@ void FileController::remove(const QString &id)
     }
 
     emit statusMessage(QStringLiteral("✓ 已删除（不可恢复）"), true);
+    emit storageChanged();
     refresh();
 }
 
@@ -408,6 +610,7 @@ void FileController::createFolder(const QString &path)
     }
 
     emit statusMessage(QStringLiteral("✓ 新建文件夹成功"), true);
+    emit storageChanged();
     refresh();
 }
 

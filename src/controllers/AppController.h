@@ -37,6 +37,8 @@ class AppController : public QObject
     // 自动刷新配置（加法式）：读写 Settings 并立即落盘，供设置页绑定。
     Q_PROPERTY(bool autoRefresh         READ autoRefresh         WRITE setAutoRefresh         NOTIFY autoRefreshChanged)
     Q_PROPERTY(int  autoRefreshInterval READ autoRefreshInterval WRITE setAutoRefreshInterval NOTIFY autoRefreshIntervalChanged)
+    // 默认下载目录（加法式）：setDownloadDir 只写 Settings 与内存（不落盘），saveSettings() 负责 sync()
+    Q_PROPERTY(QString downloadDir      READ downloadDir      WRITE setDownloadDir      NOTIFY downloadDirChanged)
 
 public:
     explicit AppController(Backend *backend, QObject *parent = nullptr);
@@ -64,6 +66,10 @@ public:
     int  autoRefreshInterval() const;
     void setAutoRefreshInterval(int sec);
 
+    // ---- 默认下载目录（加法式）----
+    QString downloadDir() const { return m_downloadDir; }
+    void    setDownloadDir(const QString &dir); // 写 Settings（内存）+ m_downloadDir，不落盘
+
     // ---- 契约 §3 冻结方法 ----
     Q_INVOKABLE void healthCheck();     // GET /healthz（HttpBackend）或探活（其它后端）
     Q_INVOKABLE void refreshStorage();  // GET /api/v1/storage（经 Backend::usage）
@@ -83,6 +89,7 @@ signals:
     void busyChanged();
     void autoRefreshChanged();
     void autoRefreshIntervalChanged();
+    void downloadDirChanged();
 
     // 首次连接自签名服务器时请求人工确认（QML CertPinDialog 处理）
     void trustPromptRequested(const QString &hostPort,
@@ -108,6 +115,7 @@ private:
     QString  m_statusText;
     bool     m_trustSelfSigned = true;
     bool     m_busy = false;
+    QString  m_downloadDir;   // 默认下载目录（与 Settings 同步；改后由 Application 重新注入 TransferManager）
 
     // TOFU 确认等待状态（仅主线程访问）
     bool m_trustPromptPending = false;

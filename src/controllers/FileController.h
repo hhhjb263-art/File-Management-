@@ -22,6 +22,7 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
+#include <QVariantMap>
 #include <QVector>
 
 #include "core/Types.h" // FileItem
@@ -39,6 +40,12 @@ class FileController : public QObject
     Q_PROPERTY(QString     emptyText   READ emptyText   NOTIFY emptyTextChanged)
     Q_PROPERTY(QStringList selectedIds READ selectedIds WRITE setSelectedIds NOTIFY selectedIdsChanged)
     Q_PROPERTY(bool        supported   READ supported   CONSTANT)
+    // ---- 文件预览（加法式）：异步取内容区间，绝不阻塞主线程 ----
+    Q_PROPERTY(QVariantMap previewMeta     READ previewMeta     NOTIFY previewChanged)
+    Q_PROPERTY(QString     previewState    READ previewState    NOTIFY previewChanged)
+    Q_PROPERTY(QString     previewText     READ previewText     NOTIFY previewChanged)
+    Q_PROPERTY(QString     previewImageUrl READ previewImageUrl NOTIFY previewChanged)
+    Q_PROPERTY(QString     previewError    READ previewError    NOTIFY previewChanged)
 
 public:
     explicit FileController(Backend *backend, FileListModel *model, QObject *parent = nullptr);
@@ -49,6 +56,17 @@ public:
     QStringList selectedIds() const { return m_selectedIds; }
     void        setSelectedIds(const QStringList &ids);
     bool        supported() const { return m_backend != nullptr; }
+
+    // ---- 预览属性（只读；见 requestPreview）----
+    QVariantMap previewMeta() const { return m_previewMeta; }
+    QString     previewState() const { return m_previewState; }
+    QString     previewText() const { return m_previewText; }
+    QString     previewImageUrl() const { return m_previewImageUrl; }
+    QString     previewError() const { return m_previewError; }
+
+    // 请求预览某文件（异步）。传空串等价 clearPreview()。
+    Q_INVOKABLE void requestPreview(const QString &fileId);
+    Q_INVOKABLE void clearPreview();
 
     // ---- 契约 §3 冻结方法 ----
     Q_INVOKABLE void refresh();                          // 重新列出 currentDir
@@ -80,6 +98,10 @@ signals:
     // toast 接线对任何非空 message 都会弹，会退化成每轮弹窗）。
     // refreshIfChanged()（低频轮询）：仅「失败」或「内容指纹变化」时才发；未变化不发任何信号。
     void refreshFinished(bool ok);
+    // 预览属性变化（previewMeta / previewState / previewText / previewImageUrl / previewError 任一变化）
+    void previewChanged();
+    // 文件增 / 删 / 改名 / 新建文件夹**成功**后发出（供 Application 触发 Stats.refresh()；失败不发）
+    void storageChanged();
     void uploadRequested(const QString &dir);          // QML 打开文件选择框后调 Transfer.upload
     void downloadRequested(const QStringList &fileIds); // QML 或上层转交 Transfer.download
     void logMessage(const QString &level, const QString &text);
@@ -103,6 +125,13 @@ private:
     // 内容指纹：按「id|name|size|mtime」稳定排序后整体 SHA-256（判定轮询是否"变了"）
     static QString fingerprintOf(const QVector<FileItem> &items);
 
+    // ---- 预览内部 ----
+    // 由文件名 / 是否目录推断预览类别："dir" | "text" | "image" | "other"
+    static QString previewKindFor(const FileItem &item);
+    // 异步取回内容后的统一处理（含乱序丢弃）；seq 过期则不发任何信号
+    void handlePreviewReply(int seq, const QString &kind, const Result<QByteArray> &reply);
+    void resetPreviewToIdle(); // 清空各预览字段并置 idle
+
     Backend       *m_backend = nullptr;
     FileListModel *m_model   = nullptr;
 
@@ -113,6 +142,14 @@ private:
     QVector<FileItem> m_items;   // 当前目录项（供 id 校验 / 选中修剪）
     int           m_refreshSeq = 0; // 刷新序号：丢弃乱序（旧目录）回包，防快速切换目录串台
     QString       m_lastFingerprint; // 最近一次成功应用列表的内容指纹（轮询据此判断"是否变了"）
+
+    // ---- 预览状态（主线程独占）----
+    QVariantMap m_previewMeta;
+    QString     m_previewState = QStringLiteral("idle"); // idle|loading|meta|text|image|unsupported|error
+    QString     m_previewText;
+    QString     m_previewImageUrl;
+    QString     m_previewError;
+    int         m_previewSeq = 0; // 预览序号：**独立于 m_refreshSeq**，丢弃乱序预览回包
 };
 
 } // namespace cv

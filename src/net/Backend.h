@@ -106,6 +106,14 @@ public:
         done(listFolder(parentId));
     }
     virtual void usageAsync(std::function<void(Result<UsageStats>)> done) { done(usage()); }
+
+    // 异步取文件内容区间（文件预览用）。默认**退化同步**；HttpBackend 覆写为真异步（用较短
+    // 超时），避免在主线程取预览内容时阻塞（不重演"界面冻结"）。Range 语义与 getRange 一致。
+    virtual void getRangeAsync(const QString &fileId, qint64 offset, qint64 length,
+                               std::function<void(Result<QByteArray>)> done)
+    {
+        done(getRange(fileId, offset, length));
+    }
 };
 
 } // namespace cv

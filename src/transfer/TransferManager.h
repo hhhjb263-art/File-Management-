@@ -82,6 +82,11 @@ public:
     // 取消当前任务（并终止当前批次剩余的排队任务）
     Q_INVOKABLE void cancelCurrent();
 
+    // 默认下载目录（由 Application 从 Settings 注入）。
+    // 回退链：enqueueDownload 的显式 destDir > 本默认目录 > AppPaths::downloadDir()。
+    void    setDefaultDownloadDir(const QString &dir);
+    QString defaultDownloadDir() const { return m_defaultDownloadDir; }
+
 signals:
     void changed();
     // 任务开始（含展示所需信息）——上层据此在 TransferModel 中建行；每任务只发一次。
@@ -178,6 +183,8 @@ private:
 
     // ---- 收尾与工具 ----
     void finishTask(bool ok, const QString &message);
+    // 下载目标目录回退链：显式 destDir > 注入的默认目录 > AppPaths::downloadDir()
+    QString resolveDownloadDir(const QString &destDir) const;
     // 分块表：块大小由调用方传入（取自 backend->chunkSize()，单一来源，§8.5）
     QList<ChunkRange> makeChunkPlan(qint64 size, qint64 chunkBytes) const;
 
@@ -204,6 +211,9 @@ private:
     qint64 m_genSeq    = 0; // 任务代号自增序号
 
     QString m_manifestFile;
+
+    // 由 Application 注入的默认下载目录（为空时回退 AppPaths::downloadDir()）
+    QString m_defaultDownloadDir;
 };
 
 } // namespace cv

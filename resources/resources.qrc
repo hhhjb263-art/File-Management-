@@ -17,6 +17,11 @@
         <file alias="qml/controls/SectionCard.qml">../qml/controls/SectionCard.qml</file>
         <file alias="qml/controls/SearchField.qml">../qml/controls/SearchField.qml</file>
         <file alias="qml/controls/UnsupportedPage.qml">../qml/controls/UnsupportedPage.qml</file>
+        <file alias="qml/controls/HistoryGroup.qml">../qml/controls/HistoryGroup.qml</file>
+
+        <!-- 面板（右侧常驻区 / 抽屉） -->
+        <file alias="qml/panels/PreviewPanel.qml">../qml/panels/PreviewPanel.qml</file>
+        <file alias="qml/panels/TransferDrawer.qml">../qml/panels/TransferDrawer.qml</file>
 
         <!-- 页面 -->
         <file alias="qml/pages/FilesPage.qml">../qml/pages/FilesPage.qml</file>

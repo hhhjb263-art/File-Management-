@@ -42,6 +42,9 @@ public:
     // 而另一条成为死路径（这正是曾经出现的缺陷）。
 
 private:
+    // 把默认下载目录从 Settings 注入 TransferManager（启动时 + 设置变更后）
+    void applyDownloadDirSetting();
+
     cv::Backend          *m_backend = nullptr;
     cv::TransferManager  *m_transfer = nullptr;
     cv::FileListModel    *m_fileModel = nullptr;

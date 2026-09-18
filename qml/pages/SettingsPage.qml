@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 
 import "../theme"
 import "../controls"
@@ -59,6 +60,72 @@ Item {
         autoRefreshSwitch.checked = App.autoRefresh
         intervalBox.currentIndex = page.intervalIndexFor(App.autoRefreshInterval)
         page.autoRefreshSyncing = false
+    }
+
+    // ------------------------------------------------------------------
+    //  下载目录（可编辑 + 浏览 + 校验；持久化交给既有【保存设置】）
+    //  App.downloadDir 是冻结的**运行时**属性：C++ 未落地时用 typeof 守卫，
+    //  仅本地生效、不抛错。
+    // ------------------------------------------------------------------
+    property bool   dirSyncing: false        // 回灌文本时抑制 onTextChanged 写回
+    property string downloadDir: ""          // 当前编辑值
+    property string savedDownloadDir: ""     // 最近一次「已保存」值（用于「未保存」提示）
+    property string downloadDirError: ""     // 校验提示
+    readonly property bool downloadDirDirty: downloadDir !== savedDownloadDir
+
+    // 本机磁盘列表（冻结 API；未落地时为空数组 → 卡片给「暂不可用」提示）
+    readonly property var localDisks: (typeof Stats !== "undefined" && Stats.localDisks !== undefined)
+                                      ? Stats.localDisks : []
+
+    // file:// URL → 本地路径（Windows：file:///C:/x → C:/x；POSIX：file:///home/x → /home/x）
+    function urlToPath(u) {
+        let s = String(u)
+        if (s.indexOf("file://") === 0) {
+            s = s.substring(7)
+            if (s.charAt(0) === "/" && s.length > 2 && s.charAt(2) === ":")
+                s = s.substring(1)
+        }
+        try { s = decodeURIComponent(s) } catch (e) { /* 保持原样 */ }
+        return s
+    }
+
+    // 校验：非空 + 绝对路径（Windows 盘符 / POSIX 根 / UNC）
+    function validateDownloadDir(p) {
+        const s = String(p === undefined || p === null ? "" : p).trim()
+        if (s.length === 0)
+            return qsTr("下载目录不能为空")
+        const isWin = /^[A-Za-z]:[\\/]/.test(s)
+        const isUnix = s.charAt(0) === "/"
+        const isUnc = /^\\\\/.test(s)
+        if (!isWin && !isUnix && !isUnc)
+            return qsTr("请填写绝对路径（例如 C:\\Users\\me\\Downloads）")
+        return ""
+    }
+
+    // 应用一个新目录值：更新本地态；合法且要求推送时写入 App.downloadDir
+    function applyDownloadDir(path, pushToApp) {
+        page.downloadDir = path
+        page.downloadDirError = page.validateDownloadDir(path)
+        if (pushToApp && page.downloadDirError.length === 0
+                && typeof App.downloadDir !== "undefined")
+            App.downloadDir = path
+    }
+
+    // 从 App 回灌（首次进入 / 外部改动）
+    function syncDownloadDir() {
+        const cur = (typeof App.downloadDir !== "undefined") ? String(App.downloadDir) : ""
+        page.dirSyncing = true
+        page.downloadDir = cur
+        page.savedDownloadDir = cur
+        page.downloadDirError = ""
+        downloadDirField.text = cur
+        page.dirSyncing = false
+    }
+
+    // 【保存设置】成功时调用：把当前值标记为已保存（消除「未保存」提示）
+    function markDownloadDirSaved() {
+        if (page.downloadDirError.length === 0)
+            page.savedDownloadDir = page.downloadDir
     }
 
     function defaultPortFor(scheme) {
@@ -177,6 +244,21 @@ Item {
         syncFromApp()
         refreshFingerprint()
         syncAutoRefresh()
+        syncDownloadDir()
+        page.refreshLocalDisks()
+    }
+
+    // 切回设置页时重扫本机磁盘（U 盘插拔 / 空间变化都能反映）
+    onVisibleChanged: {
+        if (page.visible)
+            page.refreshLocalDisks()
+    }
+
+    // 本机磁盘查询走 C++（QStorageInfo，纯本机、不阻塞）。
+    // 未落地（undefined）时静默降级：localDisks 为空 → 卡片给「暂不可用」提示。
+    function refreshLocalDisks() {
+        if (typeof Stats !== "undefined" && typeof Stats.refreshLocalDisks === "function")
+            Stats.refreshLocalDisks()
     }
 
     Connections {
@@ -193,6 +275,12 @@ Item {
             page.autoRefreshSyncing = true
             intervalBox.currentIndex = page.intervalIndexFor(App.autoRefreshInterval)
             page.autoRefreshSyncing = false
+        }
+        // 下载目录变更 → 只重扫磁盘（让「默认」标记跟着走）。
+        // ⚠️ 这里**不能**调 syncDownloadDir()：那会把 savedDownloadDir 一起重置，
+        //    导致「未保存」提示在用户刚敲完字时就被抹掉。
+        function onDownloadDirChanged() {
+            page.refreshLocalDisks()
         }
     }
 
@@ -398,6 +486,7 @@ Item {
                             page.commit()
                             App.accessToken = tokenField.text
                             App.saveSettings()
+                            page.markDownloadDirSaved()
                         }
                     }
                     SecondaryButton {
@@ -561,6 +650,7 @@ Item {
                         onToggled: {
                             App.trustSelfSigned = checked
                             App.saveSettings()
+                            page.markDownloadDirSaved()
                         }
                     }
                 }
@@ -628,25 +718,195 @@ Item {
             }
 
             // ==========================================================
-            //  ③ 下载目录（v1 仅打开，不可改）
+            //  ③ 下载目录（可编辑 + 浏览 + 校验）
+            //     根因：Settings 里早就有 downloadDir()/setDownloadDir()，但
+            //     TransferManager 直接调 AppPaths::downloadDir()，设置项从未被读取。
+            //     现在：编辑 → App.downloadDir → Application 注入 TransferManager，
+            //     并落盘到 general/downloadDir（点【保存设置】时持久化）。
             // ==========================================================
             SectionCard {
                 Layout.fillWidth: true
                 Layout.leftMargin: page.contentMargin
                 Layout.rightMargin: page.contentMargin
                 title: qsTr("下载目录")
-                subtitle: qsTr("下载文件默认保存到客户端配置的本地下载目录"
-                               + "（未设置时使用系统「下载」目录）。")
+                subtitle: qsTr("下载文件默认保存到此目录。修改后需点【保存设置】才会持久化；"
+                               + "保存前即已在本次运行中生效。")
 
-                RowLayout {
+                ColumnLayout {
                     Layout.fillWidth: true
                     spacing: Theme.spaceS
-                    SecondaryButton {
-                        glyph: "📂"
-                        text: qsTr("打开下载目录")
-                        onClicked: Transfers.openLocalFolder()
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.spaceS
+
+                        TextField {
+                            id: downloadDirField
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: Theme.controlHeight
+                            font.pointSize: Theme.fontBody
+                            // ⚠️ 显式配色：系统控件跟随平台调色板，深色下会「白字白底」。
+                            //    遵守 SearchField 模式（显式 color + 自带 background）。
+                            color: Theme.textPrimary
+                            placeholderTextColor: Theme.textSecondary
+                            placeholderText: qsTr("例如 C:\\Users\\me\\Downloads")
+                            selectByMouse: true
+                            text: page.downloadDir
+
+                            background: Rectangle {
+                                implicitHeight: Theme.controlHeight
+                                radius: Theme.radiusControl
+                                color: Theme.card
+                                border.width: downloadDirField.activeFocus ? 2 : 1
+                                border.color: downloadDirField.activeFocus
+                                              ? Theme.primary : Theme.border
+                            }
+
+                            onTextChanged: {
+                                if (page.dirSyncing)
+                                    return
+                                page.applyDownloadDir(text, true)
+                            }
+                        }
+
+                        SecondaryButton {
+                            glyph: "📁"
+                            text: qsTr("浏览")
+                            onClicked: folderPicker.open()
+                        }
+                        SecondaryButton {
+                            glyph: "📂"
+                            text: qsTr("打开")
+                            onClicked: Transfers.openLocalFolder()
+                        }
                     }
-                    Item { Layout.fillWidth: true }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.spaceS
+                        Label {
+                            Layout.fillWidth: true
+                            visible: page.downloadDirError.length > 0
+                            text: page.downloadDirError
+                            color: Theme.danger
+                            font.pointSize: Theme.fontSecondary
+                            wrapMode: Text.WordWrap
+                        }
+                        Label {
+                            visible: page.downloadDirError.length === 0
+                                     && page.downloadDirDirty
+                            text: qsTr("● 未保存")
+                            color: Theme.warning
+                            font.pointSize: Theme.fontSecondary
+                        }
+                        Label {
+                            visible: page.downloadDirError.length === 0
+                                     && !page.downloadDirDirty
+                                     && page.downloadDir.length > 0
+                            text: qsTr("✓ 已保存")
+                            color: Theme.success
+                            font.pointSize: Theme.fontSecondary
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
+                }
+            }
+
+            // ==========================================================
+            //  ③b 本机磁盘空间（QStorageInfo，纯本机、无网络、不阻塞）
+            //     与下载目录联动：当前下载目录所在卷标「默认」。
+            // ==========================================================
+            SectionCard {
+                Layout.fillWidth: true
+                Layout.leftMargin: page.contentMargin
+                Layout.rightMargin: page.contentMargin
+                title: qsTr("本机磁盘空间")
+                subtitle: qsTr("客户端所在机器的各磁盘容量与剩余空间。")
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.spaceS
+
+                    Repeater {
+                        model: page.localDisks
+                        delegate: ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.spaceXs
+                            required property var modelData
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Theme.spaceS
+                                Label {
+                                    text: modelData.label !== undefined
+                                          ? modelData.label : modelData.name
+                                    color: Theme.textPrimary
+                                    font.pointSize: Theme.fontBody
+                                    font.bold: true
+                                    elide: Text.ElideRight
+                                }
+                                Label {
+                                    visible: modelData.isDefault === true
+                                    text: qsTr("默认")
+                                    color: Theme.textOnPrimary
+                                    font.pointSize: Theme.fontSecondary
+                                    leftPadding: Theme.spaceXs
+                                    rightPadding: Theme.spaceXs
+                                    topPadding: 1
+                                    bottomPadding: 1
+                                    background: Rectangle {
+                                        radius: 3
+                                        color: Theme.primary
+                                    }
+                                }
+                                Item { Layout.fillWidth: true }
+                                Label {
+                                    text: qsTr("剩余 %1 / 共 %2")
+                                          .arg(modelData.freeText)
+                                          .arg(modelData.totalText)
+                                    color: Theme.textSecondary
+                                    font.pointSize: Theme.fontSecondary
+                                }
+                            }
+
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 6
+                                radius: 3
+                                color: Theme.hoverStrong
+                                Rectangle {
+                                    anchors.left: parent.left
+                                    anchors.top: parent.top
+                                    anchors.bottom: parent.bottom
+                                    width: Math.max(0, Math.min(1, modelData.usedRatio)) * parent.width
+                                    radius: 3
+                                    color: Theme.primary
+                                }
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.spaceS
+                        visible: page.localDisks.length === 0
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr("暂不可用（本机磁盘信息未获取到）")
+                            color: Theme.textSecondary
+                            font.pointSize: Theme.fontSecondary
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        SecondaryButton {
+                            glyph: "⟳"
+                            text: qsTr("重新扫描")
+                            onClicked: page.refreshLocalDisks()
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
                 }
             }
 
@@ -668,6 +928,19 @@ Item {
             }
 
             Item { Layout.preferredHeight: Theme.spaceXl }
+        }
+    }
+
+    // 下载目录选择（QtQuick.Dialogs；已确认模块可用）
+    FolderDialog {
+        id: folderPicker
+        title: qsTr("选择下载目录")
+        currentFolder: page.downloadDir.length > 0
+                       ? Qt.resolvedUrl("file:///" + page.downloadDir) : ""
+        onAccepted: {
+            const p = page.urlToPath(String(selectedFolder))
+            if (p.length > 0)
+                page.applyDownloadDir(p, true)
         }
     }
 }

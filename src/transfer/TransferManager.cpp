@@ -219,9 +219,25 @@ void TransferManager::enqueueDownload(const QStringList &fileIds, const QString 
     emit logMessage(QStringLiteral("info"),
                     QStringLiteral("加入下载队列 %1 项 → 目录「%2」")
                         .arg(fileIds.size())
-                        .arg(destDir.isEmpty() ? AppPaths::downloadDir() : destDir));
+                        .arg(resolveDownloadDir(destDir)));
     refresh();
     pump();
+}
+
+void TransferManager::setDefaultDownloadDir(const QString &dir)
+{
+    // 由 Application 从 Settings 注入（改设置后重新注入即生效）
+    m_defaultDownloadDir = dir;
+}
+
+QString TransferManager::resolveDownloadDir(const QString &destDir) const
+{
+    // 回退链：显式 destDir > 注入的默认下载目录 > AppPaths::downloadDir()（兜底）
+    if (!destDir.isEmpty())
+        return destDir;
+    if (!m_defaultDownloadDir.isEmpty())
+        return m_defaultDownloadDir;
+    return AppPaths::downloadDir();
 }
 
 void TransferManager::cancelCurrent()
@@ -773,7 +789,7 @@ void TransferManager::onDownloadStat(qint64 gen, const Result<FileItem> &r)
     // 任务身份（服务端文件名 / 类型 / 总量）——上层据此在 TransferModel 建行；每任务仅一次
     emit taskStarted(m_cur.id, m_cur.name, TransferKind::Download, m_cur.total);
 
-    const QString dest = m_cur.destDir.isEmpty() ? AppPaths::downloadDir() : m_cur.destDir;
+    const QString dest = resolveDownloadDir(m_cur.destDir);
     if (!QDir().mkpath(dest)) {
         finishTask(false, QStringLiteral("无法创建保存目录：%1").arg(dest));
         return;

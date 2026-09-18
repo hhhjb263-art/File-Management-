@@ -3,8 +3,13 @@
  ****************************************************************************/
 #include "StatsController.h"
 
+#include "core/Settings.h"  // downloadDir()（判定 isDefault 所在卷）
 #include "core/Util.h"      // Util::humanSize
 #include "net/Backend.h"    // Backend / Result / UsageStats
+
+#include <QDir>
+#include <QStorageInfo>
+#include <QVariantMap>
 
 namespace cv {
 namespace {
@@ -42,6 +47,11 @@ StatsController::StatsController(Backend *backend, QObject *parent)
     m_supported = (m_backend != nullptr);
     m_freeText = m_supported ? QStringLiteral("空间信息未获取")
                              : QStringLiteral("未配置数据源");
+
+    // 本机磁盘：纯本机查询、无网络、不阻塞。构造即填一次（QML 首帧即有数据）；
+    // 之后由 QML 按需调用 refreshLocalDisks()。**不**放进 refresh() —— 避免每次刷新服务器
+    // 用量时重复枚举本机卷（两者变化频率与数据源无关）。
+    refreshLocalDisks();
 }
 
 void StatsController::refresh()
@@ -86,6 +96,58 @@ void StatsController::refresh()
         }
         emit statsChanged();
     });
+}
+
+void StatsController::refreshLocalDisks()
+{
+    QVariantList list;
+
+    // 下载目录所在卷（用于 isDefault）：QStorageInfo 从路径构造最稳妥；无效则退回系统根卷。
+    const QString dl = Settings::instance().downloadDir();
+    QStorageInfo  dlVol;
+    if (!dl.isEmpty())
+        dlVol = QStorageInfo(dl);
+    if (!dlVol.isValid() || !dlVol.isReady())
+        dlVol = QStorageInfo::root();
+    const QString dlRoot = dlVol.isValid() ? dlVol.rootPath() : QString();
+
+    const QList<QStorageInfo> vols = QStorageInfo::mountedVolumes();
+    for (const QStorageInfo &st : vols) {
+        if (!st.isValid() || !st.isReady() || st.bytesTotal() <= 0)
+            continue; // 跳过无效 / 未就绪 / 无容量的伪设备
+
+        const qint64 total = st.bytesTotal();
+        const qint64 free  = st.bytesAvailable(); // 当前用户可用字节
+        const qint64 used  = qMax<qint64>(0, total - free);
+
+        // name：优先盘符形式（"C:"）；非盘符卷退回 displayName / 根路径
+        const QString root = QDir::toNativeSeparators(st.rootPath());
+        QString       name;
+        if (root.size() >= 2 && root.at(1) == QLatin1Char(':'))
+            name = root.left(2).toUpper();
+        else
+            name = st.displayName().isEmpty() ? root : st.displayName();
+
+        // label：有卷标 → "卷标 (C:)"，否则就是 "C:"
+        const QString volLabel = st.name();
+        const QString label =
+            volLabel.isEmpty() ? name : QStringLiteral("%1 (%2)").arg(volLabel, name);
+
+        QVariantMap m;
+        m.insert(QStringLiteral("name"), name);
+        m.insert(QStringLiteral("label"), label);
+        m.insert(QStringLiteral("totalText"), Util::humanSize(total));
+        m.insert(QStringLiteral("freeText"), Util::humanSize(free));
+        m.insert(QStringLiteral("usedText"), Util::humanSize(used));
+        m.insert(QStringLiteral("usedRatio"), total > 0 ? double(used) / double(total) : 0.0);
+        m.insert(QStringLiteral("isDefault"),
+                 !dlRoot.isEmpty()
+                     && st.rootPath().compare(dlRoot, Qt::CaseInsensitive) == 0);
+        list.append(m);
+    }
+
+    m_localDisks = list;
+    emit localDisksChanged();
 }
 
 } // namespace cv

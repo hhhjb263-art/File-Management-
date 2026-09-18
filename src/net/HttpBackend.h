@@ -168,6 +168,10 @@ public:
     void listFolderAsync(const QString &parentId,
                          std::function<void(Result<QVector<FileItem>>)> done) override;
     void usageAsync(std::function<void(Result<UsageStats>)> done) override;
+    // 真异步取内容区间（预览用）：复用 requestAsync，用较短超时 kPreviewTimeoutMs，
+    // 不在主线程建 QEventLoop。Range 头与解析与同步 getRange **共用同一份**。
+    void getRangeAsync(const QString &fileId, qint64 offset, qint64 length,
+                       std::function<void(Result<QByteArray>)> done) override;
 
 private:
     enum class Method { Get, Post, Put, Delete };
@@ -188,6 +192,10 @@ private:
     void requestAsync(Method method, const QString &path, const QByteArray &body,
                       const QHash<QByteArray, QByteArray> &headers,
                       std::function<void(Response)> done);
+    // 带自定义超时的重载（预览等短请求用；**不改变**默认请求 60s 的语义）。
+    void requestAsync(Method method, const QString &path, const QByteArray &body,
+                      const QHash<QByteArray, QByteArray> &headers,
+                      std::function<void(Response)> done, int timeoutMs);
     QNetworkAccessManager *nam(); // 每线程一个实例
 
     // 解析：由「目录请求 + 目录登记请求」的响应合成当前目录条目。
@@ -199,6 +207,10 @@ private:
     static Result<UsageStats> buildUsage(const Response &storage,
                                          const Response &files,
                                          const Response &dirs);
+
+    // Range 请求头 / 响应解析 —— 同步 getRange 与异步 getRangeAsync **共用同一份**（单一来源）。
+    static QByteArray        rangeHeader(qint64 offset, qint64 length);
+    static Result<QByteArray> parseRangeBody(const Response &r, qint64 offset, qint64 length);
 
     // TLS：在 QNetworkReply::sslErrors 上做 TOFU 指纹固定
     void applyCertPinning(QNetworkReply *reply, const QList<QSslError> &errors);

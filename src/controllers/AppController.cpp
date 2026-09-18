@@ -61,6 +61,7 @@ AppController::AppController(Backend *backend, QObject *parent)
     Settings &s = Settings::instance();
     m_serverUrl   = s.serverUrl();
     m_accessToken = s.token();
+    m_downloadDir = s.downloadDir(); // 默认下载目录（可能为空 → 传输层回退 AppPaths::downloadDir()）
     {
         // 信任开关没有对应的 Settings 访问器，直接读写与 HttpBackend 指纹固定同一
         // 份 INI（AppPaths::settingsFile()），键 tls/trustSelfSigned。
@@ -174,11 +175,24 @@ void AppController::setAutoRefreshInterval(int sec)
     emit autoRefreshIntervalChanged();
 }
 
+// ---- 默认下载目录（加法式）----
+
+void AppController::setDownloadDir(const QString &dir)
+{
+    const QString v = dir.trimmed();
+    if (v == m_downloadDir)
+        return;
+    m_downloadDir = v;
+    Settings::instance().setDownloadDir(v); // 只写 Settings（内存），落盘由 saveSettings() 负责
+    emit downloadDirChanged();              // Application 监听 → 重新注入 TransferManager（改完即生效）
+}
+
 void AppController::saveSettings()
 {
     Settings &s = Settings::instance();
     s.setServerUrl(m_serverUrl);
     s.setToken(m_accessToken);
+    s.setDownloadDir(m_downloadDir); // 默认下载目录一并持久化
 
     QSettings raw(AppPaths::settingsFile(), QSettings::IniFormat);
     raw.setValue(QStringLiteral("tls/trustSelfSigned"), m_trustSelfSigned);
@@ -186,6 +200,8 @@ void AppController::saveSettings()
     s.sync();
 
     applyBackendConfig(); // 兜底再推一次（setter 已推，防御外部直接改字段的场景）
+    // 通知 Application 重新注入下载目录（即便是外部直接改字段、未走 setter 也能生效）
+    emit downloadDirChanged();
     setStatus(QStringLiteral("✓ 设置已保存"), true);
     emit logMessage(QStringLiteral("INFO"),
                     QStringLiteral("设置已保存（服务器=%1，允许自签名证书=%2）")

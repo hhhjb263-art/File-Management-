@@ -76,6 +76,36 @@ Item {
         Files.refresh()
     }
 
+    // ------------------------------------------------------------------
+    //  预览联动（右侧预览面板）
+    //  Files.requestPreview/clearPreview 是冻结的**运行时** API：C++ 未落地时
+    //  typeof 守卫直接跳过，不抛错、不刷屏。
+    // ------------------------------------------------------------------
+    // 当前已请求预览的文件 id —— 用于「目标未变则不重复请求」去抖（防刷新/重列时刷屏）。
+    property string previewedId: ""
+
+    function syncPreview() {
+        if (typeof Files.requestPreview !== "function")
+            return
+        // 期望目标：仅在本页可见、且恰好选中 1 项时预览；否则清空。
+        const want = (page.visible && page.selectedIds.length === 1)
+                     ? String(page.selectedIds[0]) : ""
+        if (want === page.previewedId)
+            return
+        page.previewedId = want
+        if (want.length === 0) {
+            if (typeof Files.clearPreview === "function")
+                Files.clearPreview()
+        } else {
+            Files.requestPreview(want)
+        }
+    }
+
+    // 选中项变化 → 请求 / 清空预览
+    onSelectedIdsChanged: page.syncPreview()
+    // 离开文件页 → 清空预览（避免切页后仍显示上一个文件的内容）
+    onVisibleChanged: page.syncPreview()
+
     // Ctrl+F 聚焦过滤框（仅本页可见时生效）
     Shortcut {
         sequence: "Ctrl+F"
@@ -217,7 +247,9 @@ Item {
 
     Connections {
         target: FileModel
-        function onCountChanged() { page.rebuild() }
+        // 重列后顺带**校验**预览目标（删除/改名使被预览文件消失时清空预览）。
+        // 仅一次校验（带 id 去抖），不做轮询。
+        function onCountChanged() { page.rebuild(); page.syncPreview() }
     }
 
     // 「操作后立即刷」：本客户端自身的传输任务进入历史（完成 / 失败 / 取消）时，

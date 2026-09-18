@@ -84,6 +84,40 @@ QtObject {
     readonly property color focusRing: Qt.rgba(primary.r, primary.g, primary.b, 0.40)
 
     // -----------------------------------------------------------------
+    //  传输状态 → StatusBadge 色调 的映射
+    //  （传输页活动队列 / 历史分组 / 传输抽屉三处共用，避免复制同一段 switch）
+    // -----------------------------------------------------------------
+    function toneForState(token) {
+        switch (token) {
+        case "completed": return "success"
+        case "failed":    return "danger"
+        case "canceled":  return "neutral"
+        case "paused":    return "warning"
+        case "running":   return "info"
+        case "hashing":   return "info"
+        default:          return "neutral"
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  字节数 → 人类可读串（仅用于**无 text 变体可用**的兜底：
+    //  远程容量只有 totalBytes 数值；本机磁盘与历史大小一律用后端 text 键。）
+    // -----------------------------------------------------------------
+    function humanBytes(bytes) {
+        const n = Number(bytes)
+        if (!isFinite(n) || n < 0)
+            return "—"
+        if (n < 1024)
+            return n + " B"
+        const KB = 1024, MB = KB * 1024, GB = MB * 1024, TB = GB * 1024
+        const fmt = (v) => v >= 100 ? v.toFixed(0) : (v >= 10 ? v.toFixed(1) : v.toFixed(2))
+        if (n < MB) return fmt(n / KB) + " KB"
+        if (n < GB) return fmt(n / MB) + " MB"
+        if (n < TB) return fmt(n / GB) + " GB"
+        return fmt(n / TB) + " TB"
+    }
+
+    // -----------------------------------------------------------------
     //  字号（pt）
     // -----------------------------------------------------------------
     readonly property int fontTitle:     17

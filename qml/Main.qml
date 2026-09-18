@@ -5,6 +5,7 @@ import QtQuick.Layouts
 import "theme"
 import "controls"
 import "pages"
+import "panels"
 import "dialogs"
 
 /*!
@@ -21,9 +22,9 @@ import "dialogs"
 ApplicationWindow {
     id: window
 
-    width: 1280
-    height: 800
-    minimumWidth: 720
+      width: 1280
+      height: 800
+      minimumWidth: 720
     minimumHeight: 520
     visible: true
     title: qsTr("云匣 CloudVault")
@@ -127,11 +128,15 @@ ApplicationWindow {
                 onClicked: App.healthCheck()
             }
 
+            // 「传输队列」抽屉开关：宽屏与紧凑**共用同一个抽屉**，默认隐藏；
+            // 带进行中数量徽标（activeCount>0 时显示计数）。
             GhostButton {
-                visible: !window.compact && !window.wide
                 glyph: "⇅"
-                text: qsTr("传输侧栏")
-                onClicked: transfersDrawer.open()
+                text: Transfers.activeCount > 0
+                      ? qsTr("传输队列 %1").arg(Transfers.activeCount)
+                      : qsTr("传输队列")
+                onClicked: transfersDrawer.opened ? transfersDrawer.close()
+                                                  : transfersDrawer.open()
             }
 
             ToolButton {
@@ -412,122 +417,18 @@ ApplicationWindow {
             }
         }
 
-        // ---- 右侧传输侧栏（仅 wide）----
-        Rectangle {
+        // ---- 右侧预览面板（仅 wide）----
+        PreviewPanel {
+            id: previewPanel
             visible: window.wide
             Layout.preferredWidth: Theme.sidePanelWidth
             Layout.fillHeight: true
-            color: Theme.card
-
-            Rectangle {
-                anchors.left: parent.left
-                width: 1
-                height: parent.height
-                color: Theme.border
-            }
-
-            Loader {
-                anchors.fill: parent
-                sourceComponent: transfersSummaryComponent
-            }
         }
     }
 
     // ==================================================================
-    //  传输侧栏摘要（wide 侧栏 / 中档抽屉共用同一组件）
-    // ==================================================================
-    Component {
-        id: transfersSummaryComponent
-
-        Rectangle {
-            color: Theme.card
-
-            ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: Theme.spaceM
-                spacing: Theme.spaceS
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Theme.spaceS
-                    Label {
-                        Layout.fillWidth: true
-                        text: qsTr("传输队列")
-                        color: Theme.textPrimary
-                        font.pointSize: Theme.fontTitle
-                        font.bold: true
-                    }
-                    GhostButton {
-                        text: qsTr("查看全部")
-                        onClicked: {
-                            window.navIndex = window.pageTransfers
-                        }
-                    }
-                }
-
-                Label {
-                    Layout.fillWidth: true
-                    text: Transfers.statusText
-                    color: Theme.textSecondary
-                    font.pointSize: Theme.fontSecondary
-                    elide: Text.ElideRight
-                }
-
-                ListView {
-                    id: summaryList
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    clip: true
-                    model: TransferModel
-                    spacing: Theme.spaceS
-                    ScrollBar.vertical: ScrollBar { }
-
-                    delegate: ColumnLayout {
-                        width: ListView.view ? ListView.view.width : 0
-                        spacing: 2
-
-                        Label {
-                            Layout.fillWidth: true
-                            text: (model.kind === "download" ? "⬇ " : "⬆ ") + model.fileName
-                            color: Theme.textPrimary
-                            font.pointSize: Theme.fontSecondary
-                            elide: Text.ElideRight
-                        }
-                        ProgressBar {
-                            Layout.fillWidth: true
-                            from: 0
-                            to: 1
-                            value: model.progressRatio
-                        }
-                        Label {
-                            text: model.stateText + "  " + model.progress + "%"
-                            color: Theme.textSecondary
-                            font.pointSize: Theme.fontSecondary
-                        }
-                    }
-
-                    Label {
-                        anchors.centerIn: parent
-                        visible: summaryList.count === 0
-                        text: qsTr("暂无传输任务")
-                        color: Theme.textSecondary
-                        font.pointSize: Theme.fontSecondary
-                    }
-                }
-
-                DangerButton {
-                    Layout.fillWidth: true
-                    glyph: "✕"
-                    text: qsTr("取消当前")
-                    enabled: Transfers.busy
-                    onClicked: Transfers.cancel()
-                }
-            }
-        }
-    }
-
-    // ==================================================================
-    //  中档：传输侧栏抽屉
+    //  传输抽屉（宽屏与紧凑**共用同一个**；默认隐藏，由工具栏「传输队列」按钮切换）
+    //  内容 = 进行中队列 + 「已上传」+「已下载」两栏（HistoryGroup 与传输整页共用）
     // ==================================================================
     Drawer {
         id: transfersDrawer
@@ -536,10 +437,18 @@ ApplicationWindow {
         height: window.height
         modal: false
         interactive: true
+        // ⚠️ 需求「默认隐藏」：Drawer 的 opened 是**只读**属性（写它会导致整个
+        //    QML 组件加载失败：Invalid property assignment）。Drawer 默认就是关闭态
+        //    （position=0），所以不写即可；这里显式 close() 只是把意图钉死。
+        Component.onCompleted: close()
 
-        Loader {
+        TransferDrawer {
             anchors.fill: parent
-            sourceComponent: transfersSummaryComponent
+            onCloseRequested: transfersDrawer.close()
+            onOpenFullPageRequested: {
+                transfersDrawer.close()
+                window.navIndex = window.pageTransfers
+            }
         }
     }
 
