@@ -173,12 +173,16 @@ void AppController::healthCheck()
     bool    ok = false;
     QString err;
 
+    QString version;   // 远程服务的版本号（/healthz 的 version 字段）
     if (auto *hb = qobject_cast<HttpBackend *>(m_backend)) {
         // 远程服务：走真实探活 GET /healthz（免鉴权）
         const Result<bool> r = hb->health();
         ok = r.ok;
-        if (!ok)
+        if (!ok) {
             err = r.error;
+        } else {
+            version = hb->serverVersion();
+        }
     } else {
         // 其它后端（本地引擎）：用「列根目录」作为可用性探针
         const Result<QVector<FileItem>> r = m_backend->listFolder(kRootId);
@@ -189,8 +193,17 @@ void AppController::healthCheck()
 
     setBusy(false);
 
+    if (m_serverVersion != version) {
+        m_serverVersion = version;
+        emit serverVersionChanged();
+    }
+
     if (ok) {
-        setStatus(QStringLiteral("✓ 连接正常（%1）").arg(m_backend->displayName()), true);
+        setStatus(version.isEmpty()
+                      ? QStringLiteral("✓ 连接正常（%1）").arg(m_backend->displayName())
+                      : QStringLiteral("✓ 连接正常（%1 v%2）")
+                            .arg(m_backend->displayName(), version),
+                  true);
         emit logMessage(QStringLiteral("INFO"),
                         QStringLiteral("健康检查通过：%1").arg(m_serverUrl));
     } else {

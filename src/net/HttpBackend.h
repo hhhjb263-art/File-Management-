@@ -57,8 +57,10 @@ public:
 
     // ======================= 附加能力（非抽象接口） =======================
 
-    // 探活：GET /healthz（免鉴权）。成功返回 success(true)。
+    // 探活：GET /healthz（免鉴权）。成功返回 success(true)，并解析响应中的 version 字段。
     Result<bool> health();
+    // 最近一次 health() 成功时服务端返回的版本号（如 "0.5.0"）；未探活过为空
+    QString serverVersion() const { return m_serverVersion; }
 
     // 整文件上传：POST /api/v1/files（含同名覆盖）。
     // Backend 抽象接口未提供整文件上传，此处提供以供上层按需调用。
@@ -192,6 +194,7 @@ private:
     TrustPrompt m_trustPrompt;
     // 下次上传是否覆盖同名（由调用方置真/复位）。跨线程读写（传输 worker 写、主线程读）→ 原子
     std::atomic<bool> m_uploadOverwrite{false};
+    QString m_serverVersion;   // health() 解析出的服务端版本
 
     QHash<QString, qint64> m_uploadChunkSize; // uploadId -> chunk_size
     mutable QMutex         m_chunkSizeMutex;

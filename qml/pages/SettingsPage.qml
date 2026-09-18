@@ -6,8 +6,12 @@ import "../theme"
 import "../controls"
 
 /*!
-    连接设置页：服务器地址 / 访问令牌 / 自签证书开关 / 证书指纹查看·清除 / 下载目录。
+    连接设置页：服务器地址（协议 / 主机·IP / 端口 三段）/ 访问令牌 / 自签证书开关
+    / 证书指纹查看·清除 / 下载目录 / 能力说明。
+
     只使用 AppController（App）暴露的属性与方法；不直接发 HTTP、不碰 net/。
+    ⚠️ C++ 冻结：AppController 只暴露「拼好的」serverUrl 一个属性，
+       因此三段地址的「拆分显示 / 合并写回」由本页在 QML 侧完成。
 */
 Item {
     id: page
@@ -17,15 +21,143 @@ Item {
     readonly property int contentMargin: Theme.spaceXl
     readonly property bool twoColumn: width >= 760
 
+    // ------------------------------------------------------------------
+    //  服务器地址三段（QML 侧拆分 / 合并 App.serverUrl）
+    // ------------------------------------------------------------------
+    property bool   syncing: false      // 写回 App 时抑制回灌，避免编辑被打断
+    property string proto: "http"       // http | https
+    property string host: ""            // 主机名 / IP
+    property string port: ""            // 端口（字符串，可空）
+    property bool   portEdited: false   // 用户是否显式设过端口（改过则不随协议联动覆盖）
+    property string hostError: ""       // 主机字段校验提示
+
+    // 令牌可见性
+    property bool tokenVisible: false
+
+    function defaultPortFor(scheme) {
+        return scheme === "http" ? "8080" : "8443"
+    }
+
+    // 把 App.serverUrl 解析成三段（scheme / host / port）
+    function parseUrl(u) {
+        let s = String(u === undefined || u === null ? "" : u).trim()
+        let scheme = "http"
+        let hostpart = ""
+        let p = ""
+
+        const sep = s.indexOf("://")
+        if (sep >= 0) {
+            scheme = s.substring(0, sep).toLowerCase()
+            s = s.substring(sep + 3)
+        }
+        if (scheme !== "http" && scheme !== "https")
+            scheme = "http"
+
+        // 去掉路径 / 查询
+        let cut = s.length
+        const slash = s.indexOf("/")
+        if (slash >= 0 && slash < cut) cut = slash
+        const q = s.indexOf("?")
+        if (q >= 0 && q < cut) cut = q
+        s = s.substring(0, cut)
+
+        // host[:port]（IPv6 以 [] 包裹）
+        if (s.charAt(0) === "[") {
+            const close = s.indexOf("]")
+            if (close >= 0) {
+                hostpart = s.substring(0, close + 1)
+                const rest = s.substring(close + 1)
+                if (rest.charAt(0) === ":")
+                    p = rest.substring(1)
+            } else {
+                hostpart = s
+            }
+        } else {
+            const colon = s.lastIndexOf(":")
+            if (colon >= 0) {
+                hostpart = s.substring(0, colon)
+                p = s.substring(colon + 1)
+            } else {
+                hostpart = s
+            }
+        }
+
+        page.proto = scheme
+        page.host = hostpart
+        page.port = p
+        page.portEdited = (p.length > 0) // 地址里显式带端口 → 视为用户设定
+    }
+
+    // 三段合并回一个 URL（主机为空则视为无效，返回空串）
+    function composeUrl() {
+        if (page.host.length === 0)
+            return ""
+        let u = page.proto + "://" + page.host
+        if (page.port.length > 0)
+            u += ":" + page.port
+        return u
+    }
+
+    function validateHost() {
+        const h = page.host.trim()
+        if (h.length === 0) {
+            page.hostError = qsTr("请填写主机名或 IP 地址")
+            return false
+        }
+        if (/\s/.test(h)) {
+            page.hostError = qsTr("主机名不能包含空格")
+            return false
+        }
+        if (h.indexOf("://") >= 0) {
+            page.hostError = qsTr("主机字段无需重复填写协议（请在左侧选择）")
+            return false
+        }
+        page.hostError = ""
+        return true
+    }
+
+    // 用户改动后立即合并写回 App.serverUrl
+    function commit() {
+        if (page.syncing)
+            return
+        if (!page.validateHost())
+            return
+        const u = page.composeUrl()
+        if (u.length === 0)
+            return
+        page.syncing = true
+        App.serverUrl = u
+        page.syncing = false
+    }
+
+    // 从 App 回灌三段（外部改动 / 首次进入）
+    function syncFromApp() {
+        page.syncing = true
+        page.parseUrl(App.serverUrl)
+        if (!page.portEdited && page.port.length === 0 && page.host.length > 0)
+            page.port = page.defaultPortFor(page.proto)
+        hostField.text = page.host
+        portField.text = page.port
+        protoBox.currentIndex = (page.proto === "http") ? 0 : 1
+        page.syncing = false
+    }
+
     function refreshFingerprint() {
         fingerprint = App.pinnedFingerprint()
     }
 
-    Component.onCompleted: refreshFingerprint()
+    Component.onCompleted: {
+        syncFromApp()
+        refreshFingerprint()
+    }
 
     Connections {
         target: App
-        function onServerUrlChanged() { page.refreshFingerprint() }
+        function onServerUrlChanged() {
+            if (!page.syncing)
+                page.syncFromApp()
+            page.refreshFingerprint()
+        }
     }
 
     ScrollView {
@@ -36,71 +168,169 @@ Item {
 
         ColumnLayout {
             width: settingsScroll.availableWidth
-            spacing: Theme.spaceL
+            spacing: Theme.spaceM
 
-            Item { Layout.preferredHeight: Theme.spaceXl }
+            Item { Layout.preferredHeight: Theme.spaceL }
 
             Label {
                 Layout.leftMargin: page.contentMargin
                 Layout.rightMargin: page.contentMargin
                 text: qsTr("连接设置")
                 color: Theme.textPrimary
-                font.pointSize: Theme.fontTitle + 2
+                font.pointSize: Theme.fontTitle + 3
                 font.bold: true
             }
 
-            // ---- 连接 ----
+            // ==========================================================
+            //  ① 连接服务器（最醒目的一张卡）
+            // ==========================================================
             SectionCard {
                 Layout.fillWidth: true
                 Layout.leftMargin: page.contentMargin
                 Layout.rightMargin: page.contentMargin
-                title: qsTr("服务器连接")
-                subtitle: qsTr("修改后会立即生效并自动保存。")
+                title: qsTr("连接服务器")
+                subtitle: qsTr("填写服务器地址后点击【保存设置】。修改后即时生效并写入本地配置。")
 
-                GridLayout {
+                ColumnLayout {
                     Layout.fillWidth: true
-                    columns: page.twoColumn ? 2 : 1
-                    columnSpacing: Theme.spaceM
-                    rowSpacing: Theme.spaceS
+                    spacing: Theme.spaceS
 
-                    Label {
-                        text: qsTr("服务器地址")
-                        color: Theme.textSecondary
-                        font.pointSize: Theme.fontBody
-                        Layout.preferredWidth: 90
-                    }
-                    TextField {
-                        id: urlField
+                    // ---- 协议 / 主机 / 端口 ----
+                    GridLayout {
                         Layout.fillWidth: true
-                        Layout.preferredHeight: Theme.controlHeight
-                        font.pointSize: Theme.fontBody
-                        placeholderText: qsTr("https://主机:端口")
-                        text: App.serverUrl
-                        onEditingFinished: {
-                            App.serverUrl = text
-                            App.saveSettings()
-                            page.refreshFingerprint()
+                        columns: page.twoColumn ? 6 : 1
+                        columnSpacing: Theme.spaceM
+                        rowSpacing: Theme.spaceS
+
+                        Label {
+                            text: qsTr("协议")
+                            color: Theme.textSecondary
+                            font.pointSize: Theme.fontBody
+                        }
+                        ComboBox {
+                            id: protoBox
+                            Layout.preferredWidth: page.twoColumn ? 110 : -1
+                            Layout.fillWidth: !page.twoColumn
+                            implicitHeight: Theme.controlHeight
+                            font.pointSize: Theme.fontBody
+                            model: ["http", "https"]
+                            onActivated: {
+                                page.proto = currentText
+                                // 端口未被用户设置过时，按协议联动默认端口
+                                if (!page.portEdited) {
+                                    page.port = page.defaultPortFor(page.proto)
+                                    portField.text = page.port
+                                }
+                                page.commit()
+                            }
+                        }
+
+                        Label {
+                            text: qsTr("主机 / IP")
+                            color: Theme.textSecondary
+                            font.pointSize: Theme.fontBody
+                        }
+                        TextField {
+                            id: hostField
+                            Layout.fillWidth: true
+                            implicitHeight: Theme.controlHeight
+                            font.pointSize: Theme.fontBody
+                            placeholderText: qsTr("192.168.185.231 或 example.com")
+                            onTextChanged: {
+                                if (page.syncing)
+                                    return
+                                page.host = text
+                                page.hostError = ""
+                            }
+                            onEditingFinished: page.commit()
+                        }
+
+                        Label {
+                            text: qsTr("端口")
+                            color: Theme.textSecondary
+                            font.pointSize: Theme.fontBody
+                        }
+                        TextField {
+                            id: portField
+                            Layout.preferredWidth: page.twoColumn ? 110 : -1
+                            Layout.fillWidth: !page.twoColumn
+                            implicitHeight: Theme.controlHeight
+                            font.pointSize: Theme.fontBody
+                            placeholderText: page.defaultPortFor(page.proto)
+                            inputMethodHints: Qt.ImhDigitsOnly
+                            onTextChanged: {
+                                if (page.syncing)
+                                    return
+                                page.port = text
+                                page.portEdited = true
+                            }
+                            onEditingFinished: page.commit()
                         }
                     }
+
+                    // 主机校验提示
+                    Label {
+                        Layout.fillWidth: true
+                        visible: page.hostError.length > 0
+                        text: page.hostError
+                        color: Theme.danger
+                        font.pointSize: Theme.fontSecondary
+                        wrapMode: Text.WordWrap
+                    }
+
+                    // 合并后的完整地址预览
+                    Label {
+                        Layout.fillWidth: true
+                        text: qsTr("将连接到：%1").arg(page.composeUrl().length > 0
+                                                     ? page.composeUrl()
+                                                     : qsTr("（未填写）"))
+                        color: Theme.textSecondary
+                        font.pointSize: Theme.fontSecondary
+                        elide: Text.ElideRight
+                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: 1
+                    color: Theme.border
+                }
+
+                // ---- 访问令牌（显示 / 隐藏）----
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.spaceXs
 
                     Label {
                         text: qsTr("访问令牌")
                         color: Theme.textSecondary
                         font.pointSize: Theme.fontBody
-                        Layout.preferredWidth: 90
                     }
-                    TextField {
-                        id: tokenField
+
+                    RowLayout {
                         Layout.fillWidth: true
-                        Layout.preferredHeight: Theme.controlHeight
-                        font.pointSize: Theme.fontBody
-                        echoMode: TextInput.Password
-                        placeholderText: qsTr("Bearer 令牌")
-                        text: App.accessToken
-                        onEditingFinished: {
-                            App.accessToken = text
-                            App.saveSettings()
+                        spacing: Theme.spaceS
+                        TextField {
+                            id: tokenField
+                            Layout.fillWidth: true
+                            implicitHeight: Theme.controlHeight
+                            font.pointSize: Theme.fontBody
+                            echoMode: page.tokenVisible ? TextInput.Normal : TextInput.Password
+                            placeholderText: qsTr("Bearer 令牌（可留空）")
+                            text: App.accessToken
                         }
+                        GhostButton {
+                            glyph: page.tokenVisible ? "🙈" : "👁"
+                            text: page.tokenVisible ? qsTr("隐藏") : qsTr("显示")
+                            onClicked: page.tokenVisible = !page.tokenVisible
+                        }
+                    }
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: qsTr("服务端未启用鉴权时可留空。")
+                        color: Theme.textSecondary
+                        font.pointSize: Theme.fontSecondary
                     }
                 }
 
@@ -112,36 +342,49 @@ Item {
                         glyph: "💾"
                         text: qsTr("保存设置")
                         onClicked: {
-                            App.serverUrl = urlField.text
+                            page.commit()
                             App.accessToken = tokenField.text
                             App.saveSettings()
                         }
                     }
                     SecondaryButton {
                         glyph: "⇄"
-                        text: qsTr("健康检查")
+                        text: App.busy ? qsTr("测试中…") : qsTr("测试连接")
                         enabled: !App.busy
-                        onClicked: App.healthCheck()
-                    }
-                    GhostButton {
-                        glyph: "💽"
-                        text: qsTr("刷新存储空间")
-                        onClicked: Stats.refresh()
+                        onClicked: {
+                            page.commit()
+                            App.healthCheck()
+                        }
                     }
                     Item { Layout.fillWidth: true }
                 }
 
-                StatusBadge {
+                // ---- 测试结果（就近反馈）----
+                RowLayout {
                     Layout.fillWidth: true
+                    spacing: Theme.spaceS
                     visible: App.statusText.length > 0
-                    tone: App.statusText.indexOf("✗") === 0 ? "danger"
-                        : (App.statusText.indexOf("⚠") === 0 ? "warning" : "success")
-                    outlined: true
-                    text: App.statusText
+
+                    StatusBadge {
+                        tone: App.statusText.indexOf("✗") === 0 ? "danger"
+                            : (App.statusText.indexOf("⚠") === 0 ? "warning" : "success")
+                        text: App.statusText.indexOf("✗") === 0 ? qsTr("连接失败")
+                            : (App.statusText.indexOf("⚠") === 0 ? qsTr("提示") : qsTr("已连接"))
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        text: App.statusText
+                        color: App.statusText.indexOf("✗") === 0 ? Theme.danger : Theme.textPrimary
+                        font.pointSize: Theme.fontSecondary
+                        wrapMode: Text.WordWrap
+                        elide: Text.ElideRight
+                    }
                 }
             }
 
-            // ---- 自签证书 / TOFU ----
+            // ==========================================================
+            //  ② 自签证书 / TOFU
+            // ==========================================================
             SectionCard {
                 Layout.fillWidth: true
                 Layout.leftMargin: page.contentMargin
@@ -242,7 +485,9 @@ Item {
                 }
             }
 
-            // ---- 下载目录 ----
+            // ==========================================================
+            //  ③ 下载目录（v1 仅打开，不可改）
+            // ==========================================================
             SectionCard {
                 Layout.fillWidth: true
                 Layout.leftMargin: page.contentMargin
@@ -263,7 +508,9 @@ Item {
                 }
             }
 
-            // ---- 未支持功能说明 ----
+            // ==========================================================
+            //  ④ 能力说明
+            // ==========================================================
             SectionCard {
                 Layout.fillWidth: true
                 Layout.leftMargin: page.contentMargin

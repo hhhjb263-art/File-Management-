@@ -6,6 +6,7 @@ import "../theme"
 /*!
     主操作按钮（实心主色）。对应 UI 方案 §2.2「Primary」——每屏最多 1–2 个。
     例：上传、下载。
+    三态：hover / pressed / focus（焦点用 Theme.focusRing 描边）。
 */
 Button {
     id: control
@@ -40,5 +41,16 @@ Button {
              : Theme.primary
 
         Behavior on color { ColorAnimation { duration: Theme.animFast } }
+    }
+
+    // 键盘焦点环（键盘可达性）
+    Rectangle {
+        anchors.fill: parent
+        anchors.margins: -3
+        radius: Theme.radiusControl + 3
+        color: "transparent"
+        border.width: 2
+        border.color: Theme.focusRing
+        visible: control.visualFocus
     }
 }

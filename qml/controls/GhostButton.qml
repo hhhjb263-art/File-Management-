@@ -7,6 +7,7 @@ import "../theme"
     辅助 / 图标按钮（无边框，hover 浅底）。对应 UI 方案 §2.2「Ghost/Icon」。
     例：健康检查、存储空间、证书…、清空日志。
     设置 active=true 可呈现「选中态」（用于导航 / 视图切换）。
+    三态：hover / pressed / focus（焦点用 Theme.focusRing 描边）。
 */
 Button {
     id: control
@@ -39,9 +40,20 @@ Button {
         implicitHeight: Theme.controlHeight
         radius: Theme.radiusControl
         color: control.active ? Theme.selected
-             : (control.down || control.hovered) ? Theme.hover
+             : control.down ? Theme.hoverStrong
+             : control.hovered ? Theme.hover
              : "transparent"
 
         Behavior on color { ColorAnimation { duration: Theme.animFast } }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        anchors.margins: -3
+        radius: Theme.radiusControl + 3
+        color: "transparent"
+        border.width: 2
+        border.color: Theme.focusRing
+        visible: control.visualFocus
     }
 }

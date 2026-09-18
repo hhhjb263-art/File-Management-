@@ -32,6 +32,8 @@ class AppController : public QObject
     Q_PROPERTY(bool    trustSelfSigned   READ trustSelfSigned   WRITE setTrustSelfSigned   NOTIFY trustSelfSignedChanged)
     Q_PROPERTY(QString unsupportedNotice READ unsupportedNotice CONSTANT)
     Q_PROPERTY(bool    busy              READ busy              NOTIFY busyChanged)
+    // 服务端版本号（来自 /healthz 的 version 字段；未探活/不可用时为空）
+    Q_PROPERTY(QString serverVersion     READ serverVersion     NOTIFY serverVersionChanged)
 
 public:
     explicit AppController(Backend *backend, QObject *parent = nullptr);
@@ -44,6 +46,7 @@ public:
     void    setAccessToken(const QString &token);
 
     QString statusText() const { return m_statusText; }
+    QString serverVersion() const { return m_serverVersion; }
 
     bool trustSelfSigned() const { return m_trustSelfSigned; }
     void setTrustSelfSigned(bool on);
@@ -66,6 +69,7 @@ signals:
     void serverUrlChanged();
     void accessTokenChanged();
     void statusTextChanged();
+    void serverVersionChanged();
     void trustSelfSignedChanged();
     void busyChanged();
 
@@ -89,6 +93,7 @@ private:
     Backend *m_backend = nullptr;
     QString  m_serverUrl;
     QString  m_accessToken;
+    QString  m_serverVersion;   // /healthz 的 version 字段
     QString  m_statusText;
     bool     m_trustSelfSigned = true;
     bool     m_busy = false;

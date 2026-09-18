@@ -6,6 +6,7 @@ import "../theme"
 /*!
     危险操作按钮（危险色）。对应 UI 方案 §2.2「Danger」。
     例：删除、取消上传。仅出现在确认流程或溢出菜单中。
+    三态：hover / pressed / focus（焦点用 Theme.focusRing 描边）。
 */
 Button {
     id: control
@@ -34,10 +35,20 @@ Button {
         implicitHeight: Theme.controlHeight
         radius: Theme.radiusControl
         color: !control.enabled ? Theme.border
-             : control.down ? Qt.darker(Theme.danger, 1.15)
-             : control.hovered ? Qt.lighter(Theme.danger, 1.1)
+             : control.down ? Theme.dangerPressed
+             : control.hovered ? Theme.dangerHover
              : Theme.danger
 
         Behavior on color { ColorAnimation { duration: Theme.animFast } }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        anchors.margins: -3
+        radius: Theme.radiusControl + 3
+        color: "transparent"
+        border.width: 2
+        border.color: Theme.focusRing
+        visible: control.visualFocus
     }
 }

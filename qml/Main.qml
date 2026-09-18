@@ -297,13 +297,16 @@ ApplicationWindow {
                     model: window.navItems
                     delegate: Item {
                         Layout.fillWidth: true
-                        implicitHeight: navCol.implicitHeight + Theme.spaceS
+                        implicitHeight: navCol.implicitHeight + Theme.spaceM
 
+                        // 选中态：药丸形高亮
                         Rectangle {
                             anchors.fill: parent
-                            radius: Theme.radiusControl
+                            radius: height / 2
                             color: window.navIndex === index ? Theme.selected
                                  : (navMouse.containsMouse ? Theme.hover : "transparent")
+
+                            Behavior on color { ColorAnimation { duration: Theme.animFast } }
                         }
                         ColumnLayout {
                             id: navCol
@@ -543,23 +546,35 @@ ApplicationWindow {
     // ==================================================================
     //  菜单
     // ==================================================================
+    // 顶部溢出菜单：分组（诊断 / 安全 / 关于）+ 图标
     Menu {
         id: overflowMenu
-        MenuItem { text: qsTr("健康检查"); onTriggered: App.healthCheck() }
-        MenuItem { text: qsTr("刷新文件列表"); onTriggered: Files.refresh() }
-        MenuItem { text: qsTr("刷新存储空间"); onTriggered: Stats.refresh() }
+        width: 220
+        // ---- 诊断 ----
+        MenuItem { text: "⇄  " + qsTr("健康检查"); onTriggered: App.healthCheck() }
+        MenuItem { text: "⟳  " + qsTr("刷新文件列表"); onTriggered: Files.refresh() }
+        MenuItem { text: "💽  " + qsTr("刷新存储空间"); onTriggered: Stats.refresh() }
         MenuSeparator { }
-        MenuItem { text: qsTr("关于云匣"); onTriggered: aboutDialog.open() }
+        // ---- 安全 ----
+        MenuItem {
+            text: "🔒  " + qsTr("证书与信任…")
+            onTriggered: window.navIndex = window.pageSettings
+        }
+        MenuSeparator { }
+        // ---- 关于 ----
+        MenuItem { text: "ℹ  " + qsTr("关于云匣"); onTriggered: aboutDialog.open() }
     }
 
     Menu {
         id: compactMoreMenu
-        MenuItem { text: qsTr("分享（暂不支持）"); enabled: false }
-        MenuItem { text: qsTr("标签（暂不支持）"); enabled: false }
-        MenuItem { text: qsTr("回收站（暂不支持）"); enabled: false }
-        MenuItem { text: qsTr("版本（暂不支持）"); enabled: false }
+        width: 220
+        MenuItem { text: "🔗  " + qsTr("分享（暂不支持）"); enabled: false }
+        MenuItem { text: "🏷  " + qsTr("标签（暂不支持）"); enabled: false }
+        MenuItem { text: "🗑  " + qsTr("回收站（暂不支持）"); enabled: false }
+        MenuItem { text: "🕘  " + qsTr("版本（暂不支持）"); enabled: false }
         MenuSeparator { }
-        MenuItem { text: qsTr("关于云匣"); onTriggered: aboutDialog.open() }
+        MenuItem { text: "⚙  " + qsTr("连接设置"); onTriggered: window.navIndex = window.pageSettings }
+        MenuItem { text: "ℹ  " + qsTr("关于云匣"); onTriggered: aboutDialog.open() }
     }
 
     // ==================================================================

@@ -972,6 +972,9 @@ Result<bool> HttpBackend::health()
     const Response r = request(Method::Get, QStringLiteral("/healthz"));
     if (!r.ok())
         return Result<bool>::fail(r.error.isEmpty() ? QStringLiteral("健康检查失败") : r.error);
+    // 记录服务端版本（/healthz 返回 {"status":"ok","version":"x.y.z",...}），供 UI 展示
+    const QJsonObject o = QJsonDocument::fromJson(r.body).object();
+    m_serverVersion = o.value(QStringLiteral("version")).toString();
     return Result<bool>::success(true);
 }
 

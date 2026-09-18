@@ -5,7 +5,8 @@ import "../theme"
 
 /*!
     次级按钮（描边 / 浅底）。对应 UI 方案 §2.2「Secondary」。
-    例：刷新、新建文件夹。
+    例：刷新、新建文件夹、测试连接。
+    三态：hover / pressed / focus（焦点用 Theme.focusRing 描边）。
 */
 Button {
     id: control
@@ -33,12 +34,22 @@ Button {
         implicitHeight: Theme.controlHeight
         radius: Theme.radiusControl
         color: !control.enabled ? Theme.bg
-             : control.down ? Theme.hover
+             : control.down ? Theme.hoverStrong
              : control.hovered ? Theme.hover
              : "transparent"
         border.width: 1
-        border.color: control.enabled ? Theme.border : Theme.disabledText
+        border.color: control.enabled ? Theme.borderStrong : Theme.disabledText
 
         Behavior on color { ColorAnimation { duration: Theme.animFast } }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        anchors.margins: -3
+        radius: Theme.radiusControl + 3
+        color: "transparent"
+        border.width: 2
+        border.color: Theme.focusRing
+        visible: control.visualFocus
     }
 }

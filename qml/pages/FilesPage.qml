@@ -8,8 +8,8 @@ import "../controls"
 import "../dialogs"
 
 /*!
-    文件页：工具条（上传 / 下载 / 新建 / 刷新）+ 面包屑 + 列表（空 / 加载 / 错误三态）
-    + 右键菜单（7 项）+ 拖拽上传 + 双击进入目录。
+    文件页：工具条（左侧搜索 · 右侧主操作）+ 面包屑 + 列表（空 / 加载 / 错误三态）
+    + 右键菜单（四组，带图标）+ 拖拽上传 + 双击进入目录。
 
     数据来源：FileModel（契约 §4 角色）；操作只经 FileController / TransferController。
     目录识别：FileController 合成的目录行 id 以 "dir:" 前缀（net 层约定），
@@ -208,38 +208,15 @@ Item {
         anchors.margins: Theme.spaceL
         spacing: Theme.spaceM
 
-        // ---- 工具条 ----
+        // ---- 工具条：左侧搜索 · 右侧主操作 ----
         RowLayout {
             Layout.fillWidth: true
             spacing: Theme.spaceS
 
-            PrimaryButton {
-                glyph: "⬆"
-                text: qsTr("上传")
-                onClicked: Files.uploadHere()
-            }
-            PrimaryButton {
-                glyph: "⬇"
-                text: qsTr("下载")
-                enabled: page.selectedIds.length > 0
-                onClicked: Files.downloadSelected()
-            }
-            SecondaryButton {
-                id: newBtn
-                glyph: "＋"
-                text: qsTr("新建")
-                onClicked: newMenu.popup(newBtn, 0, newBtn.height)
-            }
-            GhostButton {
-                glyph: "⟳"
-                text: qsTr("刷新")
-                onClicked: Files.refresh()
-            }
-
             SearchField {
                 id: searchField
                 Layout.fillWidth: true
-                Layout.maximumWidth: 260
+                Layout.maximumWidth: 320
                 placeholderText: qsTr("搜索文件（Ctrl+F）")
                 onTextChanged: page.filterText = text
             }
@@ -251,6 +228,29 @@ Item {
                 text: qsTr("已选 %1 项").arg(page.selectedIds.length)
                 color: Theme.textSecondary
                 font.pointSize: Theme.fontSecondary
+            }
+
+            GhostButton {
+                glyph: "⟳"
+                text: qsTr("刷新")
+                onClicked: Files.refresh()
+            }
+            SecondaryButton {
+                id: newBtn
+                glyph: "＋"
+                text: qsTr("新建")
+                onClicked: newMenu.popup(newBtn, 0, newBtn.height)
+            }
+            PrimaryButton {
+                glyph: "⬆"
+                text: qsTr("上传")
+                onClicked: Files.uploadHere()
+            }
+            PrimaryButton {
+                glyph: "⬇"
+                text: qsTr("下载")
+                enabled: page.selectedIds.length > 0
+                onClicked: Files.downloadSelected()
             }
         }
 
@@ -330,6 +330,7 @@ Item {
                         Label {
                             visible: !page.narrow
                             Layout.preferredWidth: page.colTimeWidth
+                            horizontalAlignment: Text.AlignRight
                             text: qsTr("修改时间")
                             color: Theme.textSecondary
                             font.pointSize: Theme.fontSecondary
@@ -426,6 +427,7 @@ Item {
                             Label {
                                 visible: !page.narrow
                                 Layout.preferredWidth: page.colTimeWidth
+                                horizontalAlignment: Text.AlignRight
                                 text: model.time
                                 color: Theme.textSecondary
                                 font.pointSize: Theme.fontSecondary
@@ -536,14 +538,25 @@ Item {
     // ------------------------------------------------------------------
     Menu {
         id: newMenu
-        MenuItem { text: qsTr("新建文件"); onTriggered: newFileDialog.openFor("file") }
-        MenuItem { text: qsTr("新建文件夹"); onTriggered: newFileDialog.openFor("folder") }
+        width: 180
+        MenuItem { text: "📄  " + qsTr("新建文件"); onTriggered: newFileDialog.openFor("file") }
+        MenuItem { text: "📁  " + qsTr("新建文件夹"); onTriggered: newFileDialog.openFor("folder") }
     }
 
+    /*!
+        右键菜单：四组（操作 / 修改 / 新建 / 排序），组间用 MenuSeparator 分隔。
+        · 图标用内联字形（不引入外部资源）
+        · 删除为 danger 色，且目录行置灰（服务端目录无删除语义）
+        · 排序为嵌套 Menu（Qt6：Menu 嵌 Menu 自动成为子菜单；MenuItem.menu 只读）
+    */
     Menu {
         id: ctxMenu
+        width: 224
+
+        // ---- 组1 操作 ----
         MenuItem {
-            text: page.ctxIsDir ? qsTr("打开文件夹") : qsTr("打开下载目录")
+            id: miOpen
+            text: "📂  " + (page.ctxIsDir ? qsTr("打开文件夹") : qsTr("打开下载目录"))
             onTriggered: {
                 if (page.ctxIsDir)
                     Files.enterDir(page.dirPathOf(page.ctxId))
@@ -552,26 +565,45 @@ Item {
             }
         }
         MenuItem {
-            text: qsTr("下载")
+            text: "⬇  " + qsTr("下载")
             enabled: !page.ctxIsDir
             onTriggered: Transfers.download([page.ctxId], "")
         }
+
+        MenuSeparator { }
+
+        // ---- 组2 修改 ----
         MenuItem {
-            text: qsTr("重命名")
+            text: "✏  " + qsTr("重命名")
             enabled: !page.ctxIsDir
             onTriggered: renameDialog.openFor(page.ctxId, page.ctxName)
         }
         MenuItem {
-            text: qsTr("删除")
+            id: miDelete
+            text: "🗑  " + qsTr("删除")
             enabled: !page.ctxIsDir
             onTriggered: deleteDialog.openFor(page.ctxId, page.ctxName)
+            contentItem: Text {
+                text: miDelete.text
+                font: miDelete.font
+                color: miDelete.enabled ? Theme.danger : Theme.disabledText
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
         }
+
         MenuSeparator { }
-        MenuItem { text: qsTr("新建文件"); onTriggered: newFileDialog.openFor("file") }
-        MenuItem { text: qsTr("上传到此目录"); onTriggered: Files.uploadHere() }
+
+        // ---- 组3 新建 ----
+        MenuItem { text: "📄  " + qsTr("新建文件"); onTriggered: newFileDialog.openFor("file") }
+        MenuItem { text: "📁  " + qsTr("新建文件夹"); onTriggered: newFileDialog.openFor("folder") }
+        MenuItem { text: "⬆  " + qsTr("上传到此目录"); onTriggered: Files.uploadHere() }
+
         MenuSeparator { }
+
+        // ---- 组4 排序（子菜单，单选）----
         Menu {
-            title: qsTr("排序")
+            title: "↕  " + qsTr("排序")
             MenuItem {
                 text: qsTr("名称")
                 checkable: true

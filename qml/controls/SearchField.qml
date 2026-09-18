@@ -4,7 +4,8 @@ import QtQuick.Controls
 import "../theme"
 
 /*!
-    搜索输入框（带清空按钮）。对应 UI 方案 §2.4 交互目标 6：Ctrl+F 过滤。
+    搜索输入框（左侧搜索图标 + 圆角 + 聚焦描边 + 清空按钮）。
+    对应 UI 方案 §2.4 交互目标 6：Ctrl+F 过滤。
     过滤逻辑由使用方负责（FilesPage 会据 textChanged 重建过滤视图）。
 */
 TextField {
@@ -58,7 +59,20 @@ TextField {
         implicitHeight: Theme.controlHeight
         radius: Theme.radiusControl
         color: Theme.card
-        border.width: 1
+        border.width: control.activeFocus ? 2 : 1
         border.color: control.activeFocus ? Theme.primary : Theme.border
+
+        Behavior on border.color { ColorAnimation { duration: Theme.animFast } }
+    }
+
+    // 聚焦时的外发光焦点环
+    Rectangle {
+        anchors.fill: parent
+        anchors.margins: -3
+        radius: Theme.radiusControl + 3
+        color: "transparent"
+        border.width: 2
+        border.color: Theme.focusRing
+        visible: control.activeFocus
     }
 }

@@ -5,14 +5,17 @@ import QtQuick.Layouts
 import "../theme"
 
 /*!
-    分区卡片（圆角 + 边框 + 标题）。用于设置页 / 关于页 / 详情区的内容分组。
+    分区卡片（圆角 12 + 边框 + 标题层级 + 卡片头下细分割线）。
+    用于设置页 / 关于页 / 详情区的内容分组。
     子项默认进入内部列表布局，直接书写即可（如 SectionCard { Label {} }）。
+    排版约定：卡片内边距 16（spaceL）、头/体间距 12（spaceM）、体项间距 12。
 */
 Rectangle {
     id: card
 
     property string title: ""
     property string subtitle: ""
+    property bool showHeaderDivider: true
     default property alias contentData: body.data
 
     implicitWidth: 260
@@ -49,6 +52,16 @@ Rectangle {
                 font.pointSize: Theme.fontSecondary
                 wrapMode: Text.WordWrap
             }
+        }
+
+        // 卡片头下细分割线（仅当有标题/描述时出现）
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.topMargin: -Theme.spaceXs
+            implicitHeight: 1
+            color: Theme.border
+            visible: card.showHeaderDivider
+                     && (card.title.length > 0 || card.subtitle.length > 0)
         }
 
         ColumnLayout {

@@ -4,7 +4,8 @@ import "../theme"
 
 /*!
     状态徽标（成功 / 警告 / 危险 / 信息 / 中性）。对应 UI 方案 §2.4「结果就近反馈」。
-    底色与描边由 tone 派生（基于 Theme 语义色做透明叠加），不引入硬编码色值。
+    药丸形（radius = height/2）；底色与描边由 tone 派生（基于 Theme 语义色做透明叠加），
+    不引入硬编码色值。
 */
 Rectangle {
     id: badge
@@ -23,9 +24,9 @@ Rectangle {
         }
     }
 
-    implicitWidth: label.implicitWidth + Theme.spaceM
-    implicitHeight: label.implicitHeight + Theme.spaceXs
-    radius: Theme.radiusControl
+    implicitWidth: label.implicitWidth + Theme.spaceL
+    implicitHeight: label.implicitHeight + Theme.spaceXs * 2
+    radius: height / 2 // 药丸形
     color: outlined ? "transparent" : Qt.rgba(toneColor.r, toneColor.g, toneColor.b, 0.14)
     border.width: 1
     border.color: Qt.rgba(toneColor.r, toneColor.g, toneColor.b, outlined ? 0.55 : 0.30)

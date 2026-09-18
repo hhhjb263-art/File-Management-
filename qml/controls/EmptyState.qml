@@ -7,6 +7,7 @@ import "../theme"
 /*!
     空态 / 引导态组件。对应 UI 方案 §2.4「空态引导」——列出提示 + 主操作按钮，
     取代「一片空白」。也复用于加载态与错误态（错误态通过 actions 提供【重试】）。
+    视觉：图标放大（40pt）、标题 17、描述次要色、主按钮用 Primary。
 */
 Item {
     id: root
@@ -25,13 +26,13 @@ Item {
     ColumnLayout {
         id: column
         anchors.centerIn: parent
-        width: Math.min(root.width > 0 ? root.width - Theme.spaceXl * 2 : 320, 420)
+        width: Math.min(root.width > 0 ? root.width - Theme.spaceXxl * 2 : 320, 420)
         spacing: Theme.spaceM
 
         Text {
             Layout.alignment: Qt.AlignHCenter
             text: root.glyph
-            font.pointSize: 34
+            font.pointSize: 40
             color: root.glyphColor
             opacity: 0.85
         }
@@ -60,6 +61,7 @@ Item {
         RowLayout {
             id: actionRow
             Layout.alignment: Qt.AlignHCenter
+            Layout.topMargin: Theme.spaceXs
             spacing: Theme.spaceS
         }
     }
