@@ -71,7 +71,7 @@ bool LocalIndex::open(const QString &dbFile)
     return db.isOpen();
 }
 
-QHash<QString, Entry> LocalIndex::entries(const QString &pairId) const
+QHash<QString, LocalIndex::Entry> LocalIndex::entries(const QString &pairId) const
 {
     QHash<QString, Entry> out;
     QSqlDatabase          db = connectionFor(m_dbFile);

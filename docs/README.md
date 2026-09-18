@@ -52,3 +52,36 @@ cmake --build client/build -j
 - **阈值/限制变更**（如分块大小、上传上限）：`大文件传输设计.md` §5 阈值总览是**唯一权威表**，改代码时必须同步它。
 - **版本标记**：用 `v0.x` 标注行为变更（例如「v0.7 移除【创建目录】【按路径下载】按钮」），便于回溯。
 - 文档中引用的路径一律相对本仓库根，避免绝对路径。
+
+
+---
+
+## 运行依赖部署（Windows，正式客户端）
+
+`bin/` 下的 `CloudVault.exe` 需要 Qt 运行时才能运行。**`bin/` 已在 `.gitignore` 中**（体积约 100 MB，不入库），
+因此克隆仓库或重新构建后，请执行一次部署脚本：
+
+```bash
+bash scripts/deploy_windows.sh            # 默认 Qt=D:/Qt/6.9.3/mingw_64
+bash scripts/deploy_windows.sh <Qt前缀> <MinGW前缀>
+```
+
+脚本做四件事（幂等，可重复运行）：
+1. `windeployqt --qmldir qml`：收集 Qt DLL、平台插件与 **QML 模块**（`qml/` 下 31 个模块、1300+ 文件；FluentWinUI3 风格必需）
+2. **补齐 TLS 后端插件**（`bin/tls/` 三个后端）——`windeployqt` 有时只拷 2 个，而自签名 HTTPS 依赖它
+3. **补齐 MinGW 运行库**（`libgcc_s_seh-1.dll` / `libstdc++-6.dll` / `libwinpthread-1.dll`）——跨机器运行必需
+4. 用 `objdump` 校验 exe 的**全部直接依赖**都落在 `bin/`
+
+**验证自包含**（把 Qt/MinGW 从 PATH 剔除后仍应启动并驻留）：
+
+```bash
+CLEAN=$(echo "$PATH" | tr ':' '\n' | grep -iv "qt\|mingw" | paste -sd: -)
+env PATH="$CLEAN" QT_QPA_PLATFORM=offscreen timeout 5 ./bin/CloudVault.exe   # 期望 exit=124
+```
+
+完成后的 `bin/` 可**直接双击运行**，或整目录拷到其他 Windows 机器（无需安装 Qt）。
+
+> ⚠️ **TLS 后端说明**：本机 Qt 未附带 OpenSSL 运行库，故 `bin/tls/qopensslbackend.dll` 无法加载，
+> Windows 会使用系统 **Schannel** 后端（对自签名证书同样会触发 `sslErrors` → TOFU 确认框正常工作）。
+> 若后续要统一为 OpenSSL 行为：从 Qt 官方安装器的 "OpenSSL Toolkit" 取得 `libssl-3-x64.dll` /
+> `libcrypto-3-x64.dll` 放进 `bin/`，并在 `src/app/main.cpp` 加 `QSslSocket::setActiveBackend("openssl")`。

@@ -182,9 +182,10 @@ QString Util::uniquePath(const QString &path)
     const QString   ext  = info.suffix();
 
     for (int i = 1; i < 10000; ++i) {
+        // 逐参链式替换：Qt6 已移除 arg(int, const QString &) 等混合重载
         const QString candidate = ext.isEmpty()
-                                      ? QStringLiteral("%1/%2 (%3)").arg(dir, base).arg(i)
-                                      : QStringLiteral("%1/%2 (%3).%4").arg(dir, base).arg(i, ext);
+                                      ? QStringLiteral("%1/%2 (%3)").arg(dir).arg(base).arg(i)
+                                      : QStringLiteral("%1/%2 (%3).%4").arg(dir).arg(base).arg(i).arg(ext);
         if (!QFileInfo::exists(candidate))
             return candidate;
     }

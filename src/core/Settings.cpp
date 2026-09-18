@@ -17,6 +17,11 @@ constexpr int    kDefaultConcurrency   = 3;
 constexpr int    kDefaultChunkSizeMB   = 5;
 constexpr int    kDefaultScanInterval  = 10;
 
+// 自动刷新默认值 / 合法区间（秒）
+constexpr int    kDefaultAutoRefreshInterval = 30;
+constexpr int    kMinAutoRefreshSec          = 5;
+constexpr int    kMaxAutoRefreshSec          = 3600;
+
 QString syncModeToString(SyncMode mode)
 {
     switch (mode) {
@@ -40,7 +45,8 @@ Settings::Settings(QObject *parent)
     : QObject(parent)
     , m_settings(AppPaths::settingsFile(), QSettings::IniFormat)
 {
-    m_settings.setIniCodec("UTF-8");
+    // Qt6 的 QSettings 已移除 setIniCodec()：INI 文件一律按 UTF-8 处理，
+    // 且此处构造时已显式指定 QSettings::IniFormat，无需再做编码设置。
 }
 
 Settings &Settings::instance()
@@ -108,6 +114,31 @@ int  Settings::fullScanIntervalMin() const
 void Settings::setFullScanIntervalMin(int minutes)
 {
     m_settings.setValue(QStringLiteral("sync/scanIntervalMin"), qMax(1, minutes));
+}
+
+// ---------------- 自动刷新 ----------------
+
+bool Settings::autoRefreshEnabled() const
+{
+    return m_settings.value(QStringLiteral("general/autoRefresh"), true).toBool();
+}
+void Settings::setAutoRefreshEnabled(bool on)
+{
+    m_settings.setValue(QStringLiteral("general/autoRefresh"), on);
+}
+
+int Settings::autoRefreshIntervalSec() const
+{
+    // 读取时也钳制：防手改 INI 写入越界值。
+    return qBound(kMinAutoRefreshSec,
+                  m_settings.value(QStringLiteral("general/autoRefreshIntervalSec"),
+                                   kDefaultAutoRefreshInterval).toInt(),
+                  kMaxAutoRefreshSec);
+}
+void Settings::setAutoRefreshIntervalSec(int sec)
+{
+    m_settings.setValue(QStringLiteral("general/autoRefreshIntervalSec"),
+                        qBound(kMinAutoRefreshSec, sec, kMaxAutoRefreshSec));
 }
 
 QVector<SyncPair> Settings::syncPairs() const
