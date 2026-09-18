@@ -54,30 +54,38 @@ void StatsController::refresh()
         return;
     }
 
-    const Result<UsageStats> r = m_backend->usage();
-    if (!r.ok) {
-        m_freeBytes = -1;
-        m_totalBytes = 0;
-        m_freeText = friendlyError(r.error);
-        emit logMessage(QStringLiteral("ERROR"),
-                        QStringLiteral("存储空间查询失败：%1").arg(r.error));
-        emit statsChanged();
-        return;
-    }
+    // 非阻塞：走异步变体（HttpBackend 真异步；本地引擎默认退化同步，行为不变）。
+    // 用序号丢弃乱序回包（连点刷新 / 与启动查询竞争时只认最新一次）。
+    const int seq = ++m_usageSeq;
+    m_backend->usageAsync([this, seq](Result<UsageStats> r) {
+        if (seq != m_usageSeq) {
+            return; // 乱序回包：作废
+        }
 
-    const UsageStats u = r.value;
-    m_totalBytes = u.total;
-    if (u.total > 0) {
-        // used 由后端给出；free = total - used（下限 0，避免服务端越界数据出现负数）
-        m_freeBytes = qMax<qint64>(0, u.total - u.used);
-        m_freeText = QStringLiteral("剩余 %1 / 共 %2")
-                         .arg(Util::humanSize(m_freeBytes), Util::humanSize(m_totalBytes));
-    } else {
-        // 服务端未返回总容量（total==0）：不臆造数字
-        m_freeBytes = -1;
-        m_freeText = QStringLiteral("服务器未返回容量信息");
-    }
-    emit statsChanged();
+        if (!r.ok) {
+            m_freeBytes = -1;
+            m_totalBytes = 0;
+            m_freeText = friendlyError(r.error);
+            emit logMessage(QStringLiteral("ERROR"),
+                            QStringLiteral("存储空间查询失败：%1").arg(r.error));
+            emit statsChanged();
+            return;
+        }
+
+        const UsageStats u = r.value;
+        m_totalBytes = u.total;
+        if (u.total > 0) {
+            // used 由后端给出；free = total - used（下限 0，避免服务端越界数据出现负数）
+            m_freeBytes = qMax<qint64>(0, u.total - u.used);
+            m_freeText = QStringLiteral("剩余 %1 / 共 %2")
+                             .arg(Util::humanSize(m_freeBytes), Util::humanSize(m_totalBytes));
+        } else {
+            // 服务端未返回总容量（total==0）：不臆造数字
+            m_freeBytes = -1;
+            m_freeText = QStringLiteral("服务器未返回容量信息");
+        }
+        emit statsChanged();
+    });
 }
 
 } // namespace cv

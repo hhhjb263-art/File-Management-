@@ -15,6 +15,8 @@
 #include <QCryptographicHash>
 #include <QList>
 
+#include <algorithm>
+
 namespace cv {
 namespace {
 
@@ -124,6 +126,18 @@ QString FileController::normalizeDir(const QString &dir)
 
 void FileController::refresh()
 {
+    beginLoad(/*pollOnly=*/false);
+}
+
+void FileController::refreshIfChanged()
+{
+    // 低频轮询入口：与 refresh() 共用同一套异步回包处理与 m_refreshSeq 序号，
+    // 仅在**内容指纹变化**时才应用列表并 emit refreshFinished(true)。
+    beginLoad(/*pollOnly=*/true);
+}
+
+void FileController::beginLoad(bool pollOnly)
+{
     if (!m_backend) {
         setItems({});
         setEmptyText(QStringLiteral("未配置数据源"));
@@ -132,33 +146,75 @@ void FileController::refresh()
         return;
     }
 
-    setLoading(true);
-    setEmptyText(QStringLiteral("正在加载…"));
+    // 仅"显式刷新"才置加载态 / 占位文案；低频轮询不打扰界面（未变化时更应零副作用）。
+    if (!pollOnly) {
+        setLoading(true);
+        setEmptyText(QStringLiteral("正在加载…"));
+    }
 
-    const Result<QVector<FileItem>> r = m_backend->listFolder(m_currentDir);
+    // 非阻塞刷新：走异步变体（HttpBackend 真异步；本地引擎默认退化同步，行为不变）。
+    // refresh() 与 refreshIfChanged() **共用** m_refreshSeq：连点 / 切目录 / 轮询混发时旧回包一律作废。
+    const int     seq = ++m_refreshSeq;
+    const QString dir = m_currentDir;
+    m_backend->listFolderAsync(dir, [this, seq, dir, pollOnly](Result<QVector<FileItem>> r) {
+        if (seq != m_refreshSeq) {
+            return; // 乱序：已发起更新的刷新，本回包作废（不 emit、不改状态）
+        }
+        handleFolderReply(dir, r, pollOnly);
+    });
+}
 
-    setLoading(false);
-
-    if (!r.ok) {
+void FileController::handleFolderReply(const QString &dir,
+                                       const Result<QVector<FileItem>> &reply,
+                                       bool pollOnly)
+{
+    // ---- 失败：与 refresh() 失败路径**完全一致**（恰好一次 refreshFinished(false)）----
+    if (!reply.ok) {
+        setLoading(false);
         setItems({});
-        const QString msg = friendlyError(r.error);
+        const QString msg = friendlyError(reply.error);
         setEmptyText(msg);
         emit errorOccurred(msg);
         emit logMessage(QStringLiteral("ERROR"),
                         QStringLiteral("列出目录「%1」失败：%2")
-                            .arg(m_currentDir.isEmpty() ? QStringLiteral("根目录") : m_currentDir,
-                                 r.error));
+                            .arg(dir.isEmpty() ? QStringLiteral("根目录") : dir, reply.error));
         emit refreshFinished(false); // 退出路径②：列出失败
         return;
     }
 
-    setItems(r.value);
-    setEmptyText(r.value.isEmpty() ? QStringLiteral("此文件夹为空") : QString());
+    // ---- 轮询且内容未变：不动界面、不发任何信号（连 refreshFinished 也不发）----
+    if (pollOnly && fingerprintOf(reply.value) == m_lastFingerprint) {
+        emit logMessage(QStringLiteral("INFO"), QStringLiteral("轮询：内容未变化"));
+        return;
+    }
+
+    // ---- 成功应用（非轮询恒走此处；轮询仅在"变了"时走此处）----
+    setLoading(false);
+    setItems(reply.value);
+    setEmptyText(reply.value.isEmpty() ? QStringLiteral("此文件夹为空") : QString());
+    m_lastFingerprint = fingerprintOf(reply.value); // 更新缓存指纹（紧随的轮询据此判"未变化"）
     emit logMessage(QStringLiteral("INFO"),
                     QStringLiteral("已列出「%1」，共 %2 项")
-                        .arg(m_currentDir.isEmpty() ? QStringLiteral("根目录") : m_currentDir)
-                        .arg(r.value.size()));
-    emit refreshFinished(true); // 退出路径③：成功收尾
+                        .arg(dir.isEmpty() ? QStringLiteral("根目录") : dir)
+                        .arg(reply.value.size()));
+    emit refreshFinished(true); // 退出路径③：成功收尾（恰好一次）
+}
+
+QString FileController::fingerprintOf(const QVector<FileItem> &items)
+{
+    QStringList parts;
+    parts.reserve(items.size());
+    for (const FileItem &it : items) {
+        // 字段以 FileItem 真实定义为准：id / name / size / modified(UTC)
+        parts << QStringLiteral("%1|%2|%3|%4")
+                     .arg(it.id, it.name)
+                     .arg(it.size)
+                     .arg(it.modified.isValid() ? it.modified.toMSecsSinceEpoch() : 0);
+    }
+    std::sort(parts.begin(), parts.end()); // 稳定：判定与后端返回顺序无关
+    return QString::fromLatin1(QCryptographicHash::hash(parts.join(QLatin1Char('\n')).toUtf8(),
+                                                        QCryptographicHash::Sha256)
+                                   .toHex());
 }
 
 void FileController::enterDir(const QString &dir)

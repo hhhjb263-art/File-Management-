@@ -552,7 +552,7 @@ ApplicationWindow {
         width: 220
         // ---- 诊断 ----
         MenuItem { text: "⇄  " + qsTr("健康检查"); onTriggered: App.healthCheck() }
-        MenuItem { text: "⟳  " + qsTr("刷新文件列表"); onTriggered: Files.refresh() }
+        MenuItem { text: "⟳  " + qsTr("刷新文件列表"); onTriggered: filesPage.refreshNow() }
         MenuItem { text: "💽  " + qsTr("刷新存储空间"); onTriggered: Stats.refresh() }
         MenuSeparator { }
         // ---- 安全 ----
@@ -647,7 +647,9 @@ ApplicationWindow {
     Shortcut {
         sequences: ["F5", "Ctrl+R"]
         onActivated: {
-            Files.refresh()
+            // 走 FilesPage.refreshNow()：立即刷新并解除「已暂停」，
+            // 与右键菜单「刷新」行为一致（F5 为全局快捷键，已经在 Main 注册，未重复添加）。
+            filesPage.refreshNow()
             Stats.refresh()
         }
     }

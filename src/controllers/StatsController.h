@@ -46,6 +46,7 @@ private:
     qint64   m_totalBytes = 0;
     QString  m_freeText;
     bool     m_supported = true;
+    int      m_usageSeq = 0;     // 查询序号：丢弃乱序回包（连点刷新时只认最新一次）
 };
 
 } // namespace cv

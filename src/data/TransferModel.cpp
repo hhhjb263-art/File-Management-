@@ -358,8 +358,10 @@ QVariantMap TransferModel::historyMapFor(const TransferTask &task) const
     map.insert(QStringLiteral("message"), task.error);
     // 历史附加字段：
     //   sizeText    —— 已完成字节的人类可读串（复用 Util::humanSize，保证全项目文案一致）
+    //   totalText   —— 总字节的人类可读串（与 sizeText 同源，供历史行展示 "已完成 / 总量"）
     //   displayPath —— 上传 = 远端目标目录（remotePath）；下载 = 本地保存路径（localPath）
     map.insert(QStringLiteral("sizeText"), Util::humanSize(task.done));
+    map.insert(QStringLiteral("totalText"), Util::humanSize(task.total));
     map.insert(QStringLiteral("displayPath"),
                task.kind == TransferKind::Download ? task.localPath : task.remotePath);
     return map;

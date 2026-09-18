@@ -6,7 +6,9 @@
  *   HttpBackend  远程私有云服务器，走 REST
  * 两者可无缝替换，界面层零改动。
  *
- * 所有方法都是同步阻塞的，调用方负责放到线程池执行。
+ * 所有同步方法都是阻塞的，调用方负责放到线程池执行。
+ * 另有少量「异步变体」（见文件末尾，加法式、默认退化同步）：HTTP 实现对刷新类
+ * 只读查询走真异步，避免网络不可达时用嵌套事件循环阻塞 GUI 主线程。
  ****************************************************************************/
 #pragma once
 
@@ -15,6 +17,8 @@
 #include <QByteArray>
 #include <QObject>
 #include <QStringList>
+
+#include <functional>
 
 namespace cv {
 
@@ -89,6 +93,19 @@ public:
 
     // ---------------- 统计 ----------------
     virtual Result<UsageStats> usage() = 0;
+
+    // ---------------- 异步变体（加法式，带默认实现）----------------
+    // 默认**退化为同步**：本地引擎（MockBackend）等既有实现无需改动。
+    // 存在的意义：HTTP 实现可真正异步（不进入嵌套 QEventLoop），从而避免
+    // 网络不可达时阻塞 GUI 主线程导致界面冻结（启动 89s 冻结的根因）。
+    // 约定：done 一定被调用一次；真实异步实现保证在 **发起调用的线程**（主线程）
+    //       回调，调用方无需加锁；同步退化实现则在 listFolder() 返回后立即回调。
+    virtual void listFolderAsync(const QString &parentId,
+                                 std::function<void(Result<QVector<FileItem>>)> done)
+    {
+        done(listFolder(parentId));
+    }
+    virtual void usageAsync(std::function<void(Result<UsageStats>)> done) { done(usage()); }
 };
 
 } // namespace cv

@@ -195,8 +195,16 @@ Item {
                                     }
 
                                     Label {
-                                        text: historyRow.info.sizeText !== undefined
-                                              ? String(historyRow.info.sizeText) : ""
+                                        // 进度式大小：已传 / 总量（totalText 由 C++ historyMapFor 提供；
+                                        // 未就绪时优雅退化为仅显示已传）。不设 elide，保证「总量」那一半不被吃掉。
+                                        text: {
+                                            const s = historyRow.info.sizeText !== undefined
+                                                      ? String(historyRow.info.sizeText) : ""
+                                            const t = historyRow.info.totalText !== undefined
+                                                      ? String(historyRow.info.totalText) : ""
+                                            return t.length > 0 ? s + " / " + t : s
+                                        }
+                                        Layout.fillWidth: false
                                         color: Theme.textSecondary
                                         font.pointSize: Theme.fontSecondary
                                     }

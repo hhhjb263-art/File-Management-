@@ -55,8 +55,9 @@ Item {
           2) page.visible          —— StackLayout 会把非当前页置 visible=false，不在文件页不轮询
           3) !Files.loading        —— 防重入堆叠（同步阻塞下堆叠会雪上加霜）
           4) !page.autoRefreshPaused —— 失败后暂停
-        注意：不在此处（Component.onCompleted）调用 Files.refresh()，
-        以免与 Main.qml 启动时已有的 Files.refresh() 重复。
+        低频轮询走 refreshIfChanged()（内容指纹未变则**不动界面、不打断选中/滚动**）；
+        只在本客户端自身增删改 / 传输完成 / 用户手动刷新时才用 refresh() 立即更新界面。
+        注意：不在此处（Component.onCompleted）调用刷新，以免与 Main.qml 启动时已有的刷新重复。
     */
     Timer {
         id: autoRefreshTimer
@@ -66,7 +67,13 @@ Item {
                  && page.visible
                  && !Files.loading
                  && !page.autoRefreshPaused
-        onTriggered: Files.refresh()
+        onTriggered: Files.refreshIfChanged()
+    }
+
+    // 立即刷新并解除暂停（右键「刷新」/ F5 共用）。若仍失败，onRefreshFinished(false) 会再次暂停。
+    function refreshNow() {
+        page.autoRefreshPaused = false
+        Files.refresh()
     }
 
     // Ctrl+F 聚焦过滤框（仅本页可见时生效）
@@ -213,6 +220,17 @@ Item {
         function onCountChanged() { page.rebuild() }
     }
 
+    // 「操作后立即刷」：本客户端自身的传输任务进入历史（完成 / 失败 / 取消）时，
+    // 服务端文件必然已变化（如上传完成）→ 立即重列，不等下一次低频轮询。
+    // 仅在未暂停时刷新：避免对已知不可达的服务器再发起阻塞式（60s）请求。
+    Connections {
+        target: TransferModel
+        function onHistoryChanged() {
+            if (!page.autoRefreshPaused)
+                Files.refresh()
+        }
+    }
+
     Connections {
         target: Files
         function onCurrentDirChanged() { page.rebuildCrumbs() }
@@ -225,7 +243,7 @@ Item {
                 page.autoRefreshPaused = false
             } else if (App.autoRefresh && !page.autoRefreshPaused) {
                 page.autoRefreshPaused = true
-                page.notify(qsTr("自动刷新已暂停：服务器不可达，可点【刷新】重试"), false)
+                page.notify(qsTr("自动刷新已暂停：服务器不可达，可右键「刷新」或按 F5 重试"), false)
             }
         }
         function onUploadRequested(dir) {
@@ -265,31 +283,6 @@ Item {
                 text: qsTr("已选 %1 项").arg(page.selectedIds.length)
                 color: Theme.textSecondary
                 font.pointSize: Theme.fontSecondary
-            }
-
-            GhostButton {
-                glyph: "⟳"
-                text: qsTr("刷新")
-                onClicked: {
-                    // 手动重试：先解除暂停再刷新，使自动刷新重新武装；
-                    // 若仍失败，onRefreshFinished(false) 会立即再次暂停。
-                    page.autoRefreshPaused = false
-                    Files.refresh()
-                }
-            }
-
-            // 自动刷新状态按钮（三态）。点击切换 App.autoRefresh；开启时清除暂停态。
-            GhostButton {
-                text: !App.autoRefresh
-                      ? qsTr("自动 ⟳ 关")
-                      : (page.autoRefreshPaused
-                         ? qsTr("自动 ⟳ 已暂停")
-                         : qsTr("自动 ⟳ %1s").arg(App.autoRefreshInterval))
-                onClicked: {
-                    App.autoRefresh = !App.autoRefresh
-                    if (App.autoRefresh)
-                        page.autoRefreshPaused = false
-                }
             }
 
             SecondaryButton {
@@ -532,7 +525,10 @@ Item {
                         SecondaryButton {
                             glyph: "⟳"
                             text: qsTr("刷新")
-                            onClicked: Files.refresh()
+                            // 走统一入口 refreshNow()：清「已暂停」再刷新。
+                            // 若直接 Files.refresh()，在 autoRefreshPaused=true（上一次失败）时
+                            // 会留下「看不见的暂停」——轮询永远停摆且已无按钮显示它。
+                            onClicked: page.refreshNow()
                         }
                     }
 
@@ -549,7 +545,8 @@ Item {
                         PrimaryButton {
                             glyph: "⟳"
                             text: qsTr("重试")
-                            onClicked: Files.refresh()
+                            // 同空态：必须走 refreshNow() 清暂停，否则重试成功后轮询仍停在暂停态。
+                            onClicked: page.refreshNow()
                         }
                         SecondaryButton {
                             text: qsTr("前往设置检查令牌")
@@ -609,6 +606,14 @@ Item {
     Menu {
         id: ctxMenu
         width: 224
+
+        // ---- 组0 刷新（替代原工具栏【刷新】按钮，始终可用；右键空白处亦可触发）----
+        MenuItem {
+            text: "⟳  " + qsTr("刷新")
+            onTriggered: page.refreshNow()
+        }
+
+        MenuSeparator { }
 
         // ---- 组1 操作 ----
         MenuItem {

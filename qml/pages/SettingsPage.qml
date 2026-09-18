@@ -443,7 +443,8 @@ Item {
                 Layout.leftMargin: page.contentMargin
                 Layout.rightMargin: page.contentMargin
                 title: qsTr("自动刷新")
-                subtitle: qsTr("开启后，停留在「文件」页时会按设定间隔自动刷新列表。")
+                subtitle: qsTr("每隔设定间隔检查一次服务器；只有文件发生变化时才刷新列表"
+                               + "（内容未变则不打断选中与滚动）。")
 
                 // ---- 总开关 ----
                 RowLayout {
@@ -516,7 +517,7 @@ Item {
                 Label {
                     Layout.fillWidth: true
                     text: qsTr("服务器不可达时，自动刷新会自动暂停以避免反复卡顿；"
-                               + "恢复连接后点【刷新】即可再次启用。")
+                               + "恢复连接后右键「刷新」或按 F5 即可再次启用。")
                     color: Theme.textSecondary
                     font.pointSize: Theme.fontSecondary
                     wrapMode: Text.WordWrap

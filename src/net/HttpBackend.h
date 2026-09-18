@@ -162,6 +162,13 @@ public:
 
     Result<UsageStats> usage() override;
 
+    // ---- 异步变体（加法式；真正不阻塞调用方线程）----
+    // 走 requestAsync（无嵌套 QEventLoop），QNAM 的 finished/超时/sslErrors 信号驱动回调。
+    // 解析逻辑与同步版**共用同一份**（buildFolderItems / buildUsage），避免两条路径漂移。
+    void listFolderAsync(const QString &parentId,
+                         std::function<void(Result<QVector<FileItem>>)> done) override;
+    void usageAsync(std::function<void(Result<UsageStats>)> done) override;
+
 private:
     enum class Method { Get, Post, Put, Delete };
 
@@ -176,7 +183,22 @@ private:
 
     Response request(Method method, const QString &path, const QByteArray &body = {},
                      const QHash<QByteArray, QByteArray> &headers = {});
+    // 回调版底层请求：不建 QEventLoop；由 reply::finished / QTimer 超时 / sslErrors 驱动
+    // done(Response)。done **恰好被调用一次**（超时后仍会 abort 并回调失败）。
+    void requestAsync(Method method, const QString &path, const QByteArray &body,
+                      const QHash<QByteArray, QByteArray> &headers,
+                      std::function<void(Response)> done);
     QNetworkAccessManager *nam(); // 每线程一个实例
+
+    // 解析：由「目录请求 + 目录登记请求」的响应合成当前目录条目。
+    // 同步 listFolder 与异步 listFolderAsync 共用（单一来源）。
+    static Result<QVector<FileItem>> buildFolderItems(const QString &parentId,
+                                                      const Response &files,
+                                                      const Response &dirs);
+    // 解析：由 storage/files/dirs 三响应合成 UsageStats。同步 usage 与异步 usageAsync 共用。
+    static Result<UsageStats> buildUsage(const Response &storage,
+                                         const Response &files,
+                                         const Response &dirs);
 
     // TLS：在 QNetworkReply::sslErrors 上做 TOFU 指纹固定
     void applyCertPinning(QNetworkReply *reply, const QList<QSslError> &errors);

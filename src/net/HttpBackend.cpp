@@ -79,6 +79,7 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <memory>
 
 namespace cv {
 namespace {
@@ -309,6 +310,23 @@ HttpBackend::Response HttpBackend::request(Method method, const QString &path,
                                            const QByteArray &body,
                                            const QHash<QByteArray, QByteArray> &headers)
 {
+    // 同步语义（既有调用方 / 非 GUI 线程）：用**局部**事件循环把异步实现包成阻塞返回。
+    // 传输与解析只有一份 —— 全在 requestAsync()，避免两条路径行为漂移。
+    // ⚠️ 同步阻塞仅限调用方自己的线程；GUI 主线程的刷新类查询请改用 *Async 变体。
+    Response   out;
+    QEventLoop loop;
+    requestAsync(method, path, body, headers, [&out, &loop](Response r) {
+        out = r;
+        loop.quit();
+    });
+    loop.exec();
+    return out;
+}
+
+void HttpBackend::requestAsync(Method method, const QString &path, const QByteArray &body,
+                               const QHash<QByteArray, QByteArray> &headers,
+                               std::function<void(Response)> done)
+{
     QNetworkRequest req((QUrl(m_baseUrl + path)));
     req.setRawHeader("Accept", "application/json");
     if (!m_token.isEmpty())
@@ -332,49 +350,52 @@ HttpBackend::Response HttpBackend::request(Method method, const QString &path,
     case Method::Delete: reply = nam()->deleteResource(req); break;
     }
 
-    Response out;
+    // 超时用 QTimer 驱动「回调失败 + abort reply」，绝不阻塞调用方。
+    auto *timer = new QTimer(reply); // 父子归 reply：reply 删除即回收
+    timer->setSingleShot(true);
 
-    QEventLoop loop;
-    QTimer     timer;
-    timer.setSingleShot(true);
+    // 保证 done **恰好一次**（finished 与 timeout 竞争时只取先到者）。
+    auto fired  = std::make_shared<bool>(false);
+    auto finish = [reply, timer, fired, done](bool timedOut) {
+        if (*fired)
+            return;
+        *fired = true;
+        timer->stop();
 
-    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
+        Response out;
+        if (timedOut && !reply->isFinished()) {
+            reply->abort();
+            out.error = QStringLiteral("请求超时（%1 ms）").arg(kTimeoutMs);
+        } else {
+            out.status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            out.body   = reply->readAll();
+            if (out.status >= 400) {
+                out.error = errorTextForStatus(out.status, out.body);
+            } else if (out.status <= 0) {
+                const QVariant pin = reply->property("cvPinMismatch");
+                if (pin.isValid()) {
+                    // 指纹不一致：给出可识别原因（控制器会翻成中文警告，且不提供"继续"）
+                    out.error = pin.toString();
+                } else {
+                    out.error = reply->error() != QNetworkReply::NoError
+                                    ? reply->errorString()
+                                    : QStringLiteral("网络错误（无响应）");
+                }
+            }
+        }
+        reply->deleteLater();
+        done(out);
+    };
+
+    QObject::connect(reply, &QNetworkReply::finished, reply, [finish]() { finish(false); });
+    QObject::connect(timer, &QTimer::timeout, reply, [finish]() { finish(true); });
     // HTTPS 自签名证书：在 sslErrors 里做 TOFU 指纹固定（纯 HTTP 不受影响）
-    QObject::connect(reply, &QNetworkReply::sslErrors, &loop,
+    QObject::connect(reply, &QNetworkReply::sslErrors, reply,
                      [this, reply](const QList<QSslError> &errors) {
                          applyCertPinning(reply, errors);
                      });
 
-    timer.start(kTimeoutMs);
-    loop.exec();
-
-    if (!reply->isFinished()) {
-        reply->abort();
-        reply->deleteLater();
-        out.error = QStringLiteral("请求超时（%1 ms）").arg(kTimeoutMs);
-        return out;
-    }
-    timer.stop();
-
-    out.status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    out.body   = reply->readAll();
-
-    if (out.status >= 400) {
-        out.error = errorTextForStatus(out.status, out.body);
-    } else if (out.status <= 0) {
-        const QVariant pin = reply->property("cvPinMismatch");
-        if (pin.isValid()) {
-            // 指纹不一致：给出可识别原因（控制器会翻成中文警告，且不提供"继续"）
-            out.error = pin.toString();
-        } else {
-            out.error = reply->error() != QNetworkReply::NoError ? reply->errorString()
-                                                                 : QStringLiteral("网络错误（无响应）");
-        }
-    }
-
-    reply->deleteLater();
-    return out;
+    timer->start(kTimeoutMs);
 }
 
 // =========================================================================
@@ -540,34 +561,35 @@ UserInfo HttpBackend::currentUser() const { return m_user; }
 // 列表（GET /api/v1/files 全量 + GET /api/v1/dirs 合成目录）
 // =========================================================================
 
-Result<QVector<FileItem>> HttpBackend::listFolder(const QString &parentId)
+// 解析：由 files/dirs 两响应合成当前目录条目（同步与异步共用，单一来源）。
+Result<QVector<FileItem>> HttpBackend::buildFolderItems(const QString &parentId,
+                                                        const Response &files,
+                                                        const Response &dirs)
 {
+    if (!files.ok())
+        return Result<QVector<FileItem>>::fail(files.error);
+
     const QString dir = dirFromParentId(parentId);
 
-    const Response fr = request(Method::Get, QStringLiteral("/api/v1/files"));
-    if (!fr.ok())
-        return Result<QVector<FileItem>>::fail(fr.error);
-
-    const Response dr = request(Method::Get, QStringLiteral("/api/v1/dirs"));
     // 目录列表失败不致命：至少把文件返回（无目录条目）
-    QSet<QString> dirs;
-    if (dr.ok()) {
+    QSet<QString> dirsSet;
+    if (dirs.ok()) {
         const QJsonArray arr =
-            QJsonDocument::fromJson(dr.body).object().value(QStringLiteral("items")).toArray();
+            QJsonDocument::fromJson(dirs.body).object().value(QStringLiteral("items")).toArray();
         for (const QJsonValue &v : arr)
-            dirs.insert(v.toString());
+            dirsSet.insert(v.toString());
     }
 
     QVector<FileItem> out;
     const QJsonArray items =
-        QJsonDocument::fromJson(fr.body).object().value(QStringLiteral("items")).toArray();
+        QJsonDocument::fromJson(files.body).object().value(QStringLiteral("items")).toArray();
     for (const QJsonValue &v : items) {
         const FileItem f = fileItemFromServer(v.toObject());
         if (f.parentId == parentIdForDir(dir))
             out.append(f);
     }
     // 目录条目：dir 的**直接**子目录
-    for (const QString &d : dirs) {
+    for (const QString &d : dirsSet) {
         if (d.isEmpty() || d == dir)
             continue;
         const bool directChild = dir.isEmpty()
@@ -580,6 +602,33 @@ Result<QVector<FileItem>> HttpBackend::listFolder(const QString &parentId)
 
     std::sort(out.begin(), out.end(), Json::fileLess);
     return Result<QVector<FileItem>>::success(out);
+}
+
+Result<QVector<FileItem>> HttpBackend::listFolder(const QString &parentId)
+{
+    const Response fr = request(Method::Get, QStringLiteral("/api/v1/files"));
+    if (!fr.ok())
+        return Result<QVector<FileItem>>::fail(fr.error);
+
+    const Response dr = request(Method::Get, QStringLiteral("/api/v1/dirs"));
+    return buildFolderItems(parentId, fr, dr);
+}
+
+void HttpBackend::listFolderAsync(const QString &parentId,
+                                  std::function<void(Result<QVector<FileItem>>)> done)
+{
+    // 与同步版同序：先取 files，成功后再取 dirs（目录失败不致命，交由 buildFolderItems 处理）。
+    requestAsync(Method::Get, QStringLiteral("/api/v1/files"), {}, {},
+                 [this, parentId, done](Response fr) {
+                     if (!fr.ok()) {
+                         done(Result<QVector<FileItem>>::fail(fr.error));
+                         return;
+                     }
+                     requestAsync(Method::Get, QStringLiteral("/api/v1/dirs"), {}, {},
+                                  [this, parentId, fr, done](Response dr) {
+                                      done(buildFolderItems(parentId, fr, dr));
+                                  });
+                 });
 }
 
 Result<QVector<FileItem>> HttpBackend::listUnderPath(const QString &remotePath)
@@ -1044,30 +1093,58 @@ Result<QVector<FileItem>> HttpBackend::search(const QString &, const QStringList
 // 统计（GET /api/v1/storage + 计数）
 // =========================================================================
 
+// 解析：由 storage/files/dirs 三响应合成 UsageStats（同步与异步共用，单一来源）。
+Result<UsageStats> HttpBackend::buildUsage(const Response &storage, const Response &files,
+                                           const Response &dirs)
+{
+    if (!storage.ok())
+        return Result<UsageStats>::fail(storage.error);
+
+    const QJsonObject so = QJsonDocument::fromJson(storage.body).object();
+    UsageStats        s;
+    s.total = so.value(QStringLiteral("total_bytes")).toVariant().toLongLong();
+    const qint64 free = so.value(QStringLiteral("free_bytes")).toVariant().toLongLong();
+    s.used = s.total > 0 && free >= 0 ? qMax<qint64>(0, s.total - free) : 0;
+
+    // 计数（best-effort）：文件数 / 目录数
+    if (files.ok())
+        s.fileCount =
+            QJsonDocument::fromJson(files.body).object().value(QStringLiteral("total")).toVariant().toLongLong();
+    if (dirs.ok())
+        s.folderCount =
+            QJsonDocument::fromJson(dirs.body).object().value(QStringLiteral("total")).toVariant().toLongLong();
+
+    // 服务端不提供 版本 / 回收站 / 分享 占用与分类明细，保持默认 0 / 空
+    return Result<UsageStats>::success(s);
+}
+
 Result<UsageStats> HttpBackend::usage()
 {
     const Response sr = request(Method::Get, QStringLiteral("/api/v1/storage"));
     if (!sr.ok())
         return Result<UsageStats>::fail(sr.error);
 
-    const QJsonObject so = QJsonDocument::fromJson(sr.body).object();
-    UsageStats s;
-    s.total = so.value(QStringLiteral("total_bytes")).toVariant().toLongLong();
-    const qint64 free = so.value(QStringLiteral("free_bytes")).toVariant().toLongLong();
-    s.used = s.total > 0 && free >= 0 ? qMax<qint64>(0, s.total - free) : 0;
-
-    // 计数（best-effort）：文件数 / 目录数
     const Response fr = request(Method::Get, QStringLiteral("/api/v1/files"));
-    if (fr.ok())
-        s.fileCount =
-            QJsonDocument::fromJson(fr.body).object().value(QStringLiteral("total")).toVariant().toLongLong();
     const Response dr = request(Method::Get, QStringLiteral("/api/v1/dirs"));
-    if (dr.ok())
-        s.folderCount =
-            QJsonDocument::fromJson(dr.body).object().value(QStringLiteral("total")).toVariant().toLongLong();
+    return buildUsage(sr, fr, dr);
+}
 
-    // 服务端不提供 版本 / 回收站 / 分享 占用与分类明细，保持默认 0 / 空
-    return Result<UsageStats>::success(s);
+void HttpBackend::usageAsync(std::function<void(Result<UsageStats>)> done)
+{
+    // 与同步版同序：storage 失败即止；其后 files/dirs 为 best-effort 计数。
+    requestAsync(Method::Get, QStringLiteral("/api/v1/storage"), {}, {}, [this, done](Response sr) {
+        if (!sr.ok()) {
+            done(Result<UsageStats>::fail(sr.error));
+            return;
+        }
+        requestAsync(Method::Get, QStringLiteral("/api/v1/files"), {}, {},
+                     [this, done, sr](Response fr) {
+                         requestAsync(Method::Get, QStringLiteral("/api/v1/dirs"), {}, {},
+                                      [this, done, sr, fr](Response dr) {
+                                          done(buildUsage(sr, fr, dr));
+                                      });
+                     });
+    });
 }
 
 } // namespace cv
