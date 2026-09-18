@@ -417,10 +417,13 @@ ApplicationWindow {
             }
         }
 
-        // ---- 右侧预览面板（仅 wide）----
+        // ---- 右侧预览面板（仅 wide **且** 在文件页）----
+        // 预览跟随文件页的选中项；切到其它页面时整个面板隐藏，
+        // 既避免"非文件页显示一个空预览壳"，也给页面腾出宽度。
+        // （FilesPage 在不可见时已 clearPreview()，这里只是把面板本身也收掉，二者一致。）
         PreviewPanel {
             id: previewPanel
-            visible: window.wide
+            visible: window.wide && window.navIndex === window.pageFiles
             Layout.preferredWidth: Theme.sidePanelWidth
             Layout.fillHeight: true
         }
