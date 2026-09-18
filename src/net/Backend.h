@@ -49,6 +49,16 @@ public:
     virtual Ok                        setTags(const QString &id, const QStringList &tagIds) = 0;
 
     // ---------------- 传输（分块 / 秒传 / 断点续传）----------------
+    // 上传同名文件时是否覆盖（对"整文件上传"与"分块 init"均生效）。默认 false。
+    // 加法式接口：带默认实现，对既有实现（MockBackend）零破坏。
+    // 约定：只对随后的一次上传生效，用后由调用方复位（如 TransferManager 在
+    //       用户选择"覆盖"后置真、发起上传后置假）。
+    virtual void setUploadOverwrite(bool enabled) { (void)enabled; }
+
+    // 分块上传的块大小（字节）——唯一来源：上层据此推导 offset→seq，禁止硬编码。
+    // 加法式接口：带默认实现，对既有实现零破坏。默认 5 MiB。
+    virtual qint64 chunkSize() const { return 5 * 1024 * 1024; }
+
     virtual Result<UploadTicket> beginUpload(const QString &parentId, const QString &name,
                                              qint64 size, const QString &sha256) = 0;
     virtual Ok                   putChunk(const QString &uploadId, qint64 offset,

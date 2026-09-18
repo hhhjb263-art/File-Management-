@@ -90,3 +90,18 @@ CMakeLists.txt.user*
 
 # 临时调试残渣（语法检查/探针输出，勿入仓库）
 /_*
+# 正式客户端（qmake）构建目录：中间产物按构建目录隔离，不入库
+build_official/
+build_verify/
+build_qa/
+build_qa2/
+build_now/
+# 旧 Qt 原型（src/ 之前的 File.pro 工程）遗留产物
+
+# 测试客户端退役存档（tag: archive/test-client-2026-09-18）
+
+# 构建产物（qmake/cmake 输出，不入库）
+build/
+bin/
+client/build*/
+output/

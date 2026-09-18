@@ -28,12 +28,14 @@ DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000
 # 统一的头文件搜索路径
 INCLUDEPATH += $$PWD/src
 
-# 中间产物目录，保持仓库根目录整洁
-OBJECTS_DIR  = $$PWD/build/obj
-MOC_DIR      = $$PWD/build/moc
-RCC_DIR      = $$PWD/build/rcc
-UI_DIR       = $$PWD/build/ui
-QMLCACHE_DIR = $$PWD/build/qmlcache
+# 中间产物目录：必须按「构建目录」隔离（$$OUT_PWD），否则多个构建目录（build_official /
+# build_qa / 任意新目录）会共用同一批 .o 与 moc，导致"看起来重新构建、其实只是重链"——
+# 这会掩盖真实编译错误，让验证假绿。DESTDIR 仍指向源码树的 bin/（保持产物位置唯一可预期）。
+OBJECTS_DIR  = $$OUT_PWD/build/obj
+MOC_DIR      = $$OUT_PWD/build/moc
+RCC_DIR      = $$OUT_PWD/build/rcc
+UI_DIR       = $$OUT_PWD/build/ui
+QMLCACHE_DIR = $$OUT_PWD/build/qmlcache
 
 win32 {
     QMAKE_TARGET_PRODUCT   = "云匣 CloudVault"

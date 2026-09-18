@@ -1,0 +1,41 @@
+<RCC>
+    <qresource prefix="/">
+        <!-- 主窗口 -->
+        <file alias="qml/Main.qml">../qml/Main.qml</file>
+
+        <!-- 设计令牌单例（qmldir 必需：singleton 声明） -->
+        <file alias="qml/theme/Theme.qml">../qml/theme/Theme.qml</file>
+        <file alias="qml/theme/qmldir">../qml/theme/qmldir</file>
+
+        <!-- 复用控件 -->
+        <file alias="qml/controls/PrimaryButton.qml">../qml/controls/PrimaryButton.qml</file>
+        <file alias="qml/controls/SecondaryButton.qml">../qml/controls/SecondaryButton.qml</file>
+        <file alias="qml/controls/GhostButton.qml">../qml/controls/GhostButton.qml</file>
+        <file alias="qml/controls/DangerButton.qml">../qml/controls/DangerButton.qml</file>
+        <file alias="qml/controls/StatusBadge.qml">../qml/controls/StatusBadge.qml</file>
+        <file alias="qml/controls/EmptyState.qml">../qml/controls/EmptyState.qml</file>
+        <file alias="qml/controls/SectionCard.qml">../qml/controls/SectionCard.qml</file>
+        <file alias="qml/controls/SearchField.qml">../qml/controls/SearchField.qml</file>
+        <file alias="qml/controls/UnsupportedPage.qml">../qml/controls/UnsupportedPage.qml</file>
+
+        <!-- 页面 -->
+        <file alias="qml/pages/FilesPage.qml">../qml/pages/FilesPage.qml</file>
+        <file alias="qml/pages/TransfersPage.qml">../qml/pages/TransfersPage.qml</file>
+        <file alias="qml/pages/SettingsPage.qml">../qml/pages/SettingsPage.qml</file>
+        <file alias="qml/pages/SharesPage.qml">../qml/pages/SharesPage.qml</file>
+        <file alias="qml/pages/TagsPage.qml">../qml/pages/TagsPage.qml</file>
+        <file alias="qml/pages/TrashPage.qml">../qml/pages/TrashPage.qml</file>
+        <file alias="qml/pages/VersionsPage.qml">../qml/pages/VersionsPage.qml</file>
+
+        <!-- 对话框 -->
+        <file alias="qml/dialogs/NewFileDialog.qml">../qml/dialogs/NewFileDialog.qml</file>
+        <file alias="qml/dialogs/RenameDialog.qml">../qml/dialogs/RenameDialog.qml</file>
+        <file alias="qml/dialogs/DeleteConfirmDialog.qml">../qml/dialogs/DeleteConfirmDialog.qml</file>
+        <file alias="qml/dialogs/OverwriteDialog.qml">../qml/dialogs/OverwriteDialog.qml</file>
+        <file alias="qml/dialogs/CertPinDialog.qml">../qml/dialogs/CertPinDialog.qml</file>
+        <file alias="qml/dialogs/AboutDialog.qml">../qml/dialogs/AboutDialog.qml</file>
+
+        <!-- 控件风格配置 -->
+        <file alias="qtquickcontrols2.conf">qtquickcontrols2.conf</file>
+    </qresource>
+</RCC>

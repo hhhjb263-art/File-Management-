@@ -40,7 +40,8 @@ Settings::Settings(QObject *parent)
     : QObject(parent)
     , m_settings(AppPaths::settingsFile(), QSettings::IniFormat)
 {
-    m_settings.setIniCodec("UTF-8");
+    // Qt6 的 QSettings 已移除 setIniCodec()：INI 文件一律按 UTF-8 处理，
+    // 且此处构造时已显式指定 QSettings::IniFormat，无需再做编码设置。
 }
 
 Settings &Settings::instance()
