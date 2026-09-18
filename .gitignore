@@ -105,3 +105,4 @@ build/
 bin/
 client/build*/
 output/
+bin_shot/

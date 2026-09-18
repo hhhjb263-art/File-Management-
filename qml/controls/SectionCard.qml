@@ -18,13 +18,18 @@ Rectangle {
     property bool showHeaderDivider: true
     default property alias contentData: body.data
 
-    implicitWidth: 260
+    // ⚠️ 关键：卡片高度/宽度必须由「内容」决定。
+    // 若只给 implicitWidth 而不给 implicitHeight，内部 anchors.fill 的布局会被压进
+    // 一个不确定的高度里 —— 表现就是设置页里各选项互相重叠（此前的缺陷根因）。
+    implicitWidth: rootLayout.implicitWidth + Theme.spaceL * 2
+    implicitHeight: rootLayout.implicitHeight + Theme.spaceL * 2
     radius: Theme.radiusCard
     color: Theme.card
     border.width: 1
     border.color: Theme.border
 
     ColumnLayout {
+        id: rootLayout
         anchors.fill: parent
         anchors.margins: Theme.spaceL
         spacing: Theme.spaceM
@@ -67,7 +72,6 @@ Rectangle {
         ColumnLayout {
             id: body
             Layout.fillWidth: true
-            Layout.fillHeight: true
             spacing: Theme.spaceM
         }
     }

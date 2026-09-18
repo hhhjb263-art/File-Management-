@@ -645,6 +645,13 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        // 自检钩子：CV_START_PAGE 指定初始页（未设置时保持默认页，无副作用）
+        if (typeof CvStartPage !== "undefined" && String(CvStartPage).length > 0) {
+            const map = { "files": 0, "transfers": 1, "settings": 6 }
+            const v = map[String(CvStartPage).toLowerCase()]
+            if (v !== undefined)
+                window.navIndex = v
+        }
         Files.refresh()
         Stats.refresh()
     }

@@ -196,9 +196,16 @@ Item {
                     spacing: Theme.spaceS
 
                     // ---- 协议 / 主机 / 端口 ----
+                    // 固定 2 列（左：标签 右：控件），并给标签/控件显式最小尺寸。
+                    // 说明：原先写的是 `columns: page.twoColumn ? 6 : 1`，把 3 个标签与 3 个控件
+                    // 混排进「列数随宽度变化」的网格里，布局意图难以预测、窄容器下行为很不稳定。
+                    // 注意：本次「控件看不见」的真正原因**不是**布局塌陷（实测控件几何完全正常，
+                    // 700x36），而是样式调色板为深色导致文字/底色与白色卡片同色 —— 修复见
+                    // src/app/main.cpp 的 setColorScheme(Light) + setPalette()。这里改成固定 2 列
+                    // 是为了让布局具备确定性，与颜色问题无关。
                     GridLayout {
                         Layout.fillWidth: true
-                        columns: page.twoColumn ? 6 : 1
+                        columns: 2
                         columnSpacing: Theme.spaceM
                         rowSpacing: Theme.spaceS
 
@@ -206,11 +213,14 @@ Item {
                             text: qsTr("协议")
                             color: Theme.textSecondary
                             font.pointSize: Theme.fontBody
+                            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                            Layout.minimumWidth: 72
                         }
                         ComboBox {
                             id: protoBox
-                            Layout.preferredWidth: page.twoColumn ? 110 : -1
-                            Layout.fillWidth: !page.twoColumn
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 120
+                            Layout.preferredHeight: Theme.controlHeight
                             implicitHeight: Theme.controlHeight
                             font.pointSize: Theme.fontBody
                             model: ["http", "https"]
@@ -229,10 +239,13 @@ Item {
                             text: qsTr("主机 / IP")
                             color: Theme.textSecondary
                             font.pointSize: Theme.fontBody
+                            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
                         }
                         TextField {
                             id: hostField
                             Layout.fillWidth: true
+                            Layout.minimumWidth: 120
+                            Layout.preferredHeight: Theme.controlHeight
                             implicitHeight: Theme.controlHeight
                             font.pointSize: Theme.fontBody
                             placeholderText: qsTr("192.168.185.231 或 example.com")
@@ -249,11 +262,13 @@ Item {
                             text: qsTr("端口")
                             color: Theme.textSecondary
                             font.pointSize: Theme.fontBody
+                            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
                         }
                         TextField {
                             id: portField
-                            Layout.preferredWidth: page.twoColumn ? 110 : -1
-                            Layout.fillWidth: !page.twoColumn
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 120
+                            Layout.preferredHeight: Theme.controlHeight
                             implicitHeight: Theme.controlHeight
                             font.pointSize: Theme.fontBody
                             placeholderText: page.defaultPortFor(page.proto)
@@ -313,6 +328,8 @@ Item {
                         TextField {
                             id: tokenField
                             Layout.fillWidth: true
+                            Layout.minimumWidth: 160
+                            Layout.preferredHeight: Theme.controlHeight
                             implicitHeight: Theme.controlHeight
                             font.pointSize: Theme.fontBody
                             echoMode: page.tokenVisible ? TextInput.Normal : TextInput.Password
