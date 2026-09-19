@@ -183,7 +183,9 @@ int shareAccessStatus(const cv::Share& s, const std::string& providedCode,
 // headers 的 key 已转小写（见 Request::headers 注释），但 value 仍可能大小写混合，
 // 故对 value 统一转小写再比对。客户端显式发 "Accept: application/json"（不含 text/html），
 // 不会命中落地页，对既有 JSON/附件行为零影响。
-bool acceptHtml(const net::Request& req) {
+// ⚠️ 本函数位于**全局匿名命名空间**（本文件 :64 打开），不在 `cv` 内、也早于 `:721` 的
+//    `using namespace cv;`，故 `net` 必须写成 **`cv::net`**（照同段 cv::net::constantTimeEqual 的写法）。
+bool acceptHtml(const cv::net::Request& req) {
   std::string a = req.header("accept");
   std::string low;
   low.reserve(a.size());
