@@ -194,6 +194,17 @@ Item {
             Transfers.download([item.fid], "")
     }
 
+    // 由 id 反查名称（右键菜单「分享…」需要把「唯一选中项」的 name 传给对话框）
+    function nameForId(id) {
+        const n = proxyModel.count
+        for (let i = 0; i < n; ++i) {
+            const it = proxyModel.get(i)
+            if (it && String(it.fid) === String(id))
+                return String(it.name)
+        }
+        return ""
+    }
+
     // ------------------------------------------------------------------
     //  过滤视图（QML 侧，不改动 C++ 模型；模型仍负责真实排序）
     // ------------------------------------------------------------------
@@ -663,6 +674,16 @@ Item {
             enabled: !page.ctxIsDir
             onTriggered: Transfers.download([page.ctxId], "")
         }
+        MenuItem {
+            // 新建分享的唯一入口（分享页只管理已有分享）
+            text: "🔗  " + qsTr("分享…")
+            // 仅当「恰好选中 1 项」时可用：0 个 / 多选 → 禁用
+            enabled: page.selectedIds.length === 1
+            onTriggered: {
+                const id = page.selectedIds[0]
+                shareDialog.openFor(id, page.nameForId(id))
+            }
+        }
 
         MenuSeparator { }
 
@@ -753,6 +774,11 @@ Item {
     DeleteConfirmDialog {
         id: deleteDialog
         onConfirmed: (id) => Files.remove(id)
+    }
+
+    // 新建分享（右键「分享…」入口）
+    ShareDialog {
+        id: shareDialog
     }
 
     FileDialog {

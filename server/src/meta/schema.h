@@ -103,6 +103,22 @@ CREATE TABLE IF NOT EXISTS upload_flags (
   upload_id INTEGER PRIMARY KEY,
   overwrite INTEGER NOT NULL DEFAULT 0
 );
+
+-- 分享链接：公开下载端点 /s/:token 免鉴权，故提取码(code_hash)绝不明文存储。
+-- code_hash = sha256(token + ":" + code)；code 为空 ⇒ need_code=false、code_hash=''。
+-- expires_at / created_at 均为 Unix 毫秒，0 表示"永久"；max_downloads=0 表示不限次数。
+-- downloads 在"开始回内容之前"自增，先判 max_downloads 再累加，避免"用尽还能下最后一发"。
+CREATE TABLE IF NOT EXISTS shares (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  token         TEXT UNIQUE NOT NULL,
+  file_id       INTEGER NOT NULL,
+  code_hash     TEXT NOT NULL DEFAULT '',
+  expires_at    INTEGER NOT NULL DEFAULT 0,
+  max_downloads INTEGER NOT NULL DEFAULT 0,
+  downloads     INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shares_token ON shares(token);
 )SQL";
 
 }  // namespace cv

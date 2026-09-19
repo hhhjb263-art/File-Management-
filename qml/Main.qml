@@ -45,6 +45,10 @@ ApplicationWindow {
 
     property int navIndex: pageFiles
 
+    // 证书指纹不匹配去抖：同一 hostPort 只弹一次（并发请求可能多次触发）。
+    // 用户「清除记录并重新信任」后对该 host 复位，便于后续新的证书变更再次提示。
+    property var certMismatchSeen: ({})
+
     // ---- 顶部通知条 ----
     property string toastText: ""
     property bool toastOk: true
@@ -69,7 +73,7 @@ ApplicationWindow {
     readonly property var navItems: [
         { label: qsTr("文件"),   glyph: "🗂", supported: true },
         { label: qsTr("传输"),   glyph: "⇅",  supported: true },
-        { label: qsTr("分享"),   glyph: "🔗", supported: false },
+        { label: qsTr("分享"),   glyph: "🔗", supported: true },
         { label: qsTr("标签"),   glyph: "🏷", supported: false },
         { label: qsTr("回收站"), glyph: "🗑", supported: false },
         { label: qsTr("版本"),   glyph: "🕘", supported: false },
@@ -480,7 +484,7 @@ ApplicationWindow {
     Menu {
         id: compactMoreMenu
         width: 220
-        MenuItem { text: "🔗  " + qsTr("分享（暂不支持）"); enabled: false }
+        MenuItem { text: "🔗  " + qsTr("分享"); onTriggered: window.navIndex = window.pageShares }
         MenuItem { text: "🏷  " + qsTr("标签（暂不支持）"); enabled: false }
         MenuItem { text: "🗑  " + qsTr("回收站（暂不支持）"); enabled: false }
         MenuItem { text: "🕘  " + qsTr("版本（暂不支持）"); enabled: false }
@@ -508,6 +512,20 @@ ApplicationWindow {
 
     AboutDialog { id: aboutDialog }
 
+    // 证书指纹不匹配（连接已被拒绝）→ 明确的提示与恢复路径。
+    // 恢复动作由 Main 代为实现（对话框不直接引用 filesPage / 导航）。
+    CertMismatchDialog {
+        id: certMismatchDialog
+        onClearAndRetryRequested: {
+            const hp = certMismatchDialog.hostPort
+            if (hp.length > 0)
+                window.certMismatchSeen[hp] = false   // 允许后续新的证书变更再次提示
+            window.showToast(qsTr("已清除该主机指纹记录，正在重新连接…"), true)
+            filesPage.refreshNow()
+        }
+        onOpenSettingsRequested: window.navIndex = window.pageSettings
+    }
+
     // ==================================================================
     //  全局信号接线
     // ==================================================================
@@ -515,6 +533,24 @@ ApplicationWindow {
         target: App
         function onTrustPromptRequested(hostPort, fingerprint, subject, issuer, validity) {
             certPinDialog.openFor(hostPort, fingerprint, subject, issuer, validity)
+        }
+    }
+
+    // 证书指纹不匹配：连接已被拒绝、不会自动重试；给出新旧指纹对照与恢复路径。
+    // ⚠️ `App.certPinMismatch` 可能尚未落地（C++ 运行时解析）→ ignoreUnknownSignals
+    //    静默跳过未知信号，加载期不刷错误；落地后自动接线。
+    // 去抖：同一 hostPort 仅弹一次，避免并发请求造成弹窗风暴。
+    Connections {
+        target: (typeof App !== "undefined") ? App : null
+        ignoreUnknownSignals: true
+        function onCertPinMismatch(hostPort, expectedFingerprint, actualFingerprint,
+                                   subject, issuer, validity) {
+            const hp = String(hostPort)
+            if (window.certMismatchSeen[hp] === true)
+                return
+            window.certMismatchSeen[hp] = true
+            certMismatchDialog.openFor(hp, expectedFingerprint, actualFingerprint,
+                                       subject, issuer, validity)
         }
     }
 
@@ -569,7 +605,8 @@ ApplicationWindow {
     Component.onCompleted: {
         // 自检钩子：CV_START_PAGE 指定初始页（未设置时保持默认页，无副作用）
         if (typeof CvStartPage !== "undefined" && String(CvStartPage).length > 0) {
-            const map = { "files": 0, "transfers": 1, "settings": 6 }
+            const map = { "files": 0, "transfers": 1, "shares": 2, "tags": 3,
+                          "trash": 4, "versions": 5, "settings": 6 }
             const v = map[String(CvStartPage).toLowerCase()]
             if (v !== undefined)
                 window.navIndex = v

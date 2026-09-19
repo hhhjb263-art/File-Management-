@@ -114,6 +114,32 @@ public:
     {
         done(getRange(fileId, offset, length));
     }
+
+    // 分享链接的异步变体（默认退化同步；HttpBackend 覆写为真异步，不阻塞主线程）。
+    virtual void sharesAsync(std::function<void(Result<QVector<ShareLink>>)> done) { done(shares()); }
+    virtual void createShareAsync(const QString &fileId, const QString &code, int expireDays,
+                                  int maxDownloads,
+                                  std::function<void(Result<ShareLink>)> done)
+    {
+        done(createShare(fileId, code, expireDays, maxDownloads));
+    }
+    virtual void revokeShareAsync(const QString &shareId, std::function<void(Ok)> done)
+    {
+        done(revokeShare(shareId));
+    }
+
+signals:
+    // 证书指纹与已固定记录不一致（疑似中间人，或用户更换了服务端证书）。
+    // ⚠️ 此刻连接**已被 fail-closed 拒绝**、且**不会自动重试** —— 界面须提示用户并给出恢复路径
+    //    （QML：`App.onCertPinMismatch(...)` → 对话框 →「清除记录并重新信任」→
+    //     `App.clearPinnedFingerprint()` → 用户重试）。
+    // 由 HttpBackend 在 applyCertPinning 的"指纹不一致"分支发出；首次连接（无记录）走确认框，不发此信号。
+    void certPinMismatch(const QString &hostPort,
+                         const QString &expectedFingerprint,  // 已固定的（旧）
+                         const QString &actualFingerprint,    // 本次收到的（新）
+                         const QString &subject,
+                         const QString &issuer,
+                         const QString &validity);
 };
 
 } // namespace cv

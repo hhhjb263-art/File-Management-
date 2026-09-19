@@ -62,6 +62,12 @@ std::string toLower(std::string s) {
   return s;
 }
 
+// 判断 path 是否以 prefix 开头（用于鉴权白名单放行公开分享端点 /s/）。
+bool startsWith(const std::string& s, const std::string& prefix) {
+  return !prefix.empty() && s.size() >= prefix.size() &&
+         s.compare(0, prefix.size(), prefix) == 0;
+}
+
 std::vector<std::string> splitPath(const std::string& path) {
   std::vector<std::string> out;
   std::string cur;
@@ -76,6 +82,14 @@ std::vector<std::string> splitPath(const std::string& path) {
   if (!cur.empty()) out.push_back(cur);
   return out;
 }
+
+HttpServer* g_server = nullptr;
+
+void onSignal(int) {
+  if (g_server) g_server->shutdown();
+}
+
+}  // namespace
 
 // 恒定时间字符串比较（防时序侧信道）：
 //   1) 比较上界取 max(len_a, len_b)，逐字节异或累加；
@@ -97,14 +111,6 @@ bool constantTimeEqual(const std::string& a, const std::string& b) {
   }
   return diff == 0;
 }
-
-HttpServer* g_server = nullptr;
-
-void onSignal(int) {
-  if (g_server) g_server->shutdown();
-}
-
-}  // namespace
 
 void Response::setJson(int code, const std::string& json) {
   status = code;
@@ -324,7 +330,37 @@ void HttpServer::acceptLoop(int listenFd, bool isTls) {
     if (isTls && sslCtx_) {
       SSL* ssl = SSL_new(static_cast<SSL_CTX*>(sslCtx_));
       if (!ssl || SSL_set_fd(ssl, fd) != 1 || SSL_accept(ssl) != 1) {
-        CV_LOG_WARN(std::string("TLS 握手失败，拒绝连接"));
+        // 记录**可诊断**的原因。只写一句「握手失败」等于没写：排查时无法区分
+        //   · 对端用明文 http:// 打了 TLS 端口（OpenSSL 会报 wrong version number / http request）
+        //   · 客户端证书指纹固定不匹配 → 对端主动断开（common，客户端 TOFU 防中间人）
+        //   · 协议版本 / 密码套件不匹配
+        // 故把 OpenSSL 错误串（可能多条，最具体的在最前）与对端地址一并记下。
+        std::string opensslErr;
+        for (int i = 0; i < 4; ++i) {
+          const unsigned long e = ERR_get_error();
+          if (e == 0) break;
+          char buf[256] = {0};
+          ERR_error_string_n(e, buf, sizeof(buf));
+          if (!opensslErr.empty()) opensslErr += "; ";
+          opensslErr += buf;
+        }
+        std::string peer = "unknown";
+        sockaddr_storage ss{};
+        socklen_t slen = sizeof(ss);
+        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&ss), &slen) == 0) {
+          char host[64] = {0};
+          if (ss.ss_family == AF_INET) {
+            const sockaddr_in* in4 = reinterpret_cast<const sockaddr_in*>(&ss);
+            if (::inet_ntop(AF_INET, &in4->sin_addr, host, sizeof(host))) peer = host;
+          } else if (ss.ss_family == AF_INET6) {
+            const sockaddr_in6* in6 = reinterpret_cast<const sockaddr_in6*>(&ss);
+            if (::inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host)))
+              peer = std::string("[") + host + "]";
+          }
+        }
+        std::string msg = std::string("TLS 握手失败，拒绝连接 [peer=") + peer + "]";
+        if (!opensslErr.empty()) msg += std::string(" [openssl=") + opensslErr + "]";
+        CV_LOG_WARN(msg);
         if (ssl) SSL_free(ssl);
         ::close(fd);
         continue;
@@ -387,8 +423,11 @@ void HttpServer::handleClient(const Conn& conn) {
       // 协议面：仅支持 Content-Length 定长帧，显式拒绝 chunked，防前置反代场景的请求走私
       resp.setError(501, "Transfer-Encoding: chunked is not supported; use Content-Length");
       keepAlive = false;
-    } else if (!authToken_.empty() && req.path != "/healthz" && !authorized(req)) {
-      // 启用鉴权且非探活接口：缺 Token 或不匹配 → 401（JSON 说明原因，恒定时间比较），不 dispatch
+    } else if (!authToken_.empty() && req.path != "/healthz" &&
+               !startsWith(req.path, "/s/") && !authorized(req)) {
+      // 启用鉴权且非豁免接口：/healthz 与公开分享端点 /s/* 免鉴权（分享链接本就面向匿名访问）；
+      // 其余接口缺 Token 或不匹配 → 401（JSON 说明原因，恒定时间比较），不 dispatch。
+      // 注意：仅放行 /s/ 前缀，绝不放宽 /api/ 下任何路径。
       resp.setError(401, "missing or invalid Authorization token (use: Authorization: Bearer <token>)");
       keepAlive = false;  // 鉴权失败 → 关闭
     } else if (!dispatch(req, resp)) {

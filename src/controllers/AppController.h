@@ -90,6 +90,13 @@ signals:
     void autoRefreshChanged();
     void autoRefreshIntervalChanged();
     void downloadDirChanged();
+    // 证书指纹与已固定记录不一致（连接已被 fail-closed 拒绝，不会自动重试）。
+    // QML 侧：`Connections { target: App; function onCertPinMismatch(...) { … } }`
+    // → 弹「服务器证书已变更」对话框；用户显式确认后用 `App.clearPinnedFingerprint()`
+    // 清除记录（下次连接重新走 TOFU 确认），再重试。
+    void certPinMismatch(const QString &hostPort, const QString &expectedFingerprint,
+                         const QString &actualFingerprint, const QString &subject,
+                         const QString &issuer, const QString &validity);
 
     // 首次连接自签名服务器时请求人工确认（QML CertPinDialog 处理）
     void trustPromptRequested(const QString &hostPort,

@@ -72,6 +72,13 @@ AppController::AppController(Backend *backend, QObject *parent)
     applyBackendConfig();  // 立即同步到后端，QML 改完即生效
     installTrustPrompt();  // 契约 §8.3
 
+    // 指纹不匹配（换了服务端证书 / 疑似中间人）→ 原样转发给 QML。
+    // 此前该情形在 HttpBackend 里静默失败（fail-closed 但界面无感），
+    // 用户只能自己猜；转发后界面会弹「服务器证书已变更」并提供「清除记录并重新信任」。
+    if (m_backend)
+        QObject::connect(m_backend, &Backend::certPinMismatch,
+                         this, &AppController::certPinMismatch);
+
     m_statusText = m_backend ? QStringLiteral("就绪") : QStringLiteral("未配置数据源");
 }
 
