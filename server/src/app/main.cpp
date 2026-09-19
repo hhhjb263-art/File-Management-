@@ -21,12 +21,19 @@
 //   PUT  /api/v1/uploads/:id/chunk/:seq  上传单个分块（幂等）
 //   POST /api/v1/uploads/:id/complete     合并分块落库（落入 init 登记的目录）
 //   DELETE /api/v1/uploads/:id       取消会话
+//   POST /api/v1/shares             创建分享链接（body: file_id, code?, expire_days?, max_downloads?）
+//   GET  /api/v1/shares             列出分享（最新在前）
+//   DELETE /api/v1/shares/:id       撤销分享
+//   GET  /s/:token/meta            公开：分享元数据（免鉴权，?code= 提取码）
+//   GET  /s/:token                 公开：下载分享文件（免鉴权，支持 Range，?code= 提取码）
 //
 // 鉴权：--auth-token / CV_AUTH_TOKEN / auth_token 非空时启用 Bearer Token 鉴权，
-//   除 /healthz 外全接口强制 Authorization: Bearer；缺失/不匹配 → 401（恒定时间比较）。
+//   除 /healthz 与公开分享端点 /s/* 外全接口强制 Authorization: Bearer；缺失/不匹配 → 401（恒定时间比较）。
+//   公开分享端点 /s/ 面向匿名访问，故免鉴权（提取码由分享侧另行校验）。
 // 明文 HTTP：--http=on|off（默认 on）；off 时仅保留 HTTPS（须同时配置 TLS，否则启动报错）。
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -46,7 +53,9 @@
 #include "core/util.h"
 #include "meta/db.h"
 #include "meta/file_repository.h"
+#include "meta/share_repository.h"
 #include "meta/upload_repository.h"
+#include "app/share_page.h"
 #include "net/http_server.h"
 #include "store/content_store.h"
 
@@ -120,6 +129,74 @@ cv::json::Value parseJsonBody(const std::string& body, std::string& err) {
   if (body.empty()) return v;
   if (!cv::json::parse(body, v, err)) return v;
   return v;
+}
+
+// 把分享记录转为 JSON 对象（管理接口 201 / GET 列表共用，字段契约冻结）。
+// 注意：明文提取码 code 由调用方（仅创建路由）按需追加，不在此函数内——
+// 列表接口拿不到明文，加进来会暴露空 code 键、泄露设计意图，且契约冻结不允许列表出现该字段。
+cv::json::Value shareToJson(const cv::Share& s, const std::string& name,
+                            std::int64_t size) {
+  cv::json::Value v = cv::json::Value::object();
+  v.set("id", static_cast<long long>(s.id));
+  v.set("token", s.token);
+  v.set("file_id", static_cast<long long>(s.fileId));
+  v.set("name", name);
+  v.set("size", static_cast<long long>(size));
+  v.set("need_code", !s.codeHash.empty());
+  v.set("expires_at", static_cast<long long>(s.expiresAt));
+  v.set("max_downloads", static_cast<long long>(s.maxDownloads));
+  v.set("downloads", static_cast<long long>(s.downloads));
+  v.set("created_at", static_cast<long long>(s.createdAt));
+  v.set("path", "/s/" + s.token);
+  return v;
+}
+
+// 分享访问前置校验：顺序 404(调用方已查 token 存在) → 403(提取码) → 410(过期/用尽)。
+// 返回 0 表示通过；否则返回 HTTP 状态码并在 reason 填入中文说明。
+// 提取码以 sha256(token+":"+code) 与存储值做恒定时间比较，防时序侧信道。
+int shareAccessStatus(const cv::Share& s, const std::string& providedCode,
+                     std::string& reason) {
+  if (!s.codeHash.empty()) {
+    if (providedCode.empty()) {
+      reason = "需要提取码";
+      return 403;
+    }
+    std::string got = cv::Sha256::of(s.token + ":" + providedCode);
+    if (!cv::net::constantTimeEqual(got, s.codeHash)) {
+      reason = "提取码错误";
+      return 403;
+    }
+  }
+  std::int64_t now = cv::nowMillis();
+  if (s.expiresAt != 0 && now >= s.expiresAt) {
+    reason = "分享链接已过期";
+    return 410;
+  }
+  if (s.maxDownloads > 0 && s.downloads >= s.maxDownloads) {
+    reason = "下载次数已用尽";
+    return 410;
+  }
+  return 0;
+}
+
+// 浏览器内容协商：请求头 Accept 含 "text/html" 则返回 true。
+// headers 的 key 已转小写（见 Request::headers 注释），但 value 仍可能大小写混合，
+// 故对 value 统一转小写再比对。客户端显式发 "Accept: application/json"（不含 text/html），
+// 不会命中落地页，对既有 JSON/附件行为零影响。
+bool acceptHtml(const net::Request& req) {
+  std::string a = req.header("accept");
+  std::string low;
+  low.reserve(a.size());
+  for (char c : a) low.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  return low.find("text/html") != std::string::npos;
+}
+
+// 把分享访问状态码映射为落地页状态字符串（见 share_page.h::renderSharePage）。
+const char* pageStateFor(int st) {
+  if (st == 403) return "code";
+  if (st == 410) return "gone";
+  if (st == 404) return "missing";
+  return "ok";
 }
 
 // 校验 64 位十六进制哈希串
@@ -704,6 +781,7 @@ int main(int argc, char** argv) {
 
   FileRepository repo(db);
   UploadRepository up(db);
+  ShareRepository shr(db);
   net::HttpServer server;
 
   // 启用 API Bearer Token 鉴权（空 = 不启用，向后兼容）
@@ -1218,7 +1296,8 @@ int main(int argc, char** argv) {
   });
 
   // ---- GET /api/v1/tree （嵌套文件树，供客户端文件树选择对话框）----
-  // 不鉴权、不分页；从 dir_node + file_node/file_dir 在内存按路径段建树，
+  // 受全局鉴权保护（白名单仅豁免 /healthz，本接口需有效 Bearer 令牌）；
+  // 不分页；从 dir_node + file_node/file_dir 在内存按路径段建树，
   // 目录在前文件在后、同类 name 升序；空目录以 children:[] 出现；路径为规范化相对路径（'/' 分隔）。
   server.route("GET", "/api/v1/tree", [&](const net::Request&, net::Response& resp) {
     std::string err;
@@ -1662,6 +1741,275 @@ int main(int argc, char** argv) {
                  CV_LOG_INFO("取消会话 upload_id=" << id);
                });
 
+  // ================= 分享链接（管理接口需鉴权；公开端点 /s/* 免鉴权） =================
+
+  // ---- POST /api/v1/shares （需鉴权）----
+  // body: {"file_id":<id>,"code":<可空>,"expire_days":<int,0=永久>,"max_downloads":<int,0=不限>}
+  server.route("POST", "/api/v1/shares", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    cv::json::Value body = parseJsonBody(req.body, perr);
+    if (!perr.empty()) {
+      resp.setError(400, "invalid json: " + perr);
+      return;
+    }
+    // file_id：兼容数字与字符串两种形态
+    const auto* fidV = body.find("file_id");
+    std::int64_t fileId = 0;
+    bool haveFileId = false;
+    if (fidV) {
+      if (fidV->type() == cv::json::Value::Type::Number) {
+        fileId = static_cast<std::int64_t>(fidV->numberValue());
+        haveFileId = true;
+      } else if (fidV->type() == cv::json::Value::Type::String) {
+        haveFileId = parseId(fidV->stringValue(), fileId);
+      }
+    }
+    if (!haveFileId || fileId <= 0) {
+      resp.setError(400, "missing or invalid file_id");
+      return;
+    }
+    cv::FileRow frow;
+    if (!repo.findById(fileId, frow, perr)) {
+      resp.setError(404, "file not found");  // 文件不存在
+      return;
+    }
+    std::string code = body.find("code") ? body.find("code")->stringValue() : "";
+    std::int64_t expireDays = 0, maxDownloads = 0;
+    if (const auto* ed = body.find("expire_days")) expireDays = static_cast<std::int64_t>(ed->numberValue());
+    if (const auto* md = body.find("max_downloads")) maxDownloads = static_cast<std::int64_t>(md->numberValue());
+    if (expireDays < 0 || maxDownloads < 0) {
+      resp.setError(400, "expire_days / max_downloads must be >= 0");
+      return;
+    }
+    // token：系统随机源（randomHex(16) → 32 位十六进制），绝不用 rand()/时间戳
+    std::string token = cv::randomHex(16);
+    // 提取码不存明文：code_hash = sha256(token + ":" + code)；空 code ⇒ 空串（need_code=false）
+    std::string codeHash = cv::shareCodeHash(token, code);
+
+    cv::Share s;
+    if (!shr.create(fileId, codeHash, expireDays, maxDownloads, token, s, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    cv::json::Value v = shareToJson(s, frow.name, frow.size);
+    // 明文提取码**仅在此 201 响应回显一次**（库中只存 sha256(token+":"+code)，列表接口无法也不应回显）
+    v.set("code", code);
+    resp.setJson(201, cv::json::dump(v));
+    CV_LOG_INFO("创建分享 id=" << s.id << " file_id=" << fileId << " token=" << token
+                               << (code.empty() ? " [无提取码]" : " [有提取码]"));
+  });
+
+  // ---- GET /api/v1/shares （需鉴权，最新在前）----
+  server.route("GET", "/api/v1/shares", [&](const net::Request&, net::Response& resp) {
+    std::string perr;
+    std::vector<cv::Share> items;
+    if (!shr.listAll(items, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    cv::json::Value arr = cv::json::Value::array();
+    for (const auto& s : items) {
+      cv::FileRow frow;
+      std::string ferr;
+      std::string name;
+      std::int64_t size = 0;
+      if (repo.findById(s.fileId, frow, ferr)) {
+        name = frow.name;
+        size = frow.size;
+      }
+      arr.push_back(shareToJson(s, name, size));
+    }
+    cv::json::Value v = cv::json::Value::object();
+    v.set("items", arr);
+    resp.setJson(200, cv::json::dump(v));
+  });
+
+  // ---- DELETE /api/v1/shares/:id （需鉴权）----
+  server.route("DELETE", "/api/v1/shares/:id", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    std::int64_t id = 0;
+    if (!parseId(req.param("id"), id)) {
+      resp.setError(404, "share not found");
+      return;
+    }
+    cv::Share s;
+    bool found = false;
+    if (!shr.findById(id, s, found, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    if (!found) {
+      resp.setError(404, "share not found");  // 不存在/已撤销
+      return;
+    }
+    if (!shr.removeById(id, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    cv::json::Value v = cv::json::Value::object();
+    v.set("ok", true);
+    resp.setJson(200, cv::json::dump(v));
+    CV_LOG_INFO("撤销分享 id=" << id);
+  });
+
+  // ---- GET /s/:token/meta （公开，免鉴权）----
+  // 顺序：404(token) → 403(提取码) → 410(过期/用尽) → 200
+  // 内容协商：Accept 含 text/html（浏览器）→ 返回 HTML 落地页；否则保持既有 JSON 不变
+  //（客户端显式发 Accept: application/json，不含 text/html，不会命中落地页，零影响）。
+  server.route("GET", "/s/:token/meta", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    cv::Share s;
+    bool found = false;
+    if (!shr.findByToken(req.param("token"), s, found, perr)) {
+      if (acceptHtml(req)) {
+        resp.setBinary(500, cv::share_page::renderSharePage(req.param("token"), "missing", "",
+                            0, 0, 0, 0, "", "服务端内部错误"), "text/html; charset=utf-8");
+        return;
+      }
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    if (!found) {
+      if (acceptHtml(req)) {
+        resp.setBinary(404, cv::share_page::renderSharePage(req.param("token"), "missing", "",
+                            0, 0, 0, 0, "", "分享链接不存在或已撤销"), "text/html; charset=utf-8");
+        return;
+      }
+      resp.setError(404, "分享链接不存在或已撤销");
+      return;
+    }
+    // 复用既有 queryParam()（本文件统一入口），并补 URL 解码：提取码若含需转义字符也能正确比对。
+    std::string providedCode = cv::util::urlDecode(queryParam(req.query, "code"));
+    std::string reason;
+    int st = shareAccessStatus(s, providedCode, reason);
+    if (st != 0) {
+      if (acceptHtml(req)) {
+        resp.setBinary(st, cv::share_page::renderSharePage(s.token, pageStateFor(st), "", 0,
+                            s.expiresAt, s.maxDownloads, s.downloads, "",
+                            reason), "text/html; charset=utf-8");
+        return;
+      }
+      resp.setError(st, reason);  // 403 提取码错误/缺失；410 已过期/次数用尽
+      return;
+    }
+    cv::FileRow frow;
+    if (!repo.findById(s.fileId, frow, perr)) {
+      if (acceptHtml(req)) {
+        resp.setBinary(404, cv::share_page::renderSharePage(s.token, "missing", "", 0, 0, 0, 0,
+                            "", "文件不存在"), "text/html; charset=utf-8");
+        return;
+      }
+      resp.setError(404, "文件不存在");
+      return;
+    }
+    if (acceptHtml(req)) {
+      // 浏览器：返回落地页（含文件名/大小/有效期/剩余次数 + 下载按钮）；不消耗下载次数。
+      resp.setBinary(200, cv::share_page::renderSharePage(s.token, "ok", frow.name, frow.size,
+                          s.expiresAt, s.maxDownloads, s.downloads, providedCode, ""),
+                     "text/html; charset=utf-8");
+      return;
+    }
+    cv::json::Value v = cv::json::Value::object();
+    v.set("name", frow.name);
+    v.set("size", static_cast<long long>(frow.size));
+    v.set("need_code", !s.codeHash.empty());
+    v.set("expires_at", static_cast<long long>(s.expiresAt));
+    v.set("max_downloads", static_cast<long long>(s.maxDownloads));
+    v.set("downloads", static_cast<long long>(s.downloads));
+    v.set("expired", (s.expiresAt != 0 && cv::nowMillis() >= s.expiresAt));
+    v.set("exhausted", (s.maxDownloads > 0 && s.downloads >= s.maxDownloads));
+    resp.setJson(200, cv::json::dump(v));
+  });
+
+  // ---- GET /s/:token （公开，免鉴权，支持 Range，复用 serveFileContent）----
+  // 顺序：404(token) → 403(提取码) → 410(过期/用尽) → 落地页/计数+1 → 回内容
+  // 内容协商：Accept 含 text/html（浏览器）→ 返回 HTML 落地页（?dl=1 显式下载除外）；
+  //          否则保持既有附件下载行为不变（客户端发 Accept: application/json，零影响）。
+  server.route("GET", "/s/:token", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    cv::Share s;
+    bool found = false;
+    // 410（已过期 / 次数用尽）统一出口：HTML 落地页分支与 JSON 分支行为一致，
+    // 供“预检 410”与“并发用尽 410”两处复用，避免复制两份 410 代码。
+    auto sendGone = [&](const std::string& reason) {
+      if (acceptHtml(req)) {
+        resp.setBinary(410, cv::share_page::renderSharePage(s.token, "gone", "", 0,
+                            s.expiresAt, s.maxDownloads, s.downloads, "", reason),
+                       "text/html; charset=utf-8");
+        return;
+      }
+      resp.setError(410, reason);
+    };
+    if (!shr.findByToken(req.param("token"), s, found, perr)) {
+      if (acceptHtml(req)) {
+        resp.setBinary(500, cv::share_page::renderSharePage(req.param("token"), "missing", "",
+                            0, 0, 0, 0, "", "服务端内部错误"), "text/html; charset=utf-8");
+        return;
+      }
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    if (!found) {
+      if (acceptHtml(req)) {
+        resp.setBinary(404, cv::share_page::renderSharePage(req.param("token"), "missing", "",
+                            0, 0, 0, 0, "", "分享链接不存在或已撤销"), "text/html; charset=utf-8");
+        return;
+      }
+      resp.setError(404, "分享链接不存在或已撤销");
+      return;
+    }
+    // 复用既有 queryParam()（本文件统一入口），并补 URL 解码：提取码若含需转义字符也能正确比对。
+    std::string providedCode = cv::util::urlDecode(queryParam(req.query, "code"));
+    std::string reason;
+    int st = shareAccessStatus(s, providedCode, reason);
+    if (st != 0) {
+      if (st == 410) { sendGone(reason); return; }  // 已过期 / 预检用尽，统一出口
+      // 403 提取码错误/缺失：HTML 表单态（reason 由 renderSharePage 内部转义，勿外层再转）
+      if (acceptHtml(req)) {
+        resp.setBinary(st, cv::share_page::renderSharePage(s.token, pageStateFor(st), "", 0,
+                            s.expiresAt, s.maxDownloads, s.downloads, "", reason),
+                       "text/html; charset=utf-8");
+        return;
+      }
+      resp.setError(st, reason);
+      return;
+    }
+    cv::FileRow frow;
+    if (!repo.findById(s.fileId, frow, perr)) {
+      if (acceptHtml(req)) {
+        resp.setBinary(404, cv::share_page::renderSharePage(s.token, "missing", "", 0, 0, 0, 0,
+                            "", "文件不存在"), "text/html; charset=utf-8");
+        return;
+      }
+      resp.setError(404, "文件不存在");
+      return;
+    }
+    // 浏览器落地页：?dl=1 为显式下载提示，跳过 HTML 直接回附件（见 share_page.h 说明）。
+    // 落地页本身不消耗下载次数；只有真正的附件下载（客户端 Accept: application/json 或 ?dl=1）才 downloads++。
+    bool wantRawDownload = (queryParam(req.query, "dl") == "1");
+    if (acceptHtml(req) && !wantRawDownload) {
+      resp.setBinary(200, cv::share_page::renderSharePage(s.token, "ok", frow.name, frow.size,
+                          s.expiresAt, s.maxDownloads, s.downloads, providedCode, ""),
+                     "text/html; charset=utf-8");
+      return;
+    }
+    // 以下为原有附件下载逻辑：开始回内容之前下载计数 +1。
+    // 条件自增（SQL 端原子判定），0 行受影响 = 已达上限 → 回 410（与预检 410 一致），绝不当成 DB 错误。
+    bool exhausted = false;
+    if (!shr.incrDownloads(s.id, perr, &exhausted)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    if (exhausted) {
+      sendGone("下载次数已用尽");
+      return;
+    }
+    // Content-Disposition：原文件名（UTF-8 百分号编码），触发浏览器下载
+    resp.extraHeaders["content-disposition"] =
+        "attachment; filename*=UTF-8''" + util::urlEncode(frow.name);
+    serveFileContent(repo, store, cfg, frow, req, resp);
+  });
+
   // 明文 HTTP 监听（可经 --http=off 关闭，仅保留 HTTPS）
   if (cfg.httpEnabled) {
     if (!server.listen(cfg.listenAddr, cfg.port, cfg.workers, err)) {
@@ -1671,7 +2019,7 @@ int main(int argc, char** argv) {
     CV_LOG_INFO("监听(明文) " << cfg.listenAddr << ":" << cfg.port << "  数据目录 " << cfg.dataDir
                              << "  工作线程 " << cfg.workers);
   } else {
-    CV_LOG_INFO("明文 HTTP 已按 --http=off 关闭，仅保留 HTTPS");
+    CV_LOG_INFO("明文 HTTP 已按 --http=off 关闭（HTTPS 是否成功启动见下方监听日志）");
   }
 
   // TLS 双模式：配置了 --tls-port 且证书/私钥齐全 → 额外开 HTTPS 监听（与 HTTP 并行）。

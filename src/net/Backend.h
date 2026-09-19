@@ -114,6 +114,19 @@ public:
     {
         done(getRange(fileId, offset, length));
     }
+
+    // 分享链接的异步变体（默认退化同步；HttpBackend 覆写为真异步，不阻塞主线程）。
+    virtual void sharesAsync(std::function<void(Result<QVector<ShareLink>>)> done) { done(shares()); }
+    virtual void createShareAsync(const QString &fileId, const QString &code, int expireDays,
+                                  int maxDownloads,
+                                  std::function<void(Result<ShareLink>)> done)
+    {
+        done(createShare(fileId, code, expireDays, maxDownloads));
+    }
+    virtual void revokeShareAsync(const QString &shareId, std::function<void(Ok)> done)
+    {
+        done(revokeShare(shareId));
+    }
 };
 
 } // namespace cv

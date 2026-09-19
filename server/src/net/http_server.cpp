@@ -62,6 +62,12 @@ std::string toLower(std::string s) {
   return s;
 }
 
+// 判断 path 是否以 prefix 开头（用于鉴权白名单放行公开分享端点 /s/）。
+bool startsWith(const std::string& s, const std::string& prefix) {
+  return !prefix.empty() && s.size() >= prefix.size() &&
+         s.compare(0, prefix.size(), prefix) == 0;
+}
+
 std::vector<std::string> splitPath(const std::string& path) {
   std::vector<std::string> out;
   std::string cur;
@@ -76,6 +82,14 @@ std::vector<std::string> splitPath(const std::string& path) {
   if (!cur.empty()) out.push_back(cur);
   return out;
 }
+
+HttpServer* g_server = nullptr;
+
+void onSignal(int) {
+  if (g_server) g_server->shutdown();
+}
+
+}  // namespace
 
 // 恒定时间字符串比较（防时序侧信道）：
 //   1) 比较上界取 max(len_a, len_b)，逐字节异或累加；
@@ -97,14 +111,6 @@ bool constantTimeEqual(const std::string& a, const std::string& b) {
   }
   return diff == 0;
 }
-
-HttpServer* g_server = nullptr;
-
-void onSignal(int) {
-  if (g_server) g_server->shutdown();
-}
-
-}  // namespace
 
 void Response::setJson(int code, const std::string& json) {
   status = code;
@@ -387,8 +393,11 @@ void HttpServer::handleClient(const Conn& conn) {
       // 协议面：仅支持 Content-Length 定长帧，显式拒绝 chunked，防前置反代场景的请求走私
       resp.setError(501, "Transfer-Encoding: chunked is not supported; use Content-Length");
       keepAlive = false;
-    } else if (!authToken_.empty() && req.path != "/healthz" && !authorized(req)) {
-      // 启用鉴权且非探活接口：缺 Token 或不匹配 → 401（JSON 说明原因，恒定时间比较），不 dispatch
+    } else if (!authToken_.empty() && req.path != "/healthz" &&
+               !startsWith(req.path, "/s/") && !authorized(req)) {
+      // 启用鉴权且非豁免接口：/healthz 与公开分享端点 /s/* 免鉴权（分享链接本就面向匿名访问）；
+      // 其余接口缺 Token 或不匹配 → 401（JSON 说明原因，恒定时间比较），不 dispatch。
+      // 注意：仅放行 /s/ 前缀，绝不放宽 /api/ 下任何路径。
       resp.setError(401, "missing or invalid Authorization token (use: Authorization: Bearer <token>)");
       keepAlive = false;  // 鉴权失败 → 关闭
     } else if (!dispatch(req, resp)) {

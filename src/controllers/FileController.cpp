@@ -19,7 +19,7 @@
 #include <QFileInfo>
 #include <QImage>
 #include <QList>
-#include <QStringDecoder>
+#include <QStringConverter>
 #include <QVariantMap>
 
 #include <algorithm>
@@ -385,7 +385,8 @@ void FileController::handlePreviewReply(int seq, const QString &kind,
         buf.open(QIODevice::WriteOnly);
         img.save(&buf, "PNG");
         buf.close();
-        m_previewImageUrl = QStringLiteral("data:image/png;base64,") + png.toBase64();
+        m_previewImageUrl = QStringLiteral("data:image/png;base64,")
+                            + QString::fromLatin1(png.toBase64());
         m_previewText.clear();
         m_previewError.clear();
         m_previewState = QStringLiteral("image");

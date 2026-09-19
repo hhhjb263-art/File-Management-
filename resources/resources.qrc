@@ -39,6 +39,7 @@
         <file alias="qml/dialogs/OverwriteDialog.qml">../qml/dialogs/OverwriteDialog.qml</file>
         <file alias="qml/dialogs/CertPinDialog.qml">../qml/dialogs/CertPinDialog.qml</file>
         <file alias="qml/dialogs/AboutDialog.qml">../qml/dialogs/AboutDialog.qml</file>
+        <file alias="qml/dialogs/ShareDialog.qml">../qml/dialogs/ShareDialog.qml</file>
 
         <!-- 控件风格配置 -->
         <file alias="qtquickcontrols2.conf">qtquickcontrols2.conf</file>

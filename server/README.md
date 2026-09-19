@@ -244,6 +244,11 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke.sh   # 指定其他端口
 | POST | `/api/v1/files/new` | 新建空文件 `{dir,name}`；同目录同名 → **409** |
 | POST | `/api/v1/files/:id/rename` | 重命名 `{name}`；同名 → **409**；同名幂等返回 200 |
 | DELETE | `/api/v1/files/:id` | 删除并**回收空间** → `200 {deleted:true,file_id,name,dir,freed_bytes,blobs_removed,disk_free_bytes}` |
+| POST | `/api/v1/shares` | 创建分享链接（body：`file_id`、`code`可选、`expire_days`可选(0=永久)、`max_downloads`可选(0=不限)）；**需鉴权** |
+| GET | `/api/v1/shares` | 列出分享（最新在前）；**需鉴权** |
+| DELETE | `/api/v1/shares/:id` | 撤销分享；**需鉴权** |
+| GET | `/s/:token/meta` | **公开（免鉴权）**：分享元数据，`?code=` 提取码；`403/404/410` |
+| GET | `/s/:token` | **公开（免鉴权）**：下载分享文件，支持 `Range`，`?code=` 提取码；`200/206`、`403/404/410` |
 
 **同名检测与覆盖**：
 - 整文件上传 `POST /api/v1/files`、新建文件、重命名、分块 `init` 都会做**同目录同名检测**；
@@ -419,7 +424,7 @@ BASE=http://127.0.0.1:9090 ./testdata/smoke_chunked.sh   # 指定端口
 
 #### `GET /api/v1/tree`　嵌套文件树（供客户端文件树选择对话框）
 
-不分页、不鉴权。把 `dir_node` 的全部目录路径 + `file_node` 的 `(dir,name,size,id)` 在内存里按路径段建树（**不写递归 SQL**）：
+不分页、**受全局鉴权保护**（仅 `/healthz` 免鉴权，本接口需携带有效 Bearer 令牌）。把 `dir_node` 的全部目录路径 + `file_node` 的 `(dir,name,size,id)` 在内存里按路径段建树（**不写递归 SQL**）：
 
 - 目录节点：`{"type":"dir","name","path","children":[...]}`；`path` 为规范化相对路径（`/` 分隔，根目录为空串不出现在树中）。
 - 文件节点：`{"type":"file","name","path","size","id"}`；`path` 为 `dir/name`（根目录文件即 `name`）。
@@ -486,7 +491,7 @@ curl -s "localhost:8080/api/v1/download?path=..%2Fsecret" -o -              # 40
 
 ### 行为
 
-- 启用后，**除 `GET /healthz` 外所有请求**必须带 `Authorization: Bearer <token>`。
+- 启用后，**除 `GET /healthz` 与公开分享端点 `/s/*` 外所有请求**必须带 `Authorization: Bearer <token>`。公开分享端点（`/s/:token`、`/s/:token/meta`）面向匿名访问，故免鉴权，提取码由分享侧另行校验（见 §4.6）。
 - 兼容历史头 `X-CV-Token: <token>`（直接携带 token，无 `Bearer ` 前缀）；两种头任选其一即可。
 - 缺失 / 不匹配 → `401`，**响应体说明原因，且不再 dispatch 后续处理**：
   ```json
@@ -590,6 +595,101 @@ strings blobs/xx/<sha256> | head
 
 ---
 
+## 4.6 分享链接（管理 `/api/v1/shares` + 公开 `/s/*`）
+
+分享链接让持有链接的人无需账号即可下载指定文件，可设置**提取码 / 有效期 / 下载次数上限**，并随时**撤销**。
+
+### 安全边界（重要）
+
+- **管理接口需鉴权**：`POST/GET/DELETE /api/v1/shares` 与所有 `/api/*` 一样受全局 Bearer Token 保护（仅 `/healthz` 与公开端点 `/s/*` 免鉴权）。
+- **公开端点 `/s/*` 免鉴权**：`GET /s/:token` 与 `GET /s/:token/meta` 可匿名访问（这是分享的本意）。但提取码校验在分享侧完成——**提取码绝不明文存储**，落库的是 `code_hash = sha256(token + ":" + code)`，校验时用**恒定时间比较**防时序侧信道。
+- 仅 `/s/` 前缀被豁免，绝不放宽 `/api/` 下任何路径。
+
+### 管理接口（需鉴权）
+
+```
+POST /api/v1/shares
+  body {"file_id":<id>, "code":<可空字符串>, "expire_days":<int, 0=永久>, "max_downloads":<int, 0=不限>}
+  201 {"id","token","file_id","name","size","need_code":<bool>,"expires_at":<ms,0=永久>,
+       "max_downloads","downloads":0,"created_at","path":"/s/<token>"}
+  404 文件不存在 / 400 参数非法（file_id 缺失或非法、expire_days/max_downloads 为负）
+
+GET  /api/v1/shares
+  200 {"items":[ <如上字段的对象数组，最新在前> ]}
+
+DELETE /api/v1/shares/:id
+  200 {"ok":true}；不存在/已撤销 → 404
+```
+
+### 公开接口（免鉴权，路径以 `/s/` 开头）
+
+```
+GET /s/:token/meta?code=<提取码>
+  200 {"name","size","need_code","expires_at","max_downloads","downloads","expired","exhausted"}
+  403 提取码错误或缺失；404 token 不存在/已撤销；410 已过期 / 次数用尽
+
+GET /s/:token?code=<提取码>
+  200 / 206 文件内容（支持 Range，复用既有分块下载助手）
+  403 提取码错误或缺失；404 token 不存在/已撤销/文件已删；410 已过期 / 次数用尽
+  成功时带 Content-Disposition: attachment; filename*=UTF-8''<urlencoded 原名>
+```
+
+全部错误响应体统一 `{"error":"<中文说明>"}`（沿用服务端既有 error 风格）。
+
+### 关键实现要点
+
+- **token**：`randomHex(16)` 生成的 32 位十六进制随机串，取自系统随机源 `/dev/urandom`（不可用时退回 `std::random_device`），**绝不使用 `rand()` / 时间戳**。
+- **下载计数**：开始回内容之前 `downloads++`；先判 `max_downloads > 0 && downloads >= max_downloads` 再累加，避免"已用尽还能下最后一发"。
+- **校验顺序**：先 404（token 不存在）→ 再 403（提取码）→ 再 410（过期 / 用尽）→ 最后计数并回内容。
+- **迁移友好**：加密开启时 blob 落盘为 `<hash>.enc`，公开下载走与 `/api/*` 相同的 `serveFileContent` 助手，自动解密。
+- **浏览器落地页（内容协商）**：`GET /s/:token` 与 `GET /s/:token/meta` 在 `Accept` 含 `text/html`（浏览器直接打开）时返回 HTML 落地页，否则保持既有 JSON / 附件下载不变（见下文）。
+
+### 浏览器落地页（内容协商）
+
+`GET /s/:token` 与 `GET /s/:token/meta` 支持**内容协商**：
+
+- 当请求头 `Accept` 含 `text/html`（浏览器直接打开链接）→ 返回 **HTML 落地页**（`Content-Type: text/html; charset=utf-8`），无需客户端 App 即可查看文件名 / 大小 / 有效期 / 剩余次数并点击下载。
+- 否则（客户端 `Accept: */*`）→ **保持既有 JSON / 附件下载行为完全不变**，对既有契约零影响（客户端本就发 `*/*`，故零回归）。
+
+落地页三种状态：
+
+1. **需要 / 错误提取码**：`GET` 表单（同 URL，字段 `code`）+ 中文错误提示（403 显示「提取码错误」，缺失显示「需要提取码」）。
+2. **校验通过**：文件名 / 大小 / 有效期文案 / 剩余下载次数 + 「下载」按钮；按钮 `href` 指向 `/s/:token?code=<已校验的code>&dl=1`（带 `download` 属性）。`dl=1` 是服务端内部提示：浏览器点击 `<a download>` 仍会带 `Accept: text/html`，该参数让路由跳过 HTML 直接回附件，从而真正触发下载而非再次落入落地页（见 `server/src/app/main.cpp` 中的 `wantRawDownload` 判断）。
+3. **410 已过期 / 次数用尽**：友好原因文案（如「分享链接已过期或下载次数已用尽」），而非笼统的「下载失败」。
+
+安全约束（硬性）：
+
+- 页面所有动态值（文件名、错误文案、剩余次数等）均经 `htmlEscape()` 转义（`& < > " '`），杜绝 XSS；恶意文件名如 `<script>alert(1)</script>` 会被转义为 `&lt;script&gt;...`。
+- 下载链接中的提取码经 `urlEncode()`，避免特殊字符直接拼进 URL。
+- 页面内联 `<style>`、**无任何外部资源**（无 CDN / 图片外链），单文件零依赖。
+
+渲染逻辑抽为纯函数 `cv::share_page::renderSharePage(...)`（`server/src/app/share_page.h`），可离线编译 harness 验证（见 `server/.localcheck/share_page_harness.cpp`）。
+
+注意：落地页本身**不消耗**下载次数；只有点击「下载」真正拉取附件（`?dl=1` 或客户端 `*/*`）时才会 `downloads++`（先判后加不变）。
+
+```bash
+# 创建分享（带提取码、7 天有效、最多 10 次）
+curl -s -X POST -H 'Authorization: Bearer s3cr3t' \
+  -H 'Content-Type: application/json' \
+  -d '{"file_id":42,"code":"letmein","expire_days":7,"max_downloads":10}' \
+  http://localhost:8080/api/v1/shares
+# => {"id":1,"token":"a1b2...","path":"/s/a1b2...","need_code":true,"expires_at":...,"max_downloads":10,"downloads":0,...}
+
+# 匿名下载（带提取码）
+curl -s -D - "http://localhost:8080/s/a1b2...?code=letmein" -o file.bin
+# => 200/206，且带 Content-Disposition: attachment; filename*=UTF-8''...
+
+# 查看元信息
+curl -s "http://localhost:8080/s/a1b2.../meta?code=letmein"
+# => {"name":"file.bin","size":...,"need_code":true,"expires_at":...,"max_downloads":10,"downloads":1,"expired":false,"exhausted":false}
+
+# 撤销
+curl -s -X DELETE -H 'Authorization: Bearer s3cr3t' http://localhost:8080/api/v1/shares/1
+# => {"ok":true}
+```
+
+---
+
 ## 5. 今天做 / 没做的边界
 
 **已实现**
@@ -606,11 +706,12 @@ strings blobs/xx/<sha256> | head
   （路径规范化清洗、`..`/绝对路径/符号链接拒绝、越界 403）
 - API 鉴权：Bearer Token（`--auth-token` / `CV_AUTH_TOKEN` / `auth_token`，兼容 `X-CV-Token` 头；恒定时间比较，不提前 return），除 `/healthz` 外全接口强制 401（JSON 说明原因，不再 dispatch）；明文 HTTP 可按 `--http=off` 关闭（必须与 TLS 二选一，否则启动报错）
 - 静态数据加密：blob 落盘 AES-256-GCM（每 blob 独立随机 nonce，`magic+nonce+tag+ciphertext` 格式；只加密内容、不加密文件名/哈希）；`--data-key` / `CV_DATA_KEY` / `data_key` 配置，覆盖 `put`/`putFromFile`/`get`/`readRange`/`materializeFromChunks` 全路径；启用后自动关闭文件树明文镜像、Range 走分块拼装 + 解密（见 §4.5）
+- 分享链接：管理接口 `/api/v1/shares`（创建/列出/撤销，需鉴权）+ 公开端点 `/s/:token`、`/s/:token/meta`（免鉴权，支持提取码/有效期/下载次数上限/可撤销）；token 取自系统随机源、提取码以 `sha256(token+":"+code)` 存储并恒定时间比较、下载计数以条件原子自增封顶（`max_downloads=0` 表示不限，见 §4.6）
 
 **明确未实现（后续模块）**
 
 - 用户、登录、会话、配额
-- 分享链接、回收站、版本回溯（表结构已预留）
+- 回收站、版本回溯（表结构已预留）
 - WebSocket 同步事件推送
 - HTTPS（生产环境应在前面挂 Caddy / Nginx 终止 TLS）
 - 下载的「流式」输出仍在应用层按区间拼装（受 net 层 `resp.body` 模型限制）；超大文件全文下载仍整文件入内存，未来可在 net 层引入分块流式回应

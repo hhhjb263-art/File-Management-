@@ -79,6 +79,9 @@ struct ShareLink {
     int       maxDownloads = 0; // 0 表示不限次数
     int       downloads = 0;
     bool      revoked = false;
+    // 追加（加法式）：服务端列表返回的字段，供展示 / needCode 判定
+    qint64    size = 0;         // 文件字节数（用于 sizeText）
+    bool      needCode = false; // 是否启用提取码（列表不含明文 code，用此判定）
 
     bool expired() const { return expire.isValid() && expire < QDateTime::currentDateTimeUtc(); }
     bool usable() const

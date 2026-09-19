@@ -69,7 +69,7 @@ ApplicationWindow {
     readonly property var navItems: [
         { label: qsTr("文件"),   glyph: "🗂", supported: true },
         { label: qsTr("传输"),   glyph: "⇅",  supported: true },
-        { label: qsTr("分享"),   glyph: "🔗", supported: false },
+        { label: qsTr("分享"),   glyph: "🔗", supported: true },
         { label: qsTr("标签"),   glyph: "🏷", supported: false },
         { label: qsTr("回收站"), glyph: "🗑", supported: false },
         { label: qsTr("版本"),   glyph: "🕘", supported: false },
@@ -480,7 +480,7 @@ ApplicationWindow {
     Menu {
         id: compactMoreMenu
         width: 220
-        MenuItem { text: "🔗  " + qsTr("分享（暂不支持）"); enabled: false }
+        MenuItem { text: "🔗  " + qsTr("分享"); onTriggered: window.navIndex = window.pageShares }
         MenuItem { text: "🏷  " + qsTr("标签（暂不支持）"); enabled: false }
         MenuItem { text: "🗑  " + qsTr("回收站（暂不支持）"); enabled: false }
         MenuItem { text: "🕘  " + qsTr("版本（暂不支持）"); enabled: false }
@@ -569,7 +569,8 @@ ApplicationWindow {
     Component.onCompleted: {
         // 自检钩子：CV_START_PAGE 指定初始页（未设置时保持默认页，无副作用）
         if (typeof CvStartPage !== "undefined" && String(CvStartPage).length > 0) {
-            const map = { "files": 0, "transfers": 1, "settings": 6 }
+            const map = { "files": 0, "transfers": 1, "shares": 2, "tags": 3,
+                          "trash": 4, "versions": 5, "settings": 6 }
             const v = map[String(CvStartPage).toLowerCase()]
             if (v !== undefined)
                 window.navIndex = v

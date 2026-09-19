@@ -108,3 +108,7 @@ output/
 bin_shot/
 build_a/
 build_b/
+
+# QA/lead 临时探针目录（不入库）
+/.qa6_probe/
+/.qa*_probe/

@@ -30,6 +30,7 @@
 #include <atomic>
 
 #include <QHash>
+#include <QJsonObject>
 #include <QList>
 #include <QMutex>
 #include <QNetworkAccessManager>
@@ -173,6 +174,12 @@ public:
     void getRangeAsync(const QString &fileId, qint64 offset, qint64 length,
                        std::function<void(Result<QByteArray>)> done) override;
 
+    // 分享链接：真异步（复用 requestAsync，不建 QEventLoop）。
+    void sharesAsync(std::function<void(Result<QVector<ShareLink>>)> done) override;
+    void createShareAsync(const QString &fileId, const QString &code, int expireDays,
+                          int maxDownloads, std::function<void(Result<ShareLink>)> done) override;
+    void revokeShareAsync(const QString &shareId, std::function<void(Ok)> done) override;
+
 private:
     enum class Method { Get, Post, Put, Delete };
 
@@ -211,6 +218,11 @@ private:
     // Range 请求头 / 响应解析 —— 同步 getRange 与异步 getRangeAsync **共用同一份**（单一来源）。
     static QByteArray        rangeHeader(qint64 offset, qint64 length);
     static Result<QByteArray> parseRangeBody(const Response &r, qint64 offset, qint64 length);
+
+    // 分享 JSON 解析 —— 同步 shares/createShare 与异步版**共用同一份**（单一来源）。
+    // url = m_baseUrl + 服务端返回的 path（如 "/s/<token>"）。includeCode=true 仅创建时用。
+    ShareLink          shareFromObject(const QJsonObject &o, bool includeCode) const;
+    QVector<ShareLink> sharesFromBody(const QByteArray &body) const;
 
     // TLS：在 QNetworkReply::sslErrors 上做 TOFU 指纹固定
     void applyCertPinning(QNetworkReply *reply, const QList<QSslError> &errors);

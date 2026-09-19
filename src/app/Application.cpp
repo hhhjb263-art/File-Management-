@@ -68,7 +68,7 @@ void Application::start()
     m_transfers = new cv::TransferController(m_transfer, this);
     // 把队列进度镜像到 QML 数据模型（否则传输页/侧栏永远空白）
     m_transfers->setTaskModel(m_transferModel);
-    m_shares = new cv::ShareController(this);
+    m_shares = new cv::ShareController(m_backend, this);
     m_stats = new cv::StatsController(m_backend, this);
 
     // ---- 日志接线：把各控制器 logMessage(level,text) 接到统一日志 sink ----
@@ -85,6 +85,8 @@ void Application::start()
                      [](const QString &lv, const QString &tx) { logToSink("Transfer", lv, tx); });
     QObject::connect(m_stats, &cv::StatsController::logMessage, this,
                      [](const QString &lv, const QString &tx) { logToSink("Stats", lv, tx); });
+    QObject::connect(m_shares, &cv::ShareController::logMessage, this,
+                     [](const QString &lv, const QString &tx) { logToSink("Shares", lv, tx); });
 
     // ---- 默认下载目录注入（启用 Settings::downloadDir()）+ 设置变更后重新注入 ----
     applyDownloadDirSetting();

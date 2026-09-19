@@ -49,6 +49,10 @@ struct Response {
 
 using Handler = std::function<void(const Request&, Response&)>;
 
+// 恒定时间字符串比较（防时序侧信道）：长度不同必返回 false，且不提前 return，
+// 比较时长与首个不同字节位置无关。供鉴权令牌与分享提取码校验复用。
+bool constantTimeEqual(const std::string& a, const std::string& b);
+
 // POSIX socket + 固定线程池的 HTTP/1.1 服务器。
 // 单连接支持 keep-alive：一个 worker 全程持有该连接，循环读取请求→处理→写响应，
 // 直到客户端要求关闭、解析失败、达到单连接请求上限或读超时（30s SO_RCVTIMEO，静默关闭）。

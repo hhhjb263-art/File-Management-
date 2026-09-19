@@ -63,6 +63,7 @@
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QEventLoop>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -1081,22 +1082,113 @@ Ok HttpBackend::restoreVersion(const QString &, const QString &)
 }
 
 // =========================================================================
-// 分享（服务端未实现 -> 不支持）
+// 分享（服务端已实现：POST/GET /api/v1/shares、DELETE /api/v1/shares/:id）
+//   公开端点 /s/:token（免鉴权）由服务端提供，客户端不调用，仅展示完整 URL。
 // =========================================================================
+
+ShareLink HttpBackend::shareFromObject(const QJsonObject &o, bool includeCode) const
+{
+    ShareLink s;
+    s.id       = QString::number(o.value(QStringLiteral("id")).toVariant().toLongLong());
+    s.fileId   = QString::number(o.value(QStringLiteral("file_id")).toVariant().toLongLong());
+    s.fileName = o.value(QStringLiteral("name")).toString();
+    s.isDir    = false; // 服务端仅对文件提供分享
+    s.size     = o.value(QStringLiteral("size")).toVariant().toLongLong();
+    // 完整 URL = 当前基地址 + 服务端返回 path（如 "/s/<token>"）；基地址与预览/下载同源
+    const QString path = o.value(QStringLiteral("path")).toString();
+    s.url      = path.isEmpty() ? QString() : m_baseUrl + path;
+    s.needCode = o.value(QStringLiteral("need_code")).toBool();
+    s.code     = includeCode ? o.value(QStringLiteral("code")).toString() : QString();
+    const qint64 createdMs = o.value(QStringLiteral("created_at")).toVariant().toLongLong();
+    if (createdMs > 0)
+        s.created = QDateTime::fromMSecsSinceEpoch(createdMs).toUTC();
+    const qint64 expMs = o.value(QStringLiteral("expires_at")).toVariant().toLongLong();
+    if (expMs > 0)
+        s.expire = QDateTime::fromMSecsSinceEpoch(expMs).toUTC(); // 0 = 永久（expire 保持无效）
+    s.maxDownloads = o.value(QStringLiteral("max_downloads")).toInt();
+    s.downloads    = o.value(QStringLiteral("downloads")).toInt();
+    s.revoked      = false;
+    return s;
+}
+
+QVector<ShareLink> HttpBackend::sharesFromBody(const QByteArray &body) const
+{
+    QVector<ShareLink> out;
+    const QJsonArray   arr =
+        QJsonDocument::fromJson(body).object().value(QStringLiteral("items")).toArray();
+    out.reserve(arr.size());
+    for (const QJsonValue &v : arr)
+        out.append(shareFromObject(v.toObject(), /*includeCode=*/false));
+    return out;
+}
 
 Result<QVector<ShareLink>> HttpBackend::shares()
 {
-    return Result<QVector<ShareLink>>::fail(unsupportedMsg(QStringLiteral("分享链接")));
+    const Response r = request(Method::Get, QStringLiteral("/api/v1/shares"));
+    if (!r.ok())
+        return Result<QVector<ShareLink>>::fail(r.error);
+    return Result<QVector<ShareLink>>::success(sharesFromBody(r.body));
 }
 
-Result<ShareLink> HttpBackend::createShare(const QString &, const QString &, int, int)
+void HttpBackend::sharesAsync(std::function<void(Result<QVector<ShareLink>>)> done)
 {
-    return Result<ShareLink>::fail(unsupportedMsg(QStringLiteral("分享链接")));
+    requestAsync(Method::Get, QStringLiteral("/api/v1/shares"), {}, {},
+                 [this, done](Response r) {
+                     if (!r.ok()) {
+                         done(Result<QVector<ShareLink>>::fail(r.error));
+                         return;
+                     }
+                     done(Result<QVector<ShareLink>>::success(sharesFromBody(r.body)));
+                 });
 }
 
-Ok HttpBackend::revokeShare(const QString &)
+Result<ShareLink> HttpBackend::createShare(const QString &fileId, const QString &code,
+                                           int expireDays, int maxDownloads)
 {
-    return err(unsupportedMsg(QStringLiteral("分享链接")));
+    QJsonObject body;
+    body.insert(QStringLiteral("file_id"), fileId);
+    body.insert(QStringLiteral("code"), code);
+    body.insert(QStringLiteral("expire_days"), expireDays);     // 0 = 永久
+    body.insert(QStringLiteral("max_downloads"), maxDownloads); // 0 = 不限
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/shares"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    if (!r.ok())
+        return Result<ShareLink>::fail(r.error);
+    return Result<ShareLink>::success(
+        shareFromObject(QJsonDocument::fromJson(r.body).object(), /*includeCode=*/true));
+}
+
+void HttpBackend::createShareAsync(const QString &fileId, const QString &code, int expireDays,
+                                   int maxDownloads,
+                                   std::function<void(Result<ShareLink>)> done)
+{
+    QJsonObject body;
+    body.insert(QStringLiteral("file_id"), fileId);
+    body.insert(QStringLiteral("code"), code);
+    body.insert(QStringLiteral("expire_days"), expireDays);
+    body.insert(QStringLiteral("max_downloads"), maxDownloads);
+    const QByteArray payload = QJsonDocument(body).toJson(QJsonDocument::Compact);
+    requestAsync(Method::Post, QStringLiteral("/api/v1/shares"), payload, {},
+                 [this, done](Response r) {
+                     if (!r.ok()) {
+                         done(Result<ShareLink>::fail(r.error));
+                         return;
+                     }
+                     done(Result<ShareLink>::success(
+                         shareFromObject(QJsonDocument::fromJson(r.body).object(), true)));
+                 });
+}
+
+Ok HttpBackend::revokeShare(const QString &shareId)
+{
+    const Response r = request(Method::Delete, QStringLiteral("/api/v1/shares/") + pct(shareId));
+    return r.ok() ? ok() : err(r.error);
+}
+
+void HttpBackend::revokeShareAsync(const QString &shareId, std::function<void(Ok)> done)
+{
+    requestAsync(Method::Delete, QStringLiteral("/api/v1/shares/") + pct(shareId), {}, {},
+                 [done](Response r) { done(r.ok() ? ok() : err(r.error)); });
 }
 
 Ok HttpBackend::touchShare(const QString &)
