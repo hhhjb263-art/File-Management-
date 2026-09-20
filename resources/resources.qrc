@@ -38,6 +38,7 @@
         <file alias="qml/dialogs/DeleteConfirmDialog.qml">../qml/dialogs/DeleteConfirmDialog.qml</file>
         <file alias="qml/dialogs/OverwriteDialog.qml">../qml/dialogs/OverwriteDialog.qml</file>
         <file alias="qml/dialogs/CertPinDialog.qml">../qml/dialogs/CertPinDialog.qml</file>
+        <file alias="qml/dialogs/CertMismatchDialog.qml">../qml/dialogs/CertMismatchDialog.qml</file>
         <file alias="qml/dialogs/AboutDialog.qml">../qml/dialogs/AboutDialog.qml</file>
         <file alias="qml/dialogs/ShareDialog.qml">../qml/dialogs/ShareDialog.qml</file>
 

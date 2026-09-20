@@ -448,12 +448,22 @@ void HttpBackend::applyCertPinning(QNetworkReply *reply, const QList<QSslError> 
     if (!recorded.isEmpty()) {
         if (recorded.compare(fp, Qt::CaseInsensitive) == 0)
             reply->ignoreSslErrors(); // 指纹一致：静默放行
-        else
+        else {
             // 指纹不一致：疑似中间人 -> 不 ignore（按证书错误失败），
             // 并把可识别原因挂到该 reply 上，最终错误文本会带 [pin-mismatch] 前缀
             reply->setProperty("cvPinMismatch",
                                kPinMismatchPrefix +
                                    QStringLiteral("服务器证书指纹与已固定记录不一致（%1）").arg(key));
+            // 额外：把这件事**主动通知界面**（QML 只能经由控制器收到）。
+            // 此前这里是静默失败——用户既不知道发生了什么，也不知道可以「清除指纹」恢复，
+            // 表现为"换了服务端证书后永久连不上"。展示串取法与下方首次确认分支保持一致。
+            // ⚠️ 仍然不放行：不调用 ignoreSslErrors()，本函数随后 return。
+            emit certPinMismatch(key, recorded, fp, cert.subjectDisplayName(),
+                                 cert.issuerDisplayName(),
+                                 QStringLiteral("%1 ~ %2").arg(
+                                     cert.effectiveDate().toString(Qt::ISODate),
+                                     cert.expiryDate().toString(Qt::ISODate)));
+        }
         return;
     }
 

@@ -45,6 +45,10 @@ ApplicationWindow {
 
     property int navIndex: pageFiles
 
+    // 证书指纹不匹配去抖：同一 hostPort 只弹一次（并发请求可能多次触发）。
+    // 用户「清除记录并重新信任」后对该 host 复位，便于后续新的证书变更再次提示。
+    property var certMismatchSeen: ({})
+
     // ---- 顶部通知条 ----
     property string toastText: ""
     property bool toastOk: true
@@ -508,6 +512,20 @@ ApplicationWindow {
 
     AboutDialog { id: aboutDialog }
 
+    // 证书指纹不匹配（连接已被拒绝）→ 明确的提示与恢复路径。
+    // 恢复动作由 Main 代为实现（对话框不直接引用 filesPage / 导航）。
+    CertMismatchDialog {
+        id: certMismatchDialog
+        onClearAndRetryRequested: {
+            const hp = certMismatchDialog.hostPort
+            if (hp.length > 0)
+                window.certMismatchSeen[hp] = false   // 允许后续新的证书变更再次提示
+            window.showToast(qsTr("已清除该主机指纹记录，正在重新连接…"), true)
+            filesPage.refreshNow()
+        }
+        onOpenSettingsRequested: window.navIndex = window.pageSettings
+    }
+
     // ==================================================================
     //  全局信号接线
     // ==================================================================
@@ -515,6 +533,24 @@ ApplicationWindow {
         target: App
         function onTrustPromptRequested(hostPort, fingerprint, subject, issuer, validity) {
             certPinDialog.openFor(hostPort, fingerprint, subject, issuer, validity)
+        }
+    }
+
+    // 证书指纹不匹配：连接已被拒绝、不会自动重试；给出新旧指纹对照与恢复路径。
+    // ⚠️ `App.certPinMismatch` 可能尚未落地（C++ 运行时解析）→ ignoreUnknownSignals
+    //    静默跳过未知信号，加载期不刷错误；落地后自动接线。
+    // 去抖：同一 hostPort 仅弹一次，避免并发请求造成弹窗风暴。
+    Connections {
+        target: (typeof App !== "undefined") ? App : null
+        ignoreUnknownSignals: true
+        function onCertPinMismatch(hostPort, expectedFingerprint, actualFingerprint,
+                                   subject, issuer, validity) {
+            const hp = String(hostPort)
+            if (window.certMismatchSeen[hp] === true)
+                return
+            window.certMismatchSeen[hp] = true
+            certMismatchDialog.openFor(hp, expectedFingerprint, actualFingerprint,
+                                       subject, issuer, validity)
         }
     }
 
