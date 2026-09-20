@@ -1247,7 +1247,7 @@ ShareLink HttpBackend::shareFromObject(const QJsonObject &o, bool includeCode) c
         s.expire = QDateTime::fromMSecsSinceEpoch(expMs).toUTC(); // 0 = 永久（expire 保持无效）
     s.maxDownloads = o.value(QStringLiteral("max_downloads")).toInt();
     s.downloads    = o.value(QStringLiteral("downloads")).toInt();
-    s.revoked      = false;
+    s.revoked      = o.value(QStringLiteral("revoked")).toBool();  // 服务端软撤销标记
     return s;
 }
 

@@ -11,7 +11,7 @@ namespace cv {
 // 与 SELECT 语句列顺序保持一致：id, token, file_id, code_hash, expires_at, max_downloads, downloads, created_at
 namespace {
 const char* kShareCols =
-    "id, token, file_id, code_hash, expires_at, max_downloads, downloads, created_at";
+    "id, token, file_id, code_hash, expires_at, max_downloads, downloads, created_at, revoked";
 
 constexpr std::int64_t kMillisPerDay = 24LL * 60 * 60 * 1000;
 }  // namespace
@@ -25,6 +25,7 @@ bool ShareRepository::rowToShare(Stmt& stmt, Share& out) {
   out.maxDownloads = stmt.int64(5);
   out.downloads = stmt.int64(6);
   out.createdAt = stmt.int64(7);
+    out.revoked = stmt.int64(8) != 0;
   return true;
 }
 
@@ -107,7 +108,7 @@ bool ShareRepository::findByToken(const std::string& token, Share& out, bool& fo
                                   std::string& err) {
   found = false;
   Stmt stmt(db_.handle(),
-            std::string("SELECT ") + kShareCols + " FROM shares WHERE token = ? LIMIT 1", err);
+            std::string("SELECT ") + kShareCols + " FROM shares WHERE token = ? AND revoked = 0 LIMIT 1", err);
   if (!stmt.ok()) return false;
   if (!stmt.bind(1, token)) {
     err = "bind failed";
@@ -162,6 +163,16 @@ bool ShareRepository::listAllVisible(std::int64_t callerOwnerId, std::vector<Sha
     out.push_back(s);
   }
   return true;
+}
+
+bool ShareRepository::revokeById(std::int64_t id, std::string& err) {
+  Stmt stmt(db_.handle(), "UPDATE shares SET revoked = 1 WHERE id = ?", err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, id)) {
+    err = "bind failed";
+    return false;
+  }
+  return stmt.step(err) == SQLITE_DONE;
 }
 
 bool ShareRepository::removeById(std::int64_t id, std::string& err) {

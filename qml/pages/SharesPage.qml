@@ -214,8 +214,9 @@ Item {
                     color: Theme.bg
                     border.width: 1
                     border.color: Theme.border
-                    // 失效项弱化视觉
-                    opacity: isExpired ? 0.62 : 1.0
+                    // 失效/已撤销项弱化视觉（撤销优先级更高）
+                    opacity: shareRow.info.revoked === true ? 0.45
+                                        : (isExpired ? 0.62 : 1.0)
 
                     ColumnLayout {
                         id: rowCol
@@ -255,6 +256,11 @@ Item {
                                 visible: shareRow.isExpired
                                 tone: "neutral"
                                 text: qsTr("已失效")
+                            }
+                            StatusBadge {
+                                visible: shareRow.info.revoked === true
+                                tone: "danger"
+                                text: qsTr("已撤销")
                             }
                         }
 

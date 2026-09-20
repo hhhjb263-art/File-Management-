@@ -150,6 +150,7 @@ cv::json::Value shareToJson(const cv::Share& s, const std::string& name,
   v.set("max_downloads", static_cast<long long>(s.maxDownloads));
   v.set("downloads", static_cast<long long>(s.downloads));
   v.set("created_at", static_cast<long long>(s.createdAt));
+  v.set("revoked", s.revoked);
   v.set("path", "/s/" + s.token);
   return v;
 }
@@ -2041,7 +2042,7 @@ int main(int argc, char** argv) {
       resp.setError(404, "share not found");  // 不存在/已撤销
       return;
     }
-    if (!shr.removeById(id, perr)) {
+    if (!shr.revokeById(id, perr)) {
       resp.setError(500, std::string("db failed: ") + perr);
       return;
     }

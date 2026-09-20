@@ -18,6 +18,7 @@ struct Share {
   std::int64_t maxDownloads = 0; // 0 = 不限次数
   std::int64_t downloads = 0;    // 已下载次数
   std::int64_t createdAt = 0;    // 毫秒
+  bool revoked = false;          // 软撤销标记：true ⇒ /s/* 视为不存在，列表仍可见
 };
 
 // 生成 nBytes 字节的随机十六进制串（共 2*nBytes 个 hex 字符）。
@@ -54,6 +55,8 @@ class ShareRepository {
 
   // 撤销（删除）某分享；成功返回 true。err 仅表示 DB 错误（不存在也返回 true）。
   bool removeById(std::int64_t id, std::string& err);
+  // 软撤销：置 revoked=1（**不删行**），列表仍可见并可标记「已撤销」
+  bool revokeById(std::int64_t id, std::string& err);
 
   // 下载计数 +1（在“开始回内容之前”调用）。SQL 端原子条件自增：
   // 仅当 (max_downloads = 0 OR downloads < max_downloads) 才 +1，并发 worker 各发独立 UPDATE，
