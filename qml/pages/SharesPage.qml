@@ -32,8 +32,16 @@ Item {
     readonly property int invalidCount: sharesReady && Shares.invalidCount !== undefined ? Shares.invalidCount : 0
     function rowState(info) { return page.sval(info, "state", "active"); }
     function rowMatches(info) {
-        return page.showInvalid ? (page.rowState(info) !== "active")
-                                : (page.rowState(info) === "active")
+        // 「已失效」栏：state 非 active（revoked/expired/exhausted）
+        if (page.showInvalid)
+            return page.rowState(info) !== "active"
+        // 「进行中」栏：**三重防御**——state、revoked、expired/usable 任一失效特征
+        // 都不放过。不依赖服务端版本（旧服务端不回 state/revoked 字段时，
+        // expired()/usable 由客户端本地时间与次数即可判定）。
+        if (page.sval(info, "state", "active") !== "active") return false
+        if (info.revoked === true) return false
+        if (info.expired === true) return false
+        return info.usable !== false
     }
 
     // 数据变更版本号（at() 是函数调用，需显式依赖才重取值）
