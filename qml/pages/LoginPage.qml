@@ -16,12 +16,32 @@ Item {
     id: page
 
     anchors.fill: parent
-    visible: Auth.supported && !Auth.loggedIn && !Auth.legacyMode && !Auth.initializing
+    // 默认规则：未登录且服务端**具备**账号体系时挡在前面。
+    // 例外（`forced`）：服务端还没有任何账号（/me 返回 501 → legacy 模式）时本页默认不显示，
+    // 但顶栏「登录 / 注册」可强制打开它 —— 否则永远注册不出第一个账号，账号体系永远启用不了。
+    visible: Auth.supported && !Auth.loggedIn && !Auth.initializing
+             && (!Auth.legacyMode || forced)
+
+    // 由 Main 置真以强制显示（legacy 模式下用户主动点「登录 / 注册」）
+    property bool forced: false
+    signal closed()
 
     // 半透明遮罩，阻止与下层界面交互（未登录时不应能操作文件等）。
     Rectangle {
         anchors.fill: parent
         color: Qt.rgba(Theme.bg.r, Theme.bg.g, Theme.bg.b, 0.82)
+    }
+
+    // 仅"强制打开"时给一个退出入口：legacy 用户本来靠访问令牌直连，
+    // 不该被登录页锁死（默认规则下本页不会被强制显示，故无需此按钮）。
+    ToolButton {
+        visible: page.forced
+        text: "✕  " + qsTr("稍后（继续用访问令牌）")
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.margins: Theme.spaceM
+        font.pointSize: Theme.fontSecondary
+        onClicked: page.closed()
     }
 
     // 账号锁定倒计时（429 的 Retry-After）

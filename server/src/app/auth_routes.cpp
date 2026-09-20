@@ -6,6 +6,7 @@
 
 #include "core/isotime.h"
 #include "core/json.h"
+#include "core/logger.h"
 #include "core/pbkdf2.h"
 #include "core/sha256.h"
 #include "meta/file_repository.h"    // nowMillis()
@@ -75,7 +76,7 @@ void registerAuthRoutes(net::HttpServer& server, UserRepository& users, const Au
   //  注册
   // ---------------------------------------------------------------------
   server.route("POST", "/api/v1/auth/register",
-               [&users, cfg](const net::Request& req, net::Response& resp) {
+               [&users, &server, cfg](const net::Request& req, net::Response& resp) {
                  const json::Value body = parseBody(req.body);
                  const std::string username    = field(body, "username");
                  const std::string password    = field(body, "password");
@@ -103,6 +104,12 @@ void registerAuthRoutes(net::HttpServer& server, UserRepository& users, const Au
                    resp.setError(500, std::string(kDbFailed) + perr);
                    return;
                  }
+                 // 有了第一个账号 ⇒ 立即启用账号体系（强制鉴权 + 按 owner 隔离），
+                 // 免去"注册完还得重启服务端"这一步。
+                 server.setAccountsEnabled(true);
+                 CV_LOG_INFO("账号体系已启用（首个账号 " << created.username
+                                                     << " 注册成功）：除 /healthz、/s/* 与"
+                                                     << " /api/v1/auth/{login,register} 外均需有效会话");
                  json::Value v = json::Value::object();
                  v.set("id", static_cast<long long>(created.id));
                  v.set("username", created.username);

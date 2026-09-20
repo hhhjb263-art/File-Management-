@@ -175,6 +175,15 @@ bool HttpServer::authenticate(Request& req) const {
 }
 
 namespace {
+
+// 取凭据的**引导端点**必须免鉴权，否则死锁：
+// "要登录先得持有令牌，而令牌只能靠登录拿到"。
+//   免鉴权：/api/v1/auth/login、/api/v1/auth/register（用凭证换令牌 / 首次开号）
+//   仍受保护：/api/v1/auth/me、/logout、/password、/sessions（都要求已有有效会话）
+bool isAuthBootstrapPath(const std::string& path) {
+  return path == "/api/v1/auth/login" || path == "/api/v1/auth/register";
+}
+
 // 建立 TCP 监听 socket（bind+listen），失败返回 -1 并填充 err
 int makeListener(const std::string& addr, int port, std::string& err) {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -442,7 +451,8 @@ void HttpServer::handleClient(const Conn& conn) {
       resp.setError(501, "Transfer-Encoding: chunked is not supported; use Content-Length");
       keepAlive = false;
     } else if ((!authToken_.empty() || accountsEnabled_) && req.path != "/healthz" &&
-               !startsWith(req.path, "/s/") && !authenticate(req)) {
+               !startsWith(req.path, "/s/") && !isAuthBootstrapPath(req.path) &&
+               !authenticate(req)) {
       // 启用鉴权且非豁免接口：/healthz 与公开分享端点 /s/* 免鉴权（分享链接本就面向匿名访问）；
       // 其余接口缺 Token 或不匹配 → 401（JSON 说明原因，恒定时间比较），不 dispatch。
       // 注意：仅放行 /s/ 前缀，绝不放宽 /api/ 下任何路径。

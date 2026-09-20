@@ -35,6 +35,9 @@ ApplicationWindow {
     readonly property bool wide: width >= Theme.breakpointWide
 
     // ---- 页面索引 ----
+    // 顶栏「登录 / 注册」强制打开登录页（服务端无账号体系时也能注册第一个账号）
+    property bool loginForced: false
+
     readonly property int pageFiles: 0
     readonly property int pageTransfers: 1
     readonly property int pageShares: 2
@@ -141,6 +144,14 @@ ApplicationWindow {
                       : qsTr("传输队列")
                 onClicked: transfersDrawer.opened ? transfersDrawer.close()
                                                   : transfersDrawer.open()
+            }
+
+            ToolButton {
+                id: loginBtn
+                visible: !Auth.loggedIn
+                text: "🔑 " + qsTr("登录 / 注册")
+                font.pointSize: Theme.fontBody
+                onClicked: window.loginForced = true
             }
 
             ToolButton {
@@ -562,6 +573,14 @@ ApplicationWindow {
     LoginPage {
         id: loginPage
         anchors.fill: parent
+        forced: window.loginForced
+        onClosed: window.loginForced = false
+        // 登录成功后自动收起强制态（visible 本身也要求 !loggedIn）
+        Connections {
+            target: Auth
+            ignoreUnknownSignals: true
+            function onLoggedIn() { window.loginForced = false }
+        }
     }
 
     // ==================================================================
