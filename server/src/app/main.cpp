@@ -22,7 +22,8 @@
 //   POST /api/v1/uploads/:id/complete     合并分块落库（落入 init 登记的目录）
 //   DELETE /api/v1/uploads/:id       取消会话
 //   POST /api/v1/shares             创建分享链接（body: file_id, code?, expire_days?, max_downloads?）
-//   GET  /api/v1/shares             列出分享（最新在前）
+//   GET  /api/v1/shares             列出分享（最新在前，每条含 state 字段）
+//   POST /api/v1/shares/cleanup     清除调用者名下无效分享（revoked/过期/用尽）→ {removed:N}
 //   DELETE /api/v1/shares/:id       撤销分享
 //   GET  /s/:token/meta            公开：分享元数据（免鉴权，?code= 提取码）
 //   GET  /s/:token                 公开：下载分享文件（免鉴权，支持 Range，?code= 提取码）
@@ -150,6 +151,8 @@ cv::json::Value shareToJson(const cv::Share& s, const std::string& name,
   v.set("max_downloads", static_cast<long long>(s.maxDownloads));
   v.set("downloads", static_cast<long long>(s.downloads));
   v.set("created_at", static_cast<long long>(s.createdAt));
+  v.set("revoked", s.revoked);
+  v.set("state", cv::shareStateOf(s, cv::nowMillis()));  // active|revoked|expired|exhausted
   v.set("path", "/s/" + s.token);
   return v;
 }
@@ -225,6 +228,11 @@ std::string partPath(const cv::Config& cfg, std::int64_t id, std::int64_t seq) {
 // 原子写文件：先写 .tmp 再 rename，保证落盘一致性
 bool writeAtomicFile(const std::string& finalPath, const std::string& data,
                      std::string& err) {
+  // 父目录可能不存在：按 owner 隔离后镜像新增了 u<ownerId>/ 层级（真机实测：
+  // 每次上传都报 cannot open tmp for write: /files/u1/xxx.tmp —— 目录没建）。
+  // create_directories 对已存在目录是幂等空操作。
+  std::error_code dec;
+  fs::create_directories(fs::path(finalPath).parent_path(), dec);
   std::string tmp = finalPath + ".tmp";
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
@@ -2023,6 +2031,24 @@ int main(int argc, char** argv) {
     resp.setJson(200, cv::json::dump(v));
   });
 
+  // ---- POST /api/v1/shares/cleanup （需鉴权）清除调用者名下的无效分享 ----
+  // 必须注册在 DELETE /api/v1/shares/:id 之前，否则 "cleanup" 会被 :id 路由吃掉
+  // （parseId("cleanup") 失败回 404）。返回 200 {removed: N}。
+  // authUserId == -1（legacy/admin）：清全部无效分享；>=1：只清自己名下文件关联的无效分享。
+  server.route("POST", "/api/v1/shares/cleanup", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    std::int64_t now = cv::nowMillis();
+    std::int64_t removed = shr.cleanupInvalid(req.authUserId, now, perr);
+    if (removed < 0) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    cv::json::Value v = cv::json::Value::object();
+    v.set("removed", static_cast<long long>(removed));
+    resp.setJson(200, cv::json::dump(v));
+    CV_LOG_INFO("清除无效分享 authUserId=" << req.authUserId << " removed=" << removed);
+  });
+
   // ---- DELETE /api/v1/shares/:id （需鉴权）----
   server.route("DELETE", "/api/v1/shares/:id", [&](const net::Request& req, net::Response& resp) {
     std::string perr;
@@ -2041,7 +2067,7 @@ int main(int argc, char** argv) {
       resp.setError(404, "share not found");  // 不存在/已撤销
       return;
     }
-    if (!shr.removeById(id, perr)) {
+    if (!shr.revokeById(id, perr)) {
       resp.setError(500, std::string("db failed: ") + perr);
       return;
     }

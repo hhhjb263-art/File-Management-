@@ -121,6 +121,14 @@ bool migrateSchema(sqlite3* db, std::string& err) {
     if (msg) sqlite3_free(msg);
   }
 
+  // 1.5) shares.revoked（软撤销标记；老库补列，新库由 kSchemaSql 直接带上）
+  if (tableExists(db, "shares", err) && !tableHasColumn(db, "shares", "revoked", err)) {
+    std::vector<std::string> stmts = {
+        "ALTER TABLE shares ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0",
+    };
+    if (!execAll(db, stmts, err)) return false;
+  }
+
   // 2) upload_session.owner_id
   if (tableExists(db, "upload_session", err) && !tableHasColumn(db, "upload_session", "owner_id", err)) {
     std::vector<std::string> stmts = {

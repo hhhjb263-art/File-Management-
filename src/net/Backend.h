@@ -82,6 +82,14 @@ public:
                                                    int expireDays, int maxDownloads) = 0;
     virtual Ok                         revokeShare(const QString &shareId) = 0;
     virtual Ok                         touchShare(const QString &shareId) = 0; // 下载计数
+    // 清除无效分享（revoked/expired/exhausted）：物理删除、不可恢复；out 参数返回移除条数。
+    // ⚠️ **不能是纯虚**：MockBackend（本地引擎）没有账号/分享服务端，按项目 Unsupported 惯例
+    //    给默认实现返回失败——否则本地引擎直接无法实例化（编译期就报 abstract class）。
+    virtual Ok                         cleanupInvalidShares(std::int64_t &removed)
+    {
+        (void)removed;
+        return Ok::fail(QStringLiteral("[unsupported] 清除无效分享需要远程服务端"));
+    }
 
     // ---------------- 标签与检索 ----------------
     virtual Result<QVector<Tag>> tags() = 0;
@@ -126,6 +134,14 @@ public:
     virtual void revokeShareAsync(const QString &shareId, std::function<void(Ok)> done)
     {
         done(revokeShare(shareId));
+    }
+    // 清除无效分享的异步变体：默认退化同步；HttpBackend 覆写为真异步。
+    virtual void cleanupInvalidSharesAsync(std::function<void(Result<std::int64_t>)> done)
+    {
+        std::int64_t removed = 0;
+        Ok ok = cleanupInvalidShares(removed);
+        done(ok.ok ? Result<std::int64_t>::success(removed)
+                   : Result<std::int64_t>::fail(ok.error));
     }
 
 signals:

@@ -319,7 +319,13 @@ Dialog {
                 border.color: Qt.rgba(Theme.warning.r, Theme.warning.g, Theme.warning.b, 0.35)
                 Label {
                     id: tipLabel
-                    anchors.fill: parent
+                    // ⚠️ 不要用 anchors.fill：父矩形的 implicitHeight 依赖 tipLabel.implicitHeight，
+                    //    而 fill 会把 label 的上下边也锚到父级 ⇒ 高度绑定环，QML 掐断循环后
+                    //    盒子高度/宽度计算错乱（实测：提示框溢出对话框卡片，即“UI 错位”）。
+                    //    只锚左/右/上：宽度被约束（自动换行），高度由内容自然撑开。
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
                     anchors.margins: Theme.spaceM
                     text: qsTr("⚠ 提取码仅在创建时显示一次，请及时保存（列表页不再显示明文）。")
                           + "\n" + qsTr("链接可在浏览器直接打开；若设了提取码，打开后需输入提取码才能下载。")

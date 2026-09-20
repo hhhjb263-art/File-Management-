@@ -26,6 +26,23 @@ Item {
 
     readonly property bool sharesBusy: sharesReady && Shares.busy !== undefined ? Shares.busy : false
     readonly property int  sharesCount: sharesReady && Shares.count !== undefined ? Shares.count : 0
+    // 两栏切换：进行中（state === "active"）/ 已失效（其余：revoked/expired/exhausted）
+    property bool showInvalid: false
+    readonly property int activeCount:  sharesReady && Shares.activeCount  !== undefined ? Shares.activeCount  : 0
+    readonly property int invalidCount: sharesReady && Shares.invalidCount !== undefined ? Shares.invalidCount : 0
+    function rowState(info) { return page.sval(info, "state", "active"); }
+    function rowMatches(info) {
+        // 「已失效」栏：state 非 active（revoked/expired/exhausted）
+        if (page.showInvalid)
+            return page.rowState(info) !== "active"
+        // 「进行中」栏：**三重防御**——state、revoked、expired/usable 任一失效特征
+        // 都不放过。不依赖服务端版本（旧服务端不回 state/revoked 字段时，
+        // expired()/usable 由客户端本地时间与次数即可判定）。
+        if (page.sval(info, "state", "active") !== "active") return false
+        if (info.revoked === true) return false
+        if (info.expired === true) return false
+        return info.usable !== false
+    }
 
     // 数据变更版本号（at() 是函数调用，需显式依赖才重取值）
     property int sharesVersion: 0
@@ -177,6 +194,37 @@ Item {
             }
         }
 
+        // ---- 两栏切换：进行中 / 已失效 + 清除无效分享 ----
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: Theme.spaceS
+
+            GhostButton {
+                checkable: true
+                checked: !page.showInvalid
+                text: qsTr("进行中 (%1)").arg(page.activeCount)
+                font.pointSize: Theme.fontBody
+                onClicked: page.showInvalid = false
+            }
+            GhostButton {
+                checkable: true
+                checked: page.showInvalid
+                text: qsTr("已失效 (%1)").arg(page.invalidCount)
+                font.pointSize: Theme.fontBody
+                onClicked: page.showInvalid = true
+            }
+            Item { Layout.fillWidth: true }
+            DangerButton {
+                visible: page.showInvalid && page.invalidCount > 0
+                glyph: "🧹"
+                text: qsTr("🧹 清理")
+                enabled: !page.sharesBusy
+                onClicked: cleanupConfirm.open()
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("永久删除已撤销 / 已过期 / 次数用尽的分享记录，不可恢复")
+            }
+        }
+
         // ---- 列表卡片 ----
         Rectangle {
             Layout.fillWidth: true
@@ -214,8 +262,8 @@ Item {
                     color: Theme.bg
                     border.width: 1
                     border.color: Theme.border
-                    // 失效项弱化视觉
-                    opacity: isExpired ? 0.62 : 1.0
+                    // 按用户要求：失效/已撤销项**不做浅色弱化**——
+                    // 状态用徽标表达；「进行中」视图里整行直接隐藏（不显示）。
 
                     ColumnLayout {
                         id: rowCol
@@ -256,6 +304,11 @@ Item {
                                 tone: "neutral"
                                 text: qsTr("已失效")
                             }
+                            StatusBadge {
+                                visible: shareRow.info.revoked === true
+                                tone: "danger"
+                                text: qsTr("已撤销")
+                            }
                         }
 
                         // 第 2 行：有效期 / 剩余次数 / 已下载
@@ -285,6 +338,27 @@ Item {
                                 color: Theme.textSecondary
                                 font.pointSize: Theme.fontSecondary
                             }
+                            Label {
+                                // 创建时间
+                                text: shareRow.info.created !== undefined && shareRow.info.created !== null
+                                          ? qsTr("创建于 %1").arg(Qt.formatDateTime(shareRow.info.created, "yyyy-MM-dd HH:mm"))
+                                          : qsTr("创建时间未知")
+                                color: Theme.textSecondary
+                                font.pointSize: Theme.fontSecondary
+                            }
+                            Label {
+                                // 提取码明文只在创建时的本机缓存过；其它设备创建的显示「—」
+                                readonly property string codeShown: {
+                                    const c = page.sval(shareRow.info, "codeText", "")
+                                    return c.length > 0 ? c : ""
+                                }
+                                text: codeShown.length > 0 ? qsTr("提取码 %1").arg(codeShown)
+                                                   : (page.sval(shareRow.info, "needCode", false) === true
+                                                          ? qsTr("提取码 —（仅创建时的本机可见）")
+                                                          : qsTr("无提取码"))
+                                color: codeShown.length > 0 ? Theme.primary : Theme.textSecondary
+                                font.pointSize: Theme.fontSecondary
+                            }
                             Item { Layout.fillWidth: true }
                         }
 
@@ -302,32 +376,36 @@ Item {
                             }
                             GhostButton {
                                 glyph: "⧉"
-                                text: qsTr("复制链接")
+                                implicitWidth: Theme.controlHeight
                                 enabled: !page.sharesBusy && shareRow.url.length > 0
                                 onClicked: page.copyLink(shareRow.url)
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("复制链接")
                             }
                             // 「打开」：用系统默认浏览器验证/查看分享链接（Qt.openUrlExternally）。
                             // 过期项仍允许打开（浏览器会显示过期提示，正好可用于验证），按钮给 ToolTip 说明。
                             GhostButton {
                                 id: openLinkBtn
                                 glyph: "🌐"
-                                text: qsTr("打开")
+                                implicitWidth: Theme.controlHeight
                                 enabled: !page.sharesBusy && shareRow.url.length > 0
                                 onClicked: page.openExternal(shareRow.url)
                                 ToolTip.visible: openLinkBtn.hovered
                                 ToolTip.text: shareRow.isExpired
-                                              ? qsTr("该分享已过期，打开后浏览器会提示；可用于验证链接状态")
-                                              : qsTr("在系统默认浏览器中打开该链接")
+                                              ? qsTr("已过期：打开可验证链接状态")
+                                              : qsTr("在系统默认浏览器中打开")
                             }
                             DangerButton {
                                 glyph: "🗑"
-                                text: qsTr("撤销")
+                                implicitWidth: Theme.controlHeight
                                 enabled: !page.sharesBusy
                                 onClicked: {
                                     revokeConfirm.shareId = page.sval(shareRow.info, "id", "")
                                     revokeConfirm.shareName = page.sval(shareRow.info, "fileName", "")
                                     revokeConfirm.open()
                                 }
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("撤销此分享（链接立即失效）")
                             }
                         }
                     }
@@ -426,6 +504,43 @@ Item {
                         revokeConfirm.close()
                     }
                 }
+            }
+        }
+    }
+
+    // 进入分享页即自动刷新（每次进入都拉最新列表；失效项自动归入「已失效」栏）
+    Component.onCompleted: page.doRefresh()
+
+    // 「清除无效分享」确认框：物理删除、不可恢复，必须二次确认
+    Dialog {
+        id: cleanupConfirm
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(440, (parent ? parent.width - Theme.spaceXl * 2 : 440))
+        standardButtons: Dialog.NoButton
+        title: qsTr("清除无效分享")
+
+        ColumnLayout {
+            spacing: Theme.spaceM
+            Label {
+                Layout.fillWidth: true
+                text: qsTr("将永久删除全部「已撤销 / 已过期 / 次数用尽」的分享记录（含其链接），此操作不可恢复。")
+                wrapMode: Text.WordWrap
+                color: Theme.textPrimary
+                font.pointSize: Theme.fontBody
+            }
+            Label {
+                Layout.fillWidth: true
+                text: qsTr("进行中的分享不受影响。")
+                color: Theme.textSecondary
+                font.pointSize: Theme.fontSecondary
+            }
+        }
+        footer: DialogButtonBox {
+            GhostButton { text: qsTr("取消"); onClicked: cleanupConfirm.reject() }
+            DangerButton {
+                text: qsTr("确认清除")
+                onClicked: { cleanupConfirm.close(); Shares.cleanupInvalid() }
             }
         }
     }

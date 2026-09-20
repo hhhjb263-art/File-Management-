@@ -70,6 +70,14 @@ public:
 
     void sync();
 
+    // ---- 分享提取码本地缓存（加法式）----
+    // 服务端只存 sha256(token+code)，列表接口永远拿不到明文提取码；创建分享的瞬间客户端
+    // 拿到过明文（ShareController::created 信号），缓存「分享 id -> 提取码」到 settings.ini。
+    // 别的设备创建的 / 重装过的分享无本机记录 → codeText 为空，QML 显示「—」并注明原因。
+    QVariantMap shareCodes() const;                       // 全量 {id: code}
+    void        setShareCode(const QString &id, const QString &code); // 单条写入
+    void        dropShareCodes(const QStringList &ids);   // 批量清除（清理无效分享后调用）
+
 private:
     explicit Settings(QObject *parent = nullptr);
 

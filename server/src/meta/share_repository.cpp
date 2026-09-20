@@ -11,7 +11,7 @@ namespace cv {
 // 与 SELECT 语句列顺序保持一致：id, token, file_id, code_hash, expires_at, max_downloads, downloads, created_at
 namespace {
 const char* kShareCols =
-    "id, token, file_id, code_hash, expires_at, max_downloads, downloads, created_at";
+    "id, token, file_id, code_hash, expires_at, max_downloads, downloads, created_at, revoked";
 
 constexpr std::int64_t kMillisPerDay = 24LL * 60 * 60 * 1000;
 }  // namespace
@@ -25,6 +25,7 @@ bool ShareRepository::rowToShare(Stmt& stmt, Share& out) {
   out.maxDownloads = stmt.int64(5);
   out.downloads = stmt.int64(6);
   out.createdAt = stmt.int64(7);
+    out.revoked = stmt.int64(8) != 0;
   return true;
 }
 
@@ -60,6 +61,13 @@ std::string randomHex(std::size_t nBytes) {
 std::string shareCodeHash(const std::string& token, const std::string& code) {
   if (code.empty()) return "";  // 无提取码：need_code=false，code_hash 存空串
   return Sha256::of(token + ":" + code);
+}
+
+std::string shareStateOf(const Share& s, std::int64_t nowMillis) {
+  if (s.revoked) return "revoked";
+  if (s.expiresAt != 0 && s.expiresAt < nowMillis) return "expired";
+  if (s.maxDownloads > 0 && s.downloads >= s.maxDownloads) return "exhausted";
+  return "active";
 }
 
 bool ShareRepository::create(std::int64_t fileId, const std::string& codeHash,
@@ -107,7 +115,7 @@ bool ShareRepository::findByToken(const std::string& token, Share& out, bool& fo
                                   std::string& err) {
   found = false;
   Stmt stmt(db_.handle(),
-            std::string("SELECT ") + kShareCols + " FROM shares WHERE token = ? LIMIT 1", err);
+            std::string("SELECT ") + kShareCols + " FROM shares WHERE token = ? AND revoked = 0 LIMIT 1", err);
   if (!stmt.ok()) return false;
   if (!stmt.bind(1, token)) {
     err = "bind failed";
@@ -164,6 +172,16 @@ bool ShareRepository::listAllVisible(std::int64_t callerOwnerId, std::vector<Sha
   return true;
 }
 
+bool ShareRepository::revokeById(std::int64_t id, std::string& err) {
+  Stmt stmt(db_.handle(), "UPDATE shares SET revoked = 1 WHERE id = ?", err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, id)) {
+    err = "bind failed";
+    return false;
+  }
+  return stmt.step(err) == SQLITE_DONE;
+}
+
 bool ShareRepository::removeById(std::int64_t id, std::string& err) {
   Stmt stmt(db_.handle(), "DELETE FROM shares WHERE id = ?", err);
   if (!stmt.ok()) return false;
@@ -191,6 +209,46 @@ bool ShareRepository::incrDownloads(std::int64_t id, std::string& err, bool* out
   // sqlite3_changes 取最近一条语句的实际改动行数；0 行 = 已达上限（用尽），而非错误。
   if (outExhausted && sqlite3_changes(db_.handle()) == 0) *outExhausted = true;
   return true;
+}
+
+std::int64_t ShareRepository::cleanupInvalid(std::int64_t callerOwnerId, std::int64_t nowMillis,
+                                             std::string& err) {
+  err.clear();
+  // 物理删除「无效」分享：revoked / 已过期（expires_at>0 且 < now）/ 次数用尽。
+  // shares 表无 owner 列，归属必须走 file_node JOIN（与 listAllVisible 同款）。
+  if (callerOwnerId == -1) {
+    // legacy/admin：清理全部无效分享，不走归属过滤（不绑假值，单独一条 SQL）。
+    Stmt stmt(db_.handle(),
+              "DELETE FROM shares "
+              "WHERE revoked = 1 "
+              "   OR (expires_at > 0 AND expires_at < ?) "
+              "   OR (max_downloads > 0 AND downloads >= max_downloads)",
+              err);
+    if (!stmt.ok()) return -1;
+    if (!stmt.bind(1, nowMillis)) {
+      err = "bind failed";
+      return -1;
+    }
+    if (stmt.step(err) != SQLITE_DONE) return -1;
+    return sqlite3_changes(db_.handle());
+  }
+  // 归属分支：仅删 owner_id == callerOwnerId 文件关联的无效分享。
+  Stmt stmt(db_.handle(),
+            "DELETE FROM shares "
+            "WHERE (revoked = 1 "
+            "       OR (expires_at > 0 AND expires_at < ?) "
+            "       OR (max_downloads > 0 AND downloads >= max_downloads)) "
+            "  AND id IN (SELECT s.id FROM shares s "
+            "             JOIN file_node f ON f.id = s.file_id "
+            "             WHERE f.owner_id = ?)",
+            err);
+  if (!stmt.ok()) return -1;
+  if (!stmt.bind(1, nowMillis) || !stmt.bind(2, callerOwnerId)) {
+    err = "bind failed";
+    return -1;
+  }
+  if (stmt.step(err) != SQLITE_DONE) return -1;
+  return sqlite3_changes(db_.handle());
 }
 
 }  // namespace cv

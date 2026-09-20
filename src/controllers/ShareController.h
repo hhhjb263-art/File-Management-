@@ -32,6 +32,9 @@ class ShareController : public QObject
     Q_PROPERTY(QString unsupportedNotice READ unsupportedNotice CONSTANT)
     Q_PROPERTY(int     count             READ count             NOTIFY sharesChanged)
     Q_PROPERTY(bool    busy              READ busy              NOTIFY busyChanged)
+    // 两栏分桶计数（refresh 时按 state 计算）：active vs 其余三种（revoked/expired/exhausted）
+    Q_PROPERTY(int     activeCount       READ activeCount       NOTIFY sharesChanged)
+    Q_PROPERTY(int     invalidCount      READ invalidCount      NOTIFY sharesChanged)
 
 public:
     explicit ShareController(Backend *backend = nullptr, QObject *parent = nullptr);
@@ -40,12 +43,15 @@ public:
     QString unsupportedNotice() const { return QString(); } // 保留字段，恒空串
     int     count() const { return m_shares.size(); }
     bool    busy() const { return m_busy; }
+    int     activeCount() const;      // 进行中（state == "active"）条数
+    int     invalidCount() const;     // 已失效（其余三种状态）条数
 
     Q_INVOKABLE void refresh(); // 拉取分享列表
     Q_INVOKABLE void create(const QString &fileId, const QString &code, int expireDays,
                             int maxDownloads); // 创建分享
     Q_INVOKABLE void revoke(const QString &shareId); // 撤销分享
     Q_INVOKABLE void copyLink(const QString &url);   // 复制链接到剪贴板
+    Q_INVOKABLE void cleanupInvalid();               // 清除当前调用者名下全部无效分享（不可恢复）
     Q_INVOKABLE QVariantMap at(int i) const;         // 第 i 条（越界返回空 map）
 
 signals:

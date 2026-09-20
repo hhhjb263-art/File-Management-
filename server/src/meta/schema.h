@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS shares (
   expires_at    INTEGER NOT NULL DEFAULT 0,
   max_downloads INTEGER NOT NULL DEFAULT 0,
   downloads     INTEGER NOT NULL DEFAULT 0,
-  created_at    INTEGER NOT NULL
+  created_at    INTEGER NOT NULL,
+  revoked       INTEGER NOT NULL DEFAULT 0  -- 1 = 已撤销（软撤销：列表保留、/s/* 视为不存在）
 );
 CREATE INDEX IF NOT EXISTS idx_shares_token ON shares(token);
 )SQL";
