@@ -501,6 +501,9 @@ Item {
         }
     }
 
+    // 进入分享页即自动刷新（每次进入都拉最新列表；失效项自动归入「已失效」栏）
+    Component.onCompleted: page.doRefresh()
+
     // 「清除无效分享」确认框：物理删除、不可恢复，必须二次确认
     Dialog {
         id: cleanupConfirm

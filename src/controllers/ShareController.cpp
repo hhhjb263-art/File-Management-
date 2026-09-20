@@ -87,6 +87,18 @@ void ShareController::refresh()
             return;
         }
         m_shares = r.value;
+        // 本地判定失效状态（revoked / 已过期 / 次数用尽 ⇒ 归入「已失效」栏）。
+        // 不依赖服务端 state 字段——旧服务端没升级也能正确分栏（用户实测诉求）。
+        for (ShareLink &s : m_shares) {
+            if (s.revoked)
+                s.state = QStringLiteral("revoked");
+            else if (s.expired())
+                s.state = QStringLiteral("expired");
+            else if (s.maxDownloads > 0 && s.downloads >= s.maxDownloads)
+                s.state = QStringLiteral("exhausted");
+            else if (s.state.isEmpty())
+                s.state = QStringLiteral("active");
+        }
         emit sharesChanged();
     });
 }
@@ -121,6 +133,12 @@ void ShareController::create(const QString &fileId, const QString &code, int exp
                                     }
 
                                     // 成功：链接 + 明文提取码**仅此一次**回显给界面
+                                    // 同时把「分享 id → 提取码」缓存在本机（settings.ini），
+                                    // 分享列表按 id 展示明文（服务端只存哈希，列表永远拿不到明文）
+                                    if (!r.value.id.isEmpty() && !r.value.code.isEmpty()) {
+                                        Settings::instance().setShareCode(r.value.id, r.value.code);
+                                        Settings::instance().sync();
+                                    }
                                     emit created(r.value.url, r.value.code);
                                     emit statusMessage(QStringLiteral("✓ 分享链接已创建"), true);
                                     emit logMessage(QStringLiteral("INFO"),
