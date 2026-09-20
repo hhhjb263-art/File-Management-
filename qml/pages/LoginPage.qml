@@ -83,6 +83,13 @@ Item {
             nameField.text = ""
             lockCountdown = 0
         }
+        function onLoggedOut() {
+            // 登出后重新按「记住密码」预填，方便再次登录
+            if (Auth.rememberPassword && Auth.savedUserName.length > 0)
+                userField.text = Auth.savedUserName
+            if (Auth.rememberPassword && Auth.savedPassword.length > 0)
+                passField.text = Auth.savedPassword
+        }
     }
 
     ColumnLayout {
@@ -210,9 +217,35 @@ Item {
                     GhostButton {
                         id: showPw
                         checkable: true
-                        text: showPw.checked ? qsTr("隐藏") : qsTr("显示")
-                        font.pointSize: Theme.fontSecondary
+                        // 纯图标（不用文字）：👁=显示中 → 点它变 🙈 隐藏
+                        text: showPw.checked ? "🙈" : "👁"
+                        font.pointSize: Theme.fontTitle
+                        implicitWidth: Theme.controlHeight
+                        ToolTip.visible: hovered
+                        ToolTip.text: showPw.checked ? qsTr("隐藏密码") : qsTr("显示密码")
                     }
+                }
+
+                // 密码格式提示（注册模式）：与服务端规则一致（≥8 位）
+                Label {
+                    Layout.fillWidth: true
+                    visible: isRegister
+                    text: qsTr("密码至少 8 位，建议包含字母与数字")
+                    color: passField.text.length > 0 && passField.text.length < 8
+                               ? Theme.danger : Theme.textSecondary
+                    font.pointSize: Theme.fontSecondary
+                    wrapMode: Text.WordWrap
+                }
+
+                // 记住密码（仅登录模式；注册成功后仍需登录）
+                CheckBox {
+                    id: rememberBox
+                    visible: !isRegister
+                    Layout.fillWidth: true
+                    text: qsTr("记住密码")
+                    checked: Auth.rememberPassword
+                    onToggled: Auth.rememberPassword = checked
+                    font.pointSize: Theme.fontSecondary
                 }
 
                 Label {
@@ -247,7 +280,16 @@ Item {
         }
     }
 
-    Component.onCompleted: userField.forceActiveFocus()
+    Component.onCompleted: {
+        // 预填：「记住密码」开启时带出用户名+密码；否则只带出上次用户名
+        if (Auth.savedUserName.length > 0)
+            userField.text = Auth.savedUserName
+        else if (Auth.userName.length > 0)
+            userField.text = Auth.userName
+        if (Auth.rememberPassword && Auth.savedPassword.length > 0)
+            passField.text = Auth.savedPassword
+        userField.forceActiveFocus()
+    }
 
     function submit() {
         if (isRegister)

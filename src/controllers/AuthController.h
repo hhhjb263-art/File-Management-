@@ -41,6 +41,9 @@ class AuthController : public QObject
     Q_PROPERTY(QString errorKind           READ errorKind           NOTIFY errorChanged)
     Q_PROPERTY(QString errorText           READ errorText           NOTIFY errorChanged)
     Q_PROPERTY(int     retryAfterSeconds   READ retryAfterSeconds   NOTIFY errorChanged)
+    Q_PROPERTY(bool    rememberPassword    READ rememberPassword    WRITE setRememberPassword NOTIFY rememberPasswordChanged)
+    Q_PROPERTY(QString savedUserName       READ savedUserName       NOTIFY savedLoginChanged)
+    Q_PROPERTY(QString savedPassword       READ savedPassword       NOTIFY savedLoginChanged)
 
 public:
     explicit AuthController(Backend *backend, AppController *app, QObject *parent = nullptr);
@@ -56,6 +59,9 @@ public:
     QString errorKind() const { return m_errorKind; }
     QString errorText() const { return m_errorText; }
     int     retryAfterSeconds() const { return m_retryAfterSeconds; }
+    bool    rememberPassword() const { return m_rememberPassword; }
+    QString savedUserName() const { return m_savedUserName; }
+    QString savedPassword() const { return m_savedPassword; }
 
     // ---- 契约方法（Q_INVOKABLE，供 QML 调用）----
     Q_INVOKABLE void login(const QString &username, const QString &password);
@@ -64,6 +70,8 @@ public:
     Q_INVOKABLE void logout();
     Q_INVOKABLE void refreshMe();   // 用当前令牌刷新当前用户（启动 / 恢复时调用）
     Q_INVOKABLE void startupCheck(); // 启动判定：探测服务端是否具备账号体系
+    Q_INVOKABLE void clearSavedPassword(); // 关闭「记住密码」时清掉已存密码
+    void setRememberPassword(bool on);   // Q_PROPERTY WRITE 用
 
 public slots:
     // 由 HttpBackend::unauthorized() 触发（收到 401 且持有令牌）。
@@ -76,6 +84,8 @@ public slots:
 signals:
     void loggedIn(const QString &userId, const QString &userName, const QString &displayName);
     void loggedOut(const QString &reason); // reason: "user" | "expired" | "server-changed"
+    void rememberPasswordChanged();
+    void savedLoginChanged();
     void authError(const QString &kind, const QString &message);
     void registered(); // 注册成功（切换到登录态由 QML 处理）
     void statusMessage(const QString &message, bool ok);
@@ -126,6 +136,9 @@ private:
     QString m_errorKind;
     QString m_errorText;
     int    m_retryAfterSeconds = -1;
+    bool    m_rememberPassword = false;
+    QString m_savedUserName;
+    QString m_savedPassword;
 };
 
 } // namespace cv

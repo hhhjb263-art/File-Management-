@@ -16,6 +16,10 @@ AuthController::AuthController(Backend *backend, AppController *app, QObject *pa
 {
     // 回想上次登录用户名（仅用于登录框预填，不暗示已登录）。
     m_userName = Settings::instance().lastUser();
+    // 「记住密码」与预填凭据（opt-in；用户名/密码均存 settings.ini 的 auth/ 键下）
+    m_rememberPassword = Settings::instance().rememberPassword();
+    m_savedUserName    = Settings::instance().savedUser();
+    m_savedPassword    = Settings::instance().savedPassword();
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +109,19 @@ void AuthController::login(const QString &username, const QString &password)
         Settings::instance().setLastUser(username);
         Settings::instance().sync();
         setLegacyMode(false);
+        // 「记住密码」：开启则连同密码一起存（下次启动自动预填）；关闭则清掉已存的
+        if (m_rememberPassword) {
+            Settings::instance().setSavedUser(username);
+            Settings::instance().setSavedPassword(password);
+        } else {
+            Settings::instance().setSavedUser(QString());
+            Settings::instance().setSavedPassword(QString());
+            m_savedUserName.clear();
+            m_savedPassword.clear();
+        }
+        Settings::instance().sync();
+        emit rememberPasswordChanged();
+        emit savedLoginChanged();
         setLoggedIn(true);
         emit loggedIn(m_userId, m_userName, m_displayName);
     } else {
@@ -173,6 +190,32 @@ void AuthController::onServerUrlChanged()
 {
     // 切换服务器：无论是否登录都清空（避免把 A 的令牌发给 B）。
     resetSession(QStringLiteral("server-changed"));
+}
+
+void AuthController::setRememberPassword(bool on)
+{
+    if (m_rememberPassword == on)
+        return;
+    m_rememberPassword = on;
+    Settings::instance().setRememberPassword(on);
+    // 关闭即清掉已存凭据；开启不主动存，等下一次登录成功时再存。
+    if (!on) {
+        Settings::instance().setSavedUser(QString());
+        Settings::instance().setSavedPassword(QString());
+        m_savedUserName.clear();
+        m_savedPassword.clear();
+    }
+    Settings::instance().sync();
+    emit rememberPasswordChanged();
+    emit savedLoginChanged();
+}
+
+void AuthController::clearSavedPassword()
+{
+    Settings::instance().setSavedPassword(QString());
+    m_savedPassword.clear();
+    Settings::instance().sync();
+    emit savedLoginChanged();
 }
 
 void AuthController::resetSession(const QString &reason)

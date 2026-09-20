@@ -25,6 +25,13 @@ public:
     void    setToken(const QString &token);
     QString lastUser() const;
     void    setLastUser(const QString &user);
+    // ---- 登录态（记住密码 / 预填）----
+    bool    rememberPassword() const;
+    void    setRememberPassword(bool on);
+    QString savedUser() const;              // 「记住密码」开启时预填用户名
+    void    setSavedUser(const QString &user);
+    QString savedPassword() const;          // 明文存于 settings.ini（桌面应用惯例；opt-in）
+    void    setSavedPassword(const QString &pwd);
 
     // ---- 外观 ----
     bool darkMode() const;
