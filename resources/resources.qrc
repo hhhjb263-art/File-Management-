@@ -25,6 +25,7 @@
 
         <!-- 页面 -->
         <file alias="qml/pages/FilesPage.qml">../qml/pages/FilesPage.qml</file>
+        <file alias="qml/pages/LoginPage.qml">../qml/pages/LoginPage.qml</file>
         <file alias="qml/pages/TransfersPage.qml">../qml/pages/TransfersPage.qml</file>
         <file alias="qml/pages/SettingsPage.qml">../qml/pages/SettingsPage.qml</file>
         <file alias="qml/pages/SharesPage.qml">../qml/pages/SharesPage.qml</file>

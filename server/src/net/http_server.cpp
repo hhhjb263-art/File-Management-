@@ -141,7 +141,11 @@ HttpServer::~HttpServer() { shutdown(); }
 
 void HttpServer::setAuthToken(const std::string& token) { authToken_ = token; }
 
-bool HttpServer::authorized(const Request& req) const {
+void HttpServer::setSessionValidator(SessionValidator v) { sessionValidator_ = std::move(v); }
+
+void HttpServer::setAccountsEnabled(bool on) { accountsEnabled_ = on; }
+
+bool HttpServer::authenticate(Request& req) const {
   // 期望请求头：Authorization: Bearer <token>
   // 兼容历史头：X-CV-Token: <token>（直接携带 token，无前缀）
   std::string token;
@@ -153,7 +157,21 @@ bool HttpServer::authorized(const Request& req) const {
     token = req.header("x-cv-token");
   }
   if (token.empty()) return false;
-  return constantTimeEqual(token, authToken_);
+
+  // ① 账号体系会话优先：有效则认定身份（>=1），后续路由据此做归属过滤。
+  if (sessionValidator_) {
+    std::int64_t uid = -1;
+    if (sessionValidator_(token, uid) && uid >= 1) {
+      req.authUserId = uid;
+      return true;
+    }
+  }
+  // ② 静态 --auth-token 兜底（legacy/admin）：不写身份 ⇒ authUserId 保持 -1（不做归属过滤）。
+  if (!authToken_.empty() && constantTimeEqual(token, authToken_)) {
+    req.authUserId = -1;
+    return true;
+  }
+  return false;
 }
 
 namespace {
@@ -423,8 +441,8 @@ void HttpServer::handleClient(const Conn& conn) {
       // 协议面：仅支持 Content-Length 定长帧，显式拒绝 chunked，防前置反代场景的请求走私
       resp.setError(501, "Transfer-Encoding: chunked is not supported; use Content-Length");
       keepAlive = false;
-    } else if (!authToken_.empty() && req.path != "/healthz" &&
-               !startsWith(req.path, "/s/") && !authorized(req)) {
+    } else if ((!authToken_.empty() || accountsEnabled_) && req.path != "/healthz" &&
+               !startsWith(req.path, "/s/") && !authenticate(req)) {
       // 启用鉴权且非豁免接口：/healthz 与公开分享端点 /s/* 免鉴权（分享链接本就面向匿名访问）；
       // 其余接口缺 Token 或不匹配 → 401（JSON 说明原因，恒定时间比较），不 dispatch。
       // 注意：仅放行 /s/ 前缀，绝不放宽 /api/ 下任何路径。

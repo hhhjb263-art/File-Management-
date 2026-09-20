@@ -97,6 +97,7 @@ find_package(SQLite3 REQUIRED)
 # ---------------------------------------------------------------------------
 add_library(cv_core STATIC
   src/core/sha256.cpp
+  src/core/pbkdf2.cpp
   src/core/json.cpp
   src/core/logger.cpp
   src/core/config.cpp
@@ -123,6 +124,7 @@ add_library(cv_meta STATIC
   src/meta/file_repository.cpp
   src/meta/upload_repository.cpp
   src/meta/share_repository.cpp
+  src/meta/user_repository.cpp
 )
 target_include_directories(cv_meta PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(cv_meta PUBLIC cv_core SQLite::SQLite3)
@@ -157,7 +159,10 @@ cv_target_setup(cv_net)
 # ---------------------------------------------------------------------------
 #  app ----------------
 # ---------------------------------------------------------------------------
-add_executable(cloudvault-server src/app/main.cpp)
+add_executable(cloudvault-server
+  src/app/main.cpp
+  src/app/auth_routes.cpp
+)
 target_link_libraries(cloudvault-server PRIVATE cv_net cv_store cv_meta cv_core)
 cv_target_setup(cloudvault-server)
 

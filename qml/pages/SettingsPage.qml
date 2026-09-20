@@ -35,6 +35,10 @@ Item {
     // 令牌可见性
     property bool tokenVisible: false
 
+    // 令牌是否由登录会话托管（已登录且非 legacy）：此时手动输入区改为只读，避免两套凭据并存。
+    readonly property bool tokenManaged: (typeof Auth !== "undefined" && Auth.loggedIn !== undefined)
+                                        ? (Auth.loggedIn && !Auth.legacyMode) : false
+
     // ---- 自动刷新：回灌抑制（避免 currentIndex ↔ 秒值 双向映射产生信号回环）----
     property bool autoRefreshSyncing: false
     readonly property var autoRefreshOptions: [
@@ -459,16 +463,28 @@ Item {
                             echoMode: page.tokenVisible ? TextInput.Normal : TextInput.Password
                             placeholderText: qsTr("Bearer 令牌（可留空）")
                             text: App.accessToken
+                            readOnly: page.tokenManaged
+                            enabled: !page.tokenManaged
                         }
                         GhostButton {
                             glyph: page.tokenVisible ? "🙈" : "👁"
                             text: page.tokenVisible ? qsTr("隐藏") : qsTr("显示")
+                            enabled: !page.tokenManaged
                             onClicked: page.tokenVisible = !page.tokenVisible
                         }
                     }
 
                     Label {
                         Layout.fillWidth: true
+                        visible: page.tokenManaged
+                        text: qsTr("已通过登录会话托管访问令牌，无需手动填写。退出登录后可在此手动指定。")
+                        color: Theme.success
+                        font.pointSize: Theme.fontSecondary
+                        wrapMode: Text.WordWrap
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        visible: !page.tokenManaged
                         text: qsTr("服务端未启用鉴权时可留空。")
                         color: Theme.textSecondary
                         font.pointSize: Theme.fontSecondary
@@ -484,7 +500,9 @@ Item {
                         text: qsTr("保存设置")
                         onClicked: {
                             page.commit()
-                            App.accessToken = tokenField.text
+                            // 已登录时令牌由会话托管，不要用手动输入框（可能为空/过期）覆盖。
+                            if (!page.tokenManaged)
+                                App.accessToken = tokenField.text
                             App.saveSettings()
                             page.markDownloadDirSaved()
                         }

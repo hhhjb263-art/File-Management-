@@ -16,7 +16,7 @@ namespace {
 
 const char* kSelectFile =
     "SELECT f.id, f.name, f.size, f.content_hash, f.chunk_count, f.created_at, "
-    "COALESCE(d.dir, '') FROM file_node f "
+    "COALESCE(d.dir, ''), f.owner_id FROM file_node f "
     "LEFT JOIN file_dir d ON d.file_id = f.id WHERE f.deleted = 0";
 
 void readFileRow(Stmt& stmt, FileRow& out) {
@@ -27,6 +27,7 @@ void readFileRow(Stmt& stmt, FileRow& out) {
   out.chunkCount = static_cast<int>(stmt.int64(4));
   out.createdAt = stmt.int64(5);
   out.dir = stmt.text(6);
+  out.ownerId = stmt.int64(7);
 }
 
 }  // namespace
@@ -58,13 +59,14 @@ bool FileRepository::findById(std::int64_t id, FileRow& out, std::string& err) {
   return true;
 }
 
-bool FileRepository::findByPath(const std::string& dir, const std::string& name,
-                                FileRow& out, std::string& err) {
+bool FileRepository::findByPath(std::int64_t ownerId, const std::string& dir,
+                                const std::string& name, FileRow& out, std::string& err) {
   std::string sql =
-      std::string(kSelectFile) + " AND COALESCE(d.dir, '') = ? AND f.name = ? LIMIT 1";
+      std::string(kSelectFile) +
+      " AND COALESCE(d.dir, '') = ? AND f.name = ? AND f.owner_id = ? LIMIT 1";
   Stmt stmt(db_.handle(), sql, err);
   if (!stmt.ok()) return false;
-  if (!stmt.bind(1, dir) || !stmt.bind(2, name)) {
+  if (!stmt.bind(1, dir) || !stmt.bind(2, name) || !stmt.bind(3, ownerId)) {
     err = "bind failed";
     return false;
   }
@@ -73,10 +75,15 @@ bool FileRepository::findByPath(const std::string& dir, const std::string& name,
   return true;
 }
 
-bool FileRepository::listFiles(std::vector<FileRow>& out, std::string& err) {
-  std::string sql = std::string(kSelectFile) + " ORDER BY f.id DESC LIMIT 500";
+bool FileRepository::listFiles(std::int64_t ownerId, std::vector<FileRow>& out,
+                              std::string& err) {
+  std::string sql = std::string(kSelectFile) + " AND f.owner_id = ? ORDER BY f.id DESC LIMIT 500";
   Stmt stmt(db_.handle(), sql, err);
   if (!stmt.ok()) return false;
+  if (!stmt.bind(1, ownerId)) {
+    err = "bind failed";
+    return false;
+  }
   while (true) {
     int rc = stmt.step(err);
     if (rc == SQLITE_DONE) break;
@@ -88,14 +95,33 @@ bool FileRepository::listFiles(std::vector<FileRow>& out, std::string& err) {
   return true;
 }
 
-bool FileRepository::createDir(const std::string& path, bool& created, std::string& err) {
+bool FileRepository::chunkSizesOf(const std::vector<std::string>& hashes,
+                                 std::vector<std::size_t>& out, std::string& err) {
+  out.clear();
+  out.reserve(hashes.size());
+  for (const std::string& h : hashes) {
+    Stmt stmt(db_.handle(), "SELECT size FROM chunk WHERE hash = ? LIMIT 1", err);
+    if (!stmt.ok()) return false;
+    if (!stmt.bind(1, h)) {
+      err = "bind failed";
+      return false;
+    }
+    std::size_t sz = 0;
+    if (stmt.step(err) == SQLITE_ROW) sz = static_cast<std::size_t>(stmt.int64(0));
+    out.push_back(sz);
+  }
+  return true;
+}
+
+bool FileRepository::createDir(std::int64_t ownerId, const std::string& path, bool& created,
+                              std::string& err) {
   created = false;
   Stmt ins(db_.handle(),
-           "INSERT INTO dir_node (path, created_at) VALUES (?, ?) "
-           "ON CONFLICT(path) DO NOTHING",
+           "INSERT INTO dir_node (owner_id, path, created_at) VALUES (?, ?, ?) "
+           "ON CONFLICT(owner_id, path) DO NOTHING",
            err);
   if (!ins.ok()) return false;
-  if (!ins.bind(1, path) || !ins.bind(2, nowMillis())) {
+  if (!ins.bind(1, ownerId) || !ins.bind(2, path) || !ins.bind(3, nowMillis())) {
     err = "bind failed";
     return false;
   }
@@ -104,10 +130,16 @@ bool FileRepository::createDir(const std::string& path, bool& created, std::stri
   return true;
 }
 
-bool FileRepository::listDirs(std::vector<std::string>& out, std::string& err) {
+bool FileRepository::listDirs(std::int64_t ownerId, std::vector<std::string>& out,
+                             std::string& err) {
   out.clear();
-  Stmt stmt(db_.handle(), "SELECT path FROM dir_node ORDER BY path", err);
+  Stmt stmt(db_.handle(),
+            "SELECT path FROM dir_node WHERE owner_id = ? ORDER BY path", err);
   if (!stmt.ok()) return false;
+  if (!stmt.bind(1, ownerId)) {
+    err = "bind failed";
+    return false;
+  }
   while (true) {
     int rc = stmt.step(err);
     if (rc == SQLITE_DONE) break;
@@ -117,18 +149,42 @@ bool FileRepository::listDirs(std::vector<std::string>& out, std::string& err) {
   return true;
 }
 
-bool FileRepository::listDirsAll(std::vector<std::string>& out, std::string& err) {
+bool FileRepository::sumSizeOfOwner(std::int64_t ownerId, std::int64_t& total,
+                                   std::string& err) {
+  total = 0;
+  Stmt stmt(db_.handle(),
+            "SELECT COALESCE(SUM(size), 0) FROM file_node WHERE owner_id = ? AND deleted = 0",
+            err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, ownerId)) {
+    err = "bind failed";
+    return false;
+  }
+  if (stmt.step(err) != SQLITE_ROW) return false;
+  total = stmt.int64(0);
+  return true;
+}
+
+bool FileRepository::listDirsAll(std::int64_t ownerId, std::vector<std::string>& out,
+                                 std::string& err) {
   std::set<std::string> dirs;  // 自动去重 + 排序
-  // 1) 已显式登记的目录（dir_node）
+  // 1) 已显式登记的目录（dir_node，按 owner 隔离）
   {
     std::vector<std::string> registered;
-    if (!listDirs(registered, err)) return false;
+    if (!listDirs(ownerId, registered, err)) return false;
     for (const std::string& d : registered) dirs.insert(d);
   }
-  // 2) 文件所属目录及其全部祖先（有些目录仅通过文件登记、未走 createDir）
+  // 2) 文件所属目录及其全部祖先（有些目录仅通过文件登记、未走 createDir）；
+  //    仅取归属在该 owner 下文件的目录，避免看到他人目录。
   {
-    Stmt stmt(db_.handle(), "SELECT DISTINCT dir FROM file_dir", err);
+    Stmt stmt(db_.handle(),
+              "SELECT DISTINCT d.dir FROM file_dir d "
+              "JOIN file_node f ON f.id = d.file_id WHERE f.owner_id = ?", err);
     if (!stmt.ok()) return false;
+    if (!stmt.bind(1, ownerId)) {
+      err = "bind failed";
+      return false;
+    }
     while (true) {
       int rc = stmt.step(err);
       if (rc == SQLITE_DONE) break;
@@ -166,15 +222,18 @@ bool FileRepository::chunkHashesOf(std::int64_t fileId, std::vector<std::string>
   return true;
 }
 
-bool FileRepository::nameExists(const std::string& dir, const std::string& name,
-                                std::int64_t excludeId, bool& exists, std::string& err) {
+bool FileRepository::nameExists(std::int64_t ownerId, const std::string& dir,
+                                const std::string& name, std::int64_t excludeId,
+                                bool& exists, std::string& err) {
   exists = false;
   Stmt stmt(db_.handle(),
             "SELECT COUNT(*) FROM file_node f LEFT JOIN file_dir d ON d.file_id = f.id "
-            "WHERE f.deleted = 0 AND COALESCE(d.dir, '') = ? AND f.name = ? AND f.id != ?",
+            "WHERE f.deleted = 0 AND COALESCE(d.dir, '') = ? AND f.name = ? "
+            "AND f.owner_id = ? AND f.id != ?",
             err);
   if (!stmt.ok()) return false;
-  if (!stmt.bind(1, dir) || !stmt.bind(2, name) || !stmt.bind(3, excludeId)) {
+  if (!stmt.bind(1, dir) || !stmt.bind(2, name) || !stmt.bind(3, ownerId) ||
+      !stmt.bind(4, excludeId)) {
     err = "bind failed";
     return false;
   }
@@ -406,7 +465,8 @@ bool FileRepository::addChunkIfAbsent(const std::string& hash, std::int64_t size
 }
 
 bool FileRepository::insertFile(const std::string& name, const std::string& dir,
-                                std::int64_t size, const std::string& contentHash,
+                                std::int64_t ownerId, std::int64_t size,
+                                const std::string& contentHash,
                                 const std::vector<std::string>& chunkHashes,
                                 const std::vector<std::size_t>& chunkSizes,
                                 std::int64_t& id, std::string& err) {
@@ -415,8 +475,8 @@ bool FileRepository::insertFile(const std::string& name, const std::string& dir,
   std::int64_t newId = 0;
   {
     Stmt ins(db_.handle(),
-             "INSERT INTO file_node (name, size, content_hash, chunk_count, created_at, "
-             "deleted) VALUES (?, ?, ?, ?, ?, 0)",
+             "INSERT INTO file_node (name, size, content_hash, chunk_count, owner_id, "
+             "created_at, deleted) VALUES (?, ?, ?, ?, ?, ?, 0)",
              err);
     if (!ins.ok()) {
       db_.exec("ROLLBACK", err);
@@ -424,7 +484,7 @@ bool FileRepository::insertFile(const std::string& name, const std::string& dir,
     }
     if (!ins.bind(1, name) || !ins.bind(2, size) || !ins.bind(3, contentHash) ||
         !ins.bind(4, static_cast<std::int64_t>(chunkHashes.size())) ||
-        !ins.bind(5, nowMillis())) {
+        !ins.bind(5, ownerId) || !ins.bind(6, nowMillis())) {
       err = "bind failed";
       db_.exec("ROLLBACK", err);
       return false;

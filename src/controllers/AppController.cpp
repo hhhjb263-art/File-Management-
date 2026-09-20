@@ -115,9 +115,15 @@ void AppController::setServerUrl(const QString &url)
     if (v == m_serverUrl)
         return;
     m_serverUrl = v;
-    if (auto *hb = qobject_cast<HttpBackend *>(m_backend))
+    if (auto *hb = qobject_cast<HttpBackend *>(m_backend)) {
         hb->setBaseUrl(v);
+        // 🔴 缺陷修复：切换服务器必须清空令牌，否则会把 A 的令牌继续发给 B。
+        hb->setToken(QString());
+    }
+    m_accessToken.clear(); // 同步清空内存镜像
     emit serverUrlChanged();
+    emit accessTokenChanged();
+    emit sessionReset(); // 通知 Auth 清登录态 + 持久化令牌
 }
 
 void AppController::setAccessToken(const QString &token)

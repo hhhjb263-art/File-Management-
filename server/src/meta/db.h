@@ -8,6 +8,12 @@
 
 namespace cv {
 
+// 幂等迁移：在既有库（旧结构，无 owner_id）上补齐归属列 / 重建 dir_node 主键；
+// 全新库（已含 owner_id）则什么都不做。重复启动安全，且不破坏既有数据：
+// 老行统一归 owner_id = 0（历史数据桶），与 schema_info.version 协同作为幂等标记。
+// 必须传入已打开的 sqlite3*（不持有 Db 生命周期，仅执行语句）。
+bool migrateSchema(sqlite3* db, std::string& err);
+
 // SQLite 薄封装：打开、建表、执行、查询、预编译语句 RAII。
 class Db {
  public:

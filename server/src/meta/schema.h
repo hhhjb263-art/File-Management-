@@ -32,9 +32,12 @@ CREATE TABLE IF NOT EXISTS file_node (
   content_hash TEXT NOT NULL,
   chunk_count  INTEGER NOT NULL DEFAULT 0,
   created_at   INTEGER NOT NULL,
-  deleted      INTEGER NOT NULL DEFAULT 0
+  deleted      INTEGER NOT NULL DEFAULT 0,
+  owner_id     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_file_hash ON file_node(content_hash);
+-- 归属过滤索引：按 owner 列出/统计文件时的加速；deleted 维度用于"未删除"快速过滤。
+CREATE INDEX IF NOT EXISTS idx_file_owner ON file_node(owner_id, deleted);
 
 CREATE TABLE IF NOT EXISTS file_chunk (
   file_id    INTEGER NOT NULL,
@@ -63,7 +66,8 @@ CREATE TABLE IF NOT EXISTS upload_session (
   file_hash   TEXT NOT NULL DEFAULT '',
   status      TEXT NOT NULL DEFAULT 'created',
   created_at  INTEGER NOT NULL,
-  updated_at  INTEGER NOT NULL
+  updated_at  INTEGER NOT NULL,
+  owner_id    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_upload_hash ON upload_session(file_hash, status);
 
@@ -79,10 +83,14 @@ CREATE TABLE IF NOT EXISTS upload_chunk (
 );
 
 -- 虚拟目录树（规范化相对路径，'/' 分隔；根目录为空串不落行）。
--- 磁盘镜像树位于 <dataDir>/files/<path>；DB 是"哪些目录存在"的真相源。
+-- 按 owner 隔离：同一 path 可存在于不同 owner 下，故主键为 (owner_id, path)。
+-- 磁盘镜像树位于 <dataDir>/files/<path>（owner_id=0/legacy）或 <dataDir>/files/u<ownerId>/<path>；
+-- DB 是"哪些目录存在"的真相源。
 CREATE TABLE IF NOT EXISTS dir_node (
-  path       TEXT PRIMARY KEY,
-  created_at INTEGER NOT NULL
+  owner_id   INTEGER NOT NULL DEFAULT 0,
+  path       TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (owner_id, path)
 );
 
 -- 文件所属目录（与 file_node 1:1）。独立成表避免对存量库做 ALTER 迁移；

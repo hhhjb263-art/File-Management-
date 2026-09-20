@@ -96,6 +96,15 @@ const QString kInvalidPrefix     = QStringLiteral("[invalid-chunks] ");
 // 指纹与已固定记录不一致（疑似中间人）：控制器据此给用户可见警告（契约 §8.3）
 const QString kPinMismatchPrefix = QStringLiteral("[pin-mismatch] ");
 
+// 鉴权 / 输入 / 限流错误的可识别前缀（供 AuthController 区分错误种类；加法式，不改 Result 签名）：
+//   [bad-request](400) / [unauthorized](401) / [forbidden](403) / [too-many-requests](429)
+// 其余状态码（含 409/422/5xx）保持既有风格；网络错误由 requestAsync 统一加 [network] 前缀。
+const QString kBadRequestPrefix      = QStringLiteral("[bad-request] ");
+const QString kUnauthorizedPrefix    = QStringLiteral("[unauthorized] ");
+const QString kForbiddenPrefix       = QStringLiteral("[forbidden] ");
+const QString kTooManyRequestsPrefix = QStringLiteral("[too-many-requests] ");
+const QString kNetworkPrefix         = QStringLiteral("[network] ");
+
 // 目录条目合成 id 前缀
 const QString kDirIdPrefix = QStringLiteral("dir:");
 
@@ -268,8 +277,19 @@ QString errorTextForStatus(int status, const QByteArray &body)
                           reason.isEmpty() ? QString() : QStringLiteral("; ") + reason);
     }
 
+    // 鉴权 / 输入 / 限流错误带可识别前缀（供上层区分错误种类，不改 Result 签名）。
+    QString prefix;
+    switch (status) {
+    case 400: prefix = kBadRequestPrefix; break;
+    case 401: prefix = kUnauthorizedPrefix; break;
+    case 403: prefix = kForbiddenPrefix; break;
+    case 429: prefix = kTooManyRequestsPrefix; break;
+    default:  break;
+    }
+
     const QString shown = e.isEmpty() ? QStringLiteral("请求失败") : e;
-    return QStringLiteral("HTTP %1: %2").arg(status).arg(shown);
+    const QString base  = QStringLiteral("HTTP %1: %2").arg(status).arg(shown);
+    return prefix.isEmpty() ? base : (prefix + base);
 }
 
 } // namespace
@@ -366,7 +386,9 @@ void HttpBackend::requestAsync(Method method, const QString &path, const QByteAr
 
     // 保证 done **恰好一次**（finished 与 timeout 竞争时只取先到者）。
     auto fired  = std::make_shared<bool>(false);
-    auto finish = [reply, timer, fired, done, timeoutMs](bool timedOut) {
+    // 需要 this：内部要读 m_token 并在 401 时 emit unauthorized()（会话过期通知上层）。
+    // this 的生命周期由本对象保证；reply 是它的子对象，回调不会晚于对象析构。
+    auto finish = [this, reply, timer, fired, done, timeoutMs](bool timedOut) {
         if (*fired)
             return;
         *fired = true;
@@ -375,24 +397,36 @@ void HttpBackend::requestAsync(Method method, const QString &path, const QByteAr
         Response out;
         if (timedOut && !reply->isFinished()) {
             reply->abort();
-            out.error = QStringLiteral("请求超时（%1 ms）").arg(timeoutMs);
+            out.error = kNetworkPrefix + QStringLiteral("请求超时（%1 ms）").arg(timeoutMs);
         } else {
             out.status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
             out.body   = reply->readAll();
             if (out.status >= 400) {
                 out.error = errorTextForStatus(out.status, out.body);
+                // 解析 Retry-After（仅 429 账号锁定时有意义；其余忽略）
+                const QByteArray ra = reply->rawHeader("Retry-After");
+                if (!ra.isEmpty()) {
+                    bool ok = false;
+                    const int v = ra.toInt(&ok);
+                    if (ok)
+                        out.retryAfter = v;
+                }
             } else if (out.status <= 0) {
                 const QVariant pin = reply->property("cvPinMismatch");
                 if (pin.isValid()) {
                     // 指纹不一致：给出可识别原因（控制器会翻成中文警告，且不提供"继续"）
                     out.error = pin.toString();
                 } else {
-                    out.error = reply->error() != QNetworkReply::NoError
-                                    ? reply->errorString()
-                                    : QStringLiteral("网络错误（无响应）");
+                    out.error = kNetworkPrefix
+                                + (reply->error() != QNetworkReply::NoError
+                                       ? reply->errorString()
+                                       : QStringLiteral("网络错误（无响应）"));
                 }
             }
         }
+        // 会话过期：持有令牌却收到 401 → 通知上层清登录态（登录自身无令牌，不会触发）。
+        if (out.status == 401 && !m_token.isEmpty())
+            emit unauthorized();
         reply->deleteLater();
         done(out);
     };
@@ -560,19 +594,115 @@ qint64 HttpBackend::chunkSizeFor(const QString &uploadId)
 }
 
 // =========================================================================
-// 账户（服务端无用户体系 -> 不支持；令牌由 setToken 直接设置）
+// 账户（契约 POST/GET /api/v1/auth/*）
 // =========================================================================
 
-Result<UserInfo> HttpBackend::login(const QString &, const QString &)
+namespace {
+// 把登录 / 注册 / me 的响应 JSON 解析为 AuthUser
+cv::HttpBackend::AuthUser authUserFromObject(const QJsonObject &o)
 {
-    return Result<UserInfo>::fail(unsupportedMsg(QStringLiteral("登录/用户体系")));
+    cv::HttpBackend::AuthUser u;
+    u.id          = QString::number(o.value(QStringLiteral("id")).toVariant().toLongLong());
+    u.username    = o.value(QStringLiteral("username")).toString();
+    u.displayName = o.value(QStringLiteral("display_name")).toString();
+    u.createdAt   = o.value(QStringLiteral("created_at")).toString();
+    u.lastLoginAt = o.value(QStringLiteral("last_login_at")).toString();
+    return u;
+}
+} // namespace
+
+int HttpBackend::retryAfterSeconds(const QByteArray &header)
+{
+    bool ok = false;
+    const int v = QByteArray(header).trimmed().toInt(&ok);
+    return ok ? v : -1;
+}
+
+HttpBackend::AuthResult HttpBackend::authLogin(const QString &user, const QString &password,
+                                               const QString &userAgent)
+{
+    QJsonObject body;
+    body.insert(QStringLiteral("username"), user);
+    body.insert(QStringLiteral("password"), password);
+    if (!userAgent.isEmpty())
+        body.insert(QStringLiteral("user_agent"), userAgent);
+
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/auth/login"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    AuthResult res;
+    res.retryAfter = r.retryAfter;
+    if (!r.ok()) {
+        res.error = r.error;
+        return res;
+    }
+    const QJsonObject o = QJsonDocument::fromJson(r.body).object();
+    res.session.token     = o.value(QStringLiteral("token")).toString();
+    res.session.expiresAt = o.value(QStringLiteral("expires_at")).toString();
+    res.session.user      = authUserFromObject(o.value(QStringLiteral("user")).toObject());
+    res.ok                = true;
+    // 同步更新后端内存态（currentUser / 令牌统一来源）
+    m_user  = res.session.user.toUserInfo();
+    m_token = res.session.token;
+    return res;
+}
+
+HttpBackend::AuthResult HttpBackend::authRegister(const QString &user, const QString &password,
+                                                  const QString &displayName)
+{
+    QJsonObject body;
+    body.insert(QStringLiteral("username"), user);
+    body.insert(QStringLiteral("password"), password);
+    if (!displayName.isEmpty())
+        body.insert(QStringLiteral("display_name"), displayName);
+
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/auth/register"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    AuthResult res;
+    res.retryAfter = r.retryAfter;
+    if (!r.ok()) {
+        res.error = r.error;
+        return res;
+    }
+    // 201 {id,username,display_name}：注册成功，不直接登录（注册无令牌返回）。
+    res.ok = true;
+    return res;
+}
+
+HttpBackend::AuthResult HttpBackend::authMe()
+{
+    const Response r = request(Method::Get, QStringLiteral("/api/v1/auth/me"));
+    AuthResult res;
+    res.retryAfter = r.retryAfter;
+    if (!r.ok()) {
+        res.error = r.error;
+        return res;
+    }
+    const QJsonObject o = QJsonDocument::fromJson(r.body).object();
+    res.session.user = authUserFromObject(o);
+    res.ok           = true;
+    m_user           = res.session.user.toUserInfo();
+    return res;
+}
+
+void HttpBackend::authLogout()
+{
+    // best-effort：带上当前令牌发登出请求，忽略结果（失败也不影响本地清态）。
+    if (!m_token.isEmpty())
+        request(Method::Post, QStringLiteral("/api/v1/auth/logout"));
+}
+
+Result<UserInfo> HttpBackend::login(const QString &user, const QString &password)
+{
+    const AuthResult r = authLogin(user, password);
+    if (!r.ok)
+        return Result<UserInfo>::fail(r.error);
+    return Result<UserInfo>::success(r.session.user.toUserInfo());
 }
 
 void HttpBackend::logout()
 {
-    // 服务端无会话，登出即清除本地令牌与用户信息（不发网络请求）
-    m_token.clear();
-    m_user = UserInfo();
+    authLogout();
+    m_user = UserInfo(); // 仅清内存用户；令牌清空由 AppController/AuthController 统一负责
 }
 
 UserInfo HttpBackend::currentUser() const { return m_user; }

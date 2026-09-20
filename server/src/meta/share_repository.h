@@ -47,6 +47,11 @@ class ShareRepository {
   // 列出全部分享，最新在前（created_at DESC）。
   bool listAll(std::vector<Share>& out, std::string& err);
 
+  // 列出分享，仅返回"文件归属于 callerOwnerId"的条目。
+  // callerOwnerId == -1 表示 legacy/admin（不过滤，保持全部可见）；
+  // callerOwnerId >= 1 时通过 JOIN file_node 仅回传该用户名下文件的分享。
+  bool listAllVisible(std::int64_t callerOwnerId, std::vector<Share>& out, std::string& err);
+
   // 撤销（删除）某分享；成功返回 true。err 仅表示 DB 错误（不存在也返回 true）。
   bool removeById(std::int64_t id, std::string& err);
 

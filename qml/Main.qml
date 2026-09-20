@@ -144,6 +144,14 @@ ApplicationWindow {
             }
 
             ToolButton {
+                id: accountBtn
+                visible: Auth.loggedIn && !Auth.legacyMode
+                text: "👤 " + (Auth.displayName.length > 0 ? Auth.displayName : Auth.userName)
+                font.pointSize: Theme.fontBody
+                onClicked: accountMenu.open()
+            }
+
+            ToolButton {
                 id: overflowBtn
                 text: "⋮"
                 font.pointSize: 18
@@ -477,8 +485,30 @@ ApplicationWindow {
             onTriggered: window.navIndex = window.pageSettings
         }
         MenuSeparator { }
+        // ---- 账户 ----
+        MenuItem {
+            text: "🚪  " + qsTr("退出登录")
+            visible: Auth.loggedIn && !Auth.legacyMode
+            onTriggered: Auth.logout()
+        }
+        MenuSeparator { }
         // ---- 关于 ----
         MenuItem { text: "ℹ  " + qsTr("关于云匣"); onTriggered: aboutDialog.open() }
+    }
+
+    // 账户菜单：当前用户 + 退出登录
+    Menu {
+        id: accountMenu
+        width: 220
+        MenuItem {
+            text: qsTr("当前用户：%1").arg(Auth.displayName.length > 0 ? Auth.displayName : Auth.userName)
+            enabled: false
+        }
+        MenuSeparator { }
+        MenuItem {
+            text: "🚪  " + qsTr("退出登录")
+            onTriggered: Auth.logout()
+        }
     }
 
     Menu {
@@ -524,6 +554,14 @@ ApplicationWindow {
             filesPage.refreshNow()
         }
         onOpenSettingsRequested: window.navIndex = window.pageSettings
+    }
+
+    // ==================================================================
+    //  登录门（覆盖层）：未登录且服务端具备账号体系时挡在前面
+    // ==================================================================
+    LoginPage {
+        id: loginPage
+        anchors.fill: parent
     }
 
     // ==================================================================
@@ -586,6 +624,19 @@ ApplicationWindow {
         }
     }
 
+    // 账户相关提示（登录过期 / 注册成功等）—— 复用 window.showToast（不新造第二套 toast）。
+    Connections {
+        target: (typeof Auth !== "undefined") ? Auth : null
+        ignoreUnknownSignals: true
+        function onStatusMessage(message, ok) {
+            window.showToast(message, ok)
+        }
+        function onLoggedOut(reason) {
+            if (reason === "expired")
+                window.showToast(qsTr("登录已过期，请重新登录"), false)
+        }
+    }
+
     // ==================================================================
     //  快捷键
     // ==================================================================
@@ -611,7 +662,13 @@ ApplicationWindow {
             if (v !== undefined)
                 window.navIndex = v
         }
-        Files.refresh()
-        Stats.refresh()
+        // 启动判定：探测服务端是否具备账号体系（同步、本地回环通常立即返回）。
+        // 仅在「已登录」或「legacy 模式（无账号体系）」时才主动拉文件列表；
+        // 需要登录时不拉（无有效令牌，避免 401 风暴）。
+        Auth.startupCheck()
+        if (Auth.loggedIn || Auth.legacyMode) {
+            Files.refresh()
+            Stats.refresh()
+        }
     }
 }
