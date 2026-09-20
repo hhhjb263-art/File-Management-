@@ -63,6 +63,13 @@ std::string shareCodeHash(const std::string& token, const std::string& code) {
   return Sha256::of(token + ":" + code);
 }
 
+std::string shareStateOf(const Share& s, std::int64_t nowMillis) {
+  if (s.revoked) return "revoked";
+  if (s.expiresAt != 0 && s.expiresAt < nowMillis) return "expired";
+  if (s.maxDownloads > 0 && s.downloads >= s.maxDownloads) return "exhausted";
+  return "active";
+}
+
 bool ShareRepository::create(std::int64_t fileId, const std::string& codeHash,
                              std::int64_t expireDays, std::int64_t maxDownloads,
                              const std::string& token, Share& out, std::string& err) {
@@ -202,6 +209,46 @@ bool ShareRepository::incrDownloads(std::int64_t id, std::string& err, bool* out
   // sqlite3_changes 取最近一条语句的实际改动行数；0 行 = 已达上限（用尽），而非错误。
   if (outExhausted && sqlite3_changes(db_.handle()) == 0) *outExhausted = true;
   return true;
+}
+
+std::int64_t ShareRepository::cleanupInvalid(std::int64_t callerOwnerId, std::int64_t nowMillis,
+                                             std::string& err) {
+  err.clear();
+  // 物理删除「无效」分享：revoked / 已过期（expires_at>0 且 < now）/ 次数用尽。
+  // shares 表无 owner 列，归属必须走 file_node JOIN（与 listAllVisible 同款）。
+  if (callerOwnerId == -1) {
+    // legacy/admin：清理全部无效分享，不走归属过滤（不绑假值，单独一条 SQL）。
+    Stmt stmt(db_.handle(),
+              "DELETE FROM shares "
+              "WHERE revoked = 1 "
+              "   OR (expires_at > 0 AND expires_at < ?) "
+              "   OR (max_downloads > 0 AND downloads >= max_downloads)",
+              err);
+    if (!stmt.ok()) return -1;
+    if (!stmt.bind(1, nowMillis)) {
+      err = "bind failed";
+      return -1;
+    }
+    if (stmt.step(err) != SQLITE_DONE) return -1;
+    return sqlite3_changes(db_.handle());
+  }
+  // 归属分支：仅删 owner_id == callerOwnerId 文件关联的无效分享。
+  Stmt stmt(db_.handle(),
+            "DELETE FROM shares "
+            "WHERE (revoked = 1 "
+            "       OR (expires_at > 0 AND expires_at < ?) "
+            "       OR (max_downloads > 0 AND downloads >= max_downloads)) "
+            "  AND id IN (SELECT s.id FROM shares s "
+            "             JOIN file_node f ON f.id = s.file_id "
+            "             WHERE f.owner_id = ?)",
+            err);
+  if (!stmt.ok()) return -1;
+  if (!stmt.bind(1, nowMillis) || !stmt.bind(2, callerOwnerId)) {
+    err = "bind failed";
+    return -1;
+  }
+  if (stmt.step(err) != SQLITE_DONE) return -1;
+  return sqlite3_changes(db_.handle());
 }
 
 }  // namespace cv

@@ -1248,6 +1248,10 @@ ShareLink HttpBackend::shareFromObject(const QJsonObject &o, bool includeCode) c
     s.maxDownloads = o.value(QStringLiteral("max_downloads")).toInt();
     s.downloads    = o.value(QStringLiteral("downloads")).toInt();
     s.revoked      = o.value(QStringLiteral("revoked")).toBool();  // 服务端软撤销标记
+    // 服务端新增 state 字段（active/revoked/expired/exhausted）；缺省按 "active" 向后兼容
+    s.state        = o.value(QStringLiteral("state")).toString();
+    if (s.state.isEmpty())
+        s.state = QStringLiteral("active");
     return s;
 }
 
@@ -1329,6 +1333,33 @@ void HttpBackend::revokeShareAsync(const QString &shareId, std::function<void(Ok
 {
     requestAsync(Method::Delete, QStringLiteral("/api/v1/shares/") + pct(shareId), {}, {},
                  [done](Response r) { done(r.ok() ? ok() : err(r.error)); });
+}
+
+// 清除当前调用者名下所有无效分享（revoked/expired/exhausted），物理删除不可恢复。
+Ok HttpBackend::cleanupInvalidShares(std::int64_t &removed)
+{
+    removed = 0;
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/shares/cleanup"));
+    if (!r.ok())
+        return err(r.error);
+    const QJsonObject obj = QJsonDocument::fromJson(r.body).object();
+    removed = obj.value(QStringLiteral("removed")).toVariant().toLongLong();
+    return ok();
+}
+
+void HttpBackend::cleanupInvalidSharesAsync(std::function<void(Result<std::int64_t>)> done)
+{
+    requestAsync(Method::Post, QStringLiteral("/api/v1/shares/cleanup"), {}, {},
+                 [done](Response r) {
+                     if (!r.ok()) {
+                         done(Result<std::int64_t>::fail(r.error));
+                         return;
+                     }
+                     const QJsonObject obj = QJsonDocument::fromJson(r.body).object();
+                     const std::int64_t removed =
+                         obj.value(QStringLiteral("removed")).toVariant().toLongLong();
+                     done(Result<std::int64_t>::success(removed));
+                 });
 }
 
 Ok HttpBackend::touchShare(const QString &)

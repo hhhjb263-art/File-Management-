@@ -6,8 +6,9 @@
  ****************************************************************************/
 #include "ShareController.h"
 
-#include "core/Util.h"   // Util::humanSize
-#include "net/Backend.h" // Backend / Result / ShareLink
+#include "core/Settings.h" // Settings::instance()：提取码本地缓存
+#include "core/Util.h"      // Util::humanSize
+#include "net/Backend.h"    // Backend / Result / ShareLink
 
 #include <QClipboard>
 #include <QGuiApplication>
@@ -194,6 +195,10 @@ QVariantMap ShareController::at(int i) const
     m.insert(QStringLiteral("downloads"), s.downloads);
     m.insert(QStringLiteral("maxDownloads"), s.maxDownloads);
     m.insert(QStringLiteral("revoked"), s.revoked);
+      m.insert(QStringLiteral("state"), s.state);
+      // 提取码明文只在创建时的本机有缓存（服务端只存哈希）；无缓存显示空 ⇒ QML 显示「—」
+      m.insert(QStringLiteral("codeText"),
+               Settings::instance().shareCodes().value(s.id).toString());
 
     // 后 6 个键：展示用派生值
     m.insert(QStringLiteral("needCode"), s.needCode);
@@ -210,6 +215,53 @@ QVariantMap ShareController::at(int i) const
                                 : QStringLiteral("不限次数"));
     m.insert(QStringLiteral("sizeText"), Util::humanSize(s.size));
     return m;
+}
+
+// ---------------------------------------------------------------------------
+//  两栏分桶计数 / 清除无效分享
+// ---------------------------------------------------------------------------
+int ShareController::activeCount() const
+{
+    int n = 0;
+    for (const ShareLink &s : m_shares)
+        if (s.state == QStringLiteral("active"))
+            ++n;
+    return n;
+}
+
+int ShareController::invalidCount() const
+{
+    return m_shares.size() - activeCount();
+}
+
+void ShareController::cleanupInvalid()
+{
+    if (!m_backend || m_busy)
+        return;
+
+    setBusy(true);
+    m_backend->cleanupInvalidSharesAsync([this](Result<std::int64_t> r) {
+        setBusy(false);
+        if (!r.ok) {
+            emit errorOccurred(friendlyShareError(r.error));
+            emit logMessage(QStringLiteral("ERROR"),
+                            QStringLiteral("清除无效分享失败：%1").arg(r.error));
+            return;
+        }
+        // 同步清掉「已失效分享」的本机提取码缓存（进行中的保留）
+        const QVariantMap codes = Settings::instance().shareCodes();
+        QStringList dead;
+        for (const ShareLink &s : m_shares) {
+            if (s.state != QStringLiteral("active") && codes.contains(s.id))
+                dead << s.id;
+        }
+        if (!dead.isEmpty())
+            Settings::instance().dropShareCodes(dead);
+        emit logMessage(QStringLiteral("INFO"),
+                        QStringLiteral("已清除 %1 条无效分享").arg(r.value));
+        emit statusMessage(QStringLiteral("已清除 %1 条无效分享").arg(r.value), true);
+        refresh();  // 重新拉取，两栏计数随之更新
+    });
 }
 
 } // namespace cv

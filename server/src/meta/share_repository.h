@@ -30,6 +30,15 @@ std::string randomHex(std::size_t nBytes);
 // 校验时用恒定时间比较（constantTimeEqual）比对存储值，避免时序侧信道。
 std::string shareCodeHash(const std::string& token, const std::string& code);
 
+// 分享「状态」判定（客户端按此分「进行中/已失效」两栏）。取值：
+//   active    进行中（未撤销、未过期、次数未用尽）
+//   revoked   已软撤销（revoked=1）
+//   expired   已过期（expires_at>0 且 expires_at < nowMillis）
+//   exhausted 次数已用尽（max_downloads>0 且 downloads>=max_downloads）
+// 判定顺序严格如此（revoked 优先于 expired/exhausted）。
+// nowMillis 由调用方传入（通常 cv::nowMillis()），便于测试注入固定时钟。
+std::string shareStateOf(const Share& s, std::int64_t nowMillis);
+
 // 分享链接的元数据读写。所有操作直接作用于 Db 句柄。
 class ShareRepository {
  public:
@@ -57,6 +66,13 @@ class ShareRepository {
   bool removeById(std::int64_t id, std::string& err);
   // 软撤销：置 revoked=1（**不删行**），列表仍可见并可标记「已撤销」
   bool revokeById(std::int64_t id, std::string& err);
+
+  // 物理删除调用者名下的「无效」分享（revoked / 已过期 / 次数用尽）。
+  // callerOwnerId == -1 视为 legacy/admin：清理全部无效分享（归属走 file_node 的 owner_id）。
+  // nowMillis 用于过期判定；返回删除的行数（sqlite3_changes），
+  //   <0 表示 DB 错误（此时 err 非空）。注意：删除不可恢复。
+  std::int64_t cleanupInvalid(std::int64_t callerOwnerId, std::int64_t nowMillis,
+                              std::string& err);
 
   // 下载计数 +1（在“开始回内容之前”调用）。SQL 端原子条件自增：
   // 仅当 (max_downloads = 0 OR downloads < max_downloads) 才 +1，并发 worker 各发独立 UPDATE，

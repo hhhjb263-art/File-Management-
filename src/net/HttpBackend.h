@@ -226,6 +226,9 @@ public:
     void createShareAsync(const QString &fileId, const QString &code, int expireDays,
                           int maxDownloads, std::function<void(Result<ShareLink>)> done) override;
     void revokeShareAsync(const QString &shareId, std::function<void(Ok)> done) override;
+    // 清除无效分享（revoked/expired/exhausted）：物理删除、不可恢复；返回移除条数。
+    Ok cleanupInvalidShares(std::int64_t &removed) override;
+    void cleanupInvalidSharesAsync(std::function<void(Result<std::int64_t>)> done) override;
 
 signals:
     // 会话过期：收到 401 且当前持有令牌时发出（仅当 m_token 非空）。

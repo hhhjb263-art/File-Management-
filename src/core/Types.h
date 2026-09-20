@@ -82,6 +82,9 @@ struct ShareLink {
     // 追加（加法式）：服务端列表返回的字段，供展示 / needCode 判定
     qint64    size = 0;         // 文件字节数（用于 sizeText）
     bool      needCode = false; // 是否启用提取码（列表不含明文 code，用此判定）
+    // 追加（加法式）：分享状态（服务端新增字段；服务端未升级时默认 "active" 向后兼容）
+    // 取值："active" | "revoked" | "expired" | "exhausted"
+    QString   state = QStringLiteral("active");
 
     bool expired() const { return expire.isValid() && expire < QDateTime::currentDateTimeUtc(); }
     bool usable() const

@@ -191,4 +191,30 @@ void Settings::setSyncPairs(const QVector<SyncPair> &pairs)
 
 void Settings::sync() { m_settings.sync(); }
 
+// ---------------- 分享提取码本地缓存 ----------------
+
+QVariantMap Settings::shareCodes() const
+{
+    return m_settings.value(QStringLiteral("share/codes")).toMap();
+}
+
+void Settings::setShareCode(const QString &id, const QString &code)
+{
+    if (id.isEmpty())
+        return;
+    QVariantMap m = shareCodes();
+    m.insert(id, code);
+    m_settings.setValue(QStringLiteral("share/codes"), m);
+}
+
+void Settings::dropShareCodes(const QStringList &ids)
+{
+    if (ids.isEmpty())
+        return;
+    QVariantMap m = shareCodes();
+    for (const QString &id : ids)
+        m.remove(id);
+    m_settings.setValue(QStringLiteral("share/codes"), m);
+}
+
 } // namespace cv
