@@ -226,6 +226,11 @@ std::string partPath(const cv::Config& cfg, std::int64_t id, std::int64_t seq) {
 // 原子写文件：先写 .tmp 再 rename，保证落盘一致性
 bool writeAtomicFile(const std::string& finalPath, const std::string& data,
                      std::string& err) {
+  // 父目录可能不存在：按 owner 隔离后镜像新增了 u<ownerId>/ 层级（真机实测：
+  // 每次上传都报 cannot open tmp for write: /files/u1/xxx.tmp —— 目录没建）。
+  // create_directories 对已存在目录是幂等空操作。
+  std::error_code dec;
+  fs::create_directories(fs::path(finalPath).parent_path(), dec);
   std::string tmp = finalPath + ".tmp";
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
