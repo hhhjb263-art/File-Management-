@@ -62,7 +62,7 @@ void Application::start()
     m_transfer = new cv::TransferManager(m_backend, this);
 
     m_app = new cv::AppController(m_backend, this);
-    m_auth = new cv::AuthController(this);
+    m_auth = new cv::AuthController(m_backend, m_app, this);
     m_files = new cv::FileController(m_backend, m_fileModel, this);
     m_sync = new cv::SyncController(this);
     m_transfers = new cv::TransferController(m_transfer, this);
@@ -87,6 +87,17 @@ void Application::start()
                      [](const QString &lv, const QString &tx) { logToSink("Stats", lv, tx); });
     QObject::connect(m_shares, &cv::ShareController::logMessage, this,
                      [](const QString &lv, const QString &tx) { logToSink("Shares", lv, tx); });
+    QObject::connect(m_auth, &cv::AuthController::logMessage, this,
+                     [](const QString &lv, const QString &tx) { logToSink("Auth", lv, tx); });
+
+    // ---- 会话过期 / 切换服务器 → 重置登录态 ----
+    // HttpBackend 收到 401 且持有令牌时发 unauthorized() → Auth 清令牌 + loggedOut("expired")。
+    if (auto *hb = qobject_cast<cv::HttpBackend *>(m_backend))
+        QObject::connect(hb, &cv::HttpBackend::unauthorized,
+                         m_auth, &cv::AuthController::onUnauthorized);
+    // 切换服务器地址 → 清空会话令牌与登录态（避免把 A 的令牌发给 B）。
+    QObject::connect(m_app, &cv::AppController::serverUrlChanged,
+                     m_auth, &cv::AuthController::onServerUrlChanged);
 
     // ---- 默认下载目录注入（启用 Settings::downloadDir()）+ 设置变更后重新注入 ----
     applyDownloadDirSetting();

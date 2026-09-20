@@ -138,6 +138,32 @@ bool ShareRepository::listAll(std::vector<Share>& out, std::string& err) {
   return true;
 }
 
+bool ShareRepository::listAllVisible(std::int64_t callerOwnerId, std::vector<Share>& out,
+                                    std::string& err) {
+  out.clear();
+  // legacy/admin：callerOwnerId == -1 → 不过滤
+  if (callerOwnerId == -1) return listAll(out, err);
+  Stmt stmt(db_.handle(),
+            std::string("SELECT ") + kShareCols +
+                " FROM shares s JOIN file_node f ON f.id = s.file_id "
+                "WHERE f.owner_id = ? ORDER BY s.created_at DESC, s.id DESC",
+            err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, callerOwnerId)) {
+    err = "bind failed";
+    return false;
+  }
+  while (true) {
+    int rc = stmt.step(err);
+    if (rc == SQLITE_DONE) break;
+    if (rc != SQLITE_ROW) return false;
+    Share s;
+    if (!rowToShare(stmt, s)) return false;
+    out.push_back(s);
+  }
+  return true;
+}
+
 bool ShareRepository::removeById(std::int64_t id, std::string& err) {
   Stmt stmt(db_.handle(), "DELETE FROM shares WHERE id = ?", err);
   if (!stmt.ok()) return false;

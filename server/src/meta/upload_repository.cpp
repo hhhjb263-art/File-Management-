@@ -9,7 +9,7 @@ namespace cv {
 // 与 SELECT 语句列顺序保持一致
 namespace {
 const char* kSessionCols =
-    "upload_id, name, size, chunk_size, file_hash, status, created_at, updated_at";
+    "upload_id, name, size, chunk_size, file_hash, status, created_at, updated_at, owner_id";
 }  // namespace
 
 bool UploadRepository::rowToSession(Stmt& stmt, UploadSession& out) {
@@ -21,20 +21,23 @@ bool UploadRepository::rowToSession(Stmt& stmt, UploadSession& out) {
   out.status = stmt.text(5);
   out.createdAt = stmt.int64(6);
   out.updatedAt = stmt.int64(7);
+  out.ownerId = stmt.int64(8);
   return true;
 }
 
-bool UploadRepository::create(const std::string& name, std::int64_t size,
-                              std::int64_t chunkSize, const std::string& fileHash,
-                              std::int64_t& id, std::string& err) {
+bool UploadRepository::create(std::int64_t ownerId, const std::string& name,
+                             std::int64_t size, std::int64_t chunkSize,
+                             const std::string& fileHash, std::int64_t& id,
+                             std::string& err) {
   std::int64_t now = nowMillis();
   Stmt stmt(db_.handle(),
             "INSERT INTO upload_session (name, size, chunk_size, file_hash, status, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, 'created', ?, ?)",
+            "created_at, updated_at, owner_id) VALUES (?, ?, ?, ?, 'created', ?, ?, ?)",
             err);
   if (!stmt.ok()) return false;
   if (!stmt.bind(1, name) || !stmt.bind(2, size) || !stmt.bind(3, chunkSize) ||
-      !stmt.bind(4, fileHash) || !stmt.bind(5, now) || !stmt.bind(6, now)) {
+      !stmt.bind(4, fileHash) || !stmt.bind(5, now) || !stmt.bind(6, now) ||
+      !stmt.bind(7, ownerId)) {
     err = "bind failed";
     return false;
   }
@@ -79,16 +82,17 @@ bool UploadRepository::findChunk(std::int64_t id, std::int64_t seq, UploadChunkR
 }
 
 bool UploadRepository::findResumable(const std::string& fileHash, std::int64_t size,
-                                     std::int64_t chunkSize, UploadSession& out,
-                                     std::string& err) {
+                                     std::int64_t chunkSize, std::int64_t ownerId,
+                                     UploadSession& out, std::string& err) {
   Stmt stmt(db_.handle(),
             std::string("SELECT ") + kSessionCols +
                 " FROM upload_session WHERE file_hash = ? AND size = ? AND "
-                "chunk_size = ? AND status NOT IN ('completed','aborted') "
+                "chunk_size = ? AND owner_id = ? AND status NOT IN ('completed','aborted') "
                 "ORDER BY upload_id DESC LIMIT 1",
             err);
   if (!stmt.ok()) return false;
-  if (!stmt.bind(1, fileHash) || !stmt.bind(2, size) || !stmt.bind(3, chunkSize)) {
+  if (!stmt.bind(1, fileHash) || !stmt.bind(2, size) || !stmt.bind(3, chunkSize) ||
+      !stmt.bind(4, ownerId)) {
     err = "bind failed";
     return false;
   }

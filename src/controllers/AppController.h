@@ -82,6 +82,7 @@ public:
 
 signals:
     void serverUrlChanged();
+    void sessionReset(); // 切换服务器地址后发出：通知 Auth 清空会话与登录态
     void accessTokenChanged();
     void statusTextChanged();
     void serverVersionChanged();

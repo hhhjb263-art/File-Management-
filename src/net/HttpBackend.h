@@ -123,6 +123,53 @@ public:
     void             logout() override;
     UserInfo         currentUser() const override;
 
+    // ---- 登录 / 注册 / 会话（契约 POST/GET /api/v1/auth/*）----
+    // 这些是 AuthController 的专属通道，返回契约级结构并带「可识别错误前缀」
+    // （见文件顶部 k*Prefix，与 AuthController 的错误映射一一对应）。
+    // 与 Backend 抽象的 login/logout/currentUser（保留以兼容接口）不同，
+    // 它们额外携带 retryAfter（429 账号锁定时的 Retry-After 秒数）。
+
+    // 登录用户 / 当前用户（GET /me）
+    struct AuthUser {
+        QString id;
+        QString username;
+        QString displayName;
+        QString createdAt;   // ISO 字符串（未解析）
+        QString lastLoginAt; // ISO 字符串
+        UserInfo toUserInfo() const
+        {
+            UserInfo u;
+            u.id   = id;
+            u.name = username;
+            return u;
+        }
+    };
+
+    // 登录会话（POST /login 的 200 响应）
+    struct AuthSession {
+        QString  token;
+        QString  expiresAt; // ISO 字符串
+        AuthUser user;
+    };
+
+    // 统一的鉴权结果（ok / error(带前缀) / retryAfter）
+    struct AuthResult {
+        bool     ok         = false;
+        QString  error;     // 失败时带 [unauthorized] 等前缀
+        AuthSession session;
+        int      retryAfter = -1; // 429 时的 Retry-After 秒数；其余为 -1
+    };
+
+    AuthResult authLogin(const QString &user, const QString &password,
+                         const QString &userAgent = QString());
+    AuthResult authRegister(const QString &user, const QString &password,
+                            const QString &displayName = QString());
+    AuthResult authMe();
+    void       authLogout(); // 发送登出请求（best-effort，忽略结果）
+
+    // 解析 Retry-After 头（秒）；非数字 / 缺失返回 -1
+    static int retryAfterSeconds(const QByteArray &header);
+
     Result<QVector<FileItem>> listFolder(const QString &parentId) override;
     Result<QVector<FileItem>> listUnderPath(const QString &remotePath) override;
     Result<QVector<FileItem>> listTrash() override;
@@ -180,6 +227,13 @@ public:
                           int maxDownloads, std::function<void(Result<ShareLink>)> done) override;
     void revokeShareAsync(const QString &shareId, std::function<void(Ok)> done) override;
 
+signals:
+    // 会话过期：收到 401 且当前持有令牌时发出（仅当 m_token 非空）。
+    // 由请求处理处（requestAsync 的 401 分支）发出；Application 把它接到 AuthController
+    // → 清令牌 + loggedOut("expired")，界面据此回到登录页并提示「登录已过期，请重新登录」。
+    // ⚠️ 登录 POST 自身（此时无令牌）不会触发本信号，登录失败由 AuthController 直接处理。
+    void unauthorized();
+
 private:
     enum class Method { Get, Post, Put, Delete };
 
@@ -188,6 +242,7 @@ private:
         int        status = 0;
         QByteArray body;
         QString    error;
+        int        retryAfter = -1; // 429 时的 Retry-After 秒数；其余为 -1
 
         bool ok() const { return error.isEmpty() && status >= 200 && status < 300; }
     };
@@ -232,7 +287,7 @@ private:
     void   rememberChunkSize(const QString &uploadId, qint64 chunkSize);
     void   forgetChunkSize(const QString &uploadId);
 
-    QString m_baseUrl;
+    QString m_baseUrl;   // 服务端基址（setter 会去掉尾部 '/'）
     QString m_token;
     UserInfo m_user;
 

@@ -75,6 +75,15 @@ void    Settings::setToken(const QString &token) { m_settings.setValue(QStringLi
 QString Settings::lastUser() const { return m_settings.value(QStringLiteral("backend/lastUser")).toString(); }
 void    Settings::setLastUser(const QString &user) { m_settings.setValue(QStringLiteral("backend/lastUser"), user); }
 
+bool    Settings::rememberPassword() const { return m_settings.value(QStringLiteral("auth/rememberPassword"), false).toBool(); }
+void    Settings::setRememberPassword(bool on) { m_settings.setValue(QStringLiteral("auth/rememberPassword"), on); }
+
+QString Settings::savedUser() const { return m_settings.value(QStringLiteral("auth/savedUser")).toString(); }
+void    Settings::setSavedUser(const QString &user) { m_settings.setValue(QStringLiteral("auth/savedUser"), user); }
+
+QString Settings::savedPassword() const { return m_settings.value(QStringLiteral("auth/savedPassword")).toString(); }
+void    Settings::setSavedPassword(const QString &pwd) { m_settings.setValue(QStringLiteral("auth/savedPassword"), pwd); }
+
 // ---------------- 外观 ----------------
 
 bool Settings::darkMode() const { return m_settings.value(QStringLiteral("ui/darkMode"), false).toBool(); }

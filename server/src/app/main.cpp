@@ -54,6 +54,9 @@
 #include "meta/db.h"
 #include "meta/file_repository.h"
 #include "meta/share_repository.h"
+#include "meta/schema_users.h"
+#include "meta/user_repository.h"
+#include "app/auth_routes.h"
 #include "meta/upload_repository.h"
 #include "app/share_page.h"
 #include "net/http_server.h"
@@ -278,6 +281,48 @@ std::string filesRoot(const cv::Config& cfg) {
 std::string diskFilePath(const cv::Config& cfg, const std::string& dir,
                          const std::string& name) {
   return filesRoot(cfg) + "/" + (dir.empty() ? std::string() : dir + "/") + name;
+}
+
+// ---- 文件归属（按用户隔离）----
+// 归属语义（与 auth 工位冻结约定一致）：
+//   authUserId == -1  → 账号体系未启用 / 静态 --auth-token（legacy/admin），不做归属过滤，
+//                       完全保持历史行为；repo 查询用 owner 桶 0。
+//   authUserId >= 1   → 已登录用户，只能访问 owner_id == authUserId 的资源。
+//   file.ownerId == 0 → 账号体系启用前的历史数据；仅 authUserId == -1（legacy/admin）可见，
+//                       authUserId >= 1 访问它一律视为"不存在"（fail-closed → 404）。
+//
+// repo 层查询统一用 scopeOwner()：legacy 传 0（命中历史桶=全部既有数据），
+// 登录用户传自身 id。
+std::int64_t scopeOwner(std::int64_t authUserId) {
+  return authUserId == -1 ? 0 : authUserId;
+}
+
+// 越权判定：登录用户访问非自身资源（含历史数据桶 owner_id==0）→ false（调用方应回 404）。
+// legacy（authUserId==-1）放行。此函数刻意只返回"可见/不可见"布尔，绝不区分
+// "不存在"与"不属于你"，以防通过 403 泄漏"该 id 存在"。
+bool ownerVisible(const cv::FileRow& row, std::int64_t authUserId) {
+  if (authUserId == -1) return true;
+  return row.ownerId == authUserId;
+}
+bool ownerVisible(const cv::UploadSession& s, std::int64_t authUserId) {
+  if (authUserId == -1) return true;
+  return s.ownerId == authUserId;
+}
+
+// 镜像树路径按 owner 作用域隔离：
+//   ownerId <= 0  → 维持历史布局 <filesRoot>/<dir>/<name>（兼容既有部署的镜像目录不"消失"）。
+//   ownerId >= 1  → <filesRoot>/u<ownerId>/<dir>/<name>，各用户互不覆盖。
+std::string mirrorPathFor(const cv::Config& cfg, std::int64_t ownerId,
+                          const std::string& dir, const std::string& name) {
+  if (ownerId <= 0) return diskFilePath(cfg, dir, name);
+  return filesRoot(cfg) + "/u" + std::to_string(ownerId) + "/" +
+         (dir.empty() ? std::string() : dir + "/") + name;
+}
+
+// 物理目录树根：与镜像路径同源，按 owner 隔离（legacy 用原始根）。
+std::string userFilesRoot(const cv::Config& cfg, std::int64_t ownerId) {
+  if (ownerId <= 0) return filesRoot(cfg);
+  return filesRoot(cfg) + "/u" + std::to_string(ownerId);
 }
 
 // 从 query string 取参数（已百分号编码，调用方自行 urlDecode）
@@ -505,7 +550,7 @@ void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const c
     std::string slice;
     bool servedFromMirror = false;
     {
-      const std::string mirrorPath = diskFilePath(cfg, row.dir, row.name);
+      const std::string mirrorPath = mirrorPathFor(cfg, row.ownerId, row.dir, row.name);
       std::error_code mec;
       if (!store.encryptionEnabled() &&
           fs::file_size(mirrorPath, mec) == static_cast<std::uintmax_t>(total) && !mec) {
@@ -596,11 +641,11 @@ bool treeChildLess(const std::map<std::string, TreeNode>& nodes, const std::stri
 // 以 DB 行（dir_node 全量 + file_node/file_dir）在内存按路径段建树。
 // key 命名空间隔离：目录="D:"+path，文件="F:"+path，避免同名目录/文件 key 冲突。
 void buildFileTree(cv::FileRepository& repo, cv::json::Value& rootArr, std::int64_t& totalDirs,
-                   std::int64_t& totalFiles, std::string& err) {
+                   std::int64_t& totalFiles, std::int64_t ownerId, std::string& err) {
   std::vector<std::string> dirs;
-  if (!repo.listDirsAll(dirs, err)) return;
+  if (!repo.listDirsAll(ownerId, dirs, err)) return;
   std::vector<cv::FileRow> files;
-  if (!repo.listFiles(files, err)) return;
+  if (!repo.listFiles(ownerId, files, err)) return;
 
   std::map<std::string, TreeNode> nodes;
   // 1) 目录节点（根 '' 不建节点，由 root 数组表达）
@@ -781,6 +826,19 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // ---- 账号数据库：**独立文件** users.db（与文件元数据分离，备份/权限策略互不影响）----
+  Db usersDb;
+  const std::string usersDbPath = cfg.dataDir + "/meta/users.db";
+  if (!usersDb.open(usersDbPath, err)) {
+    CV_LOG_ERROR("打开账号数据库失败: " << err);
+    return 1;
+  }
+  if (!usersDb.exec(kUsersSchemaSql, err)) {
+    CV_LOG_ERROR("账号库建表失败: " << err);
+    return 1;
+  }
+  UserRepository usersRepo(usersDb);
+
   FileRepository repo(db);
   UploadRepository up(db);
   ShareRepository shr(db);
@@ -788,6 +846,35 @@ int main(int argc, char** argv) {
 
   // 启用 API Bearer Token 鉴权（空 = 不启用，向后兼容）
   server.setAuthToken(cfg.authToken);
+  // ---- 账号体系装配 ----
+  // 兼容开关（关键）：**users 表为空 ⇒ 不启用强制鉴权**，保持既有单用户行为。
+  // 这样 testdata/smoke*.sh（不带 token）与既有部署不受影响；
+  // 一旦有人注册了账号，除 /healthz 与公开分享端点 /s/* 外都必须带有效会话令牌。
+  {
+    std::int64_t userCount = 0;
+    std::string    uerr;
+    if (!usersRepo.countUsers(userCount, uerr))
+      CV_LOG_WARN("统计用户数失败（按未启用账号体系处理）: " << uerr);
+    server.setAccountsEnabled(userCount > 0);
+    if (userCount > 0) {
+      CV_LOG_INFO("账号体系已启用：共 " << userCount
+                                      << " 个用户；除 /healthz 与 /s/* 外均需有效会话令牌，"
+                                      << "且文件按 owner 隔离（越权一律 404）");
+    } else {
+      CV_LOG_INFO("未检测到用户账号：保持单用户模式（不做按用户隔离，静态 token 仍有效）");
+    }
+    std::string perr2;
+    if (!usersRepo.purgeDeadSessions(nowMillis(), perr2))
+      CV_LOG_WARN("清理过期会话失败: " << perr2);
+  }
+  // 会话校验回调：把 Bearer 令牌哈希后查库（库内只存 sha256(token)，不存明文）。
+  server.setSessionValidator([&usersRepo](const std::string& token, std::int64_t& outUserId) {
+    std::string verr;
+    outUserId = -1;
+    return usersRepo.validateSession(Sha256::of(token), nowMillis(), outUserId, verr);
+  });
+  registerAuthRoutes(server, usersRepo, AuthConfig{});
+
   if (cfg.authToken.empty()) {
     // 仅在“暴露面”较大时（HTTPS 且监听非本地）升级为更醒目的风险告警；
     // 纯明文 HTTP 或仅本地监听也告警，但措辞区分。
@@ -841,6 +928,8 @@ int main(int argc, char** argv) {
   // ---- POST /api/v1/files （整文件上传；头 X-CV-Dir 指定目标目录）----
   server.route("POST", "/api/v1/files", [&](const net::Request& req, net::Response& resp) {
     std::string err;
+    const std::int64_t auth = req.authUserId;        // 冻结字段：见 auth 工位约定
+    const std::int64_t oid = scopeOwner(auth);        // legacy → 0；登录 → 自身 id
     if (req.body.size() > kMaxUploadBytes) {
       json::Value v = json::Value::object();
       v.set("error", "file too large for single-shot upload; use POST /api/v1/uploads/init (chunked)");
@@ -863,7 +952,7 @@ int main(int argc, char** argv) {
     // （X-CV-Overwrite: 1 表示用户已确认覆盖）
     const bool overwrite = !req.header("x-cv-overwrite").empty();
     FileRow sameName;
-    const bool nameTaken = repo.findByPath(dir, name, sameName, err);
+    const bool nameTaken = repo.findByPath(oid, dir, name, sameName, err);
     if (nameTaken && !overwrite) {
       json::Value v = json::Value::object();
       v.set("error", "name exists in target directory");
@@ -903,8 +992,8 @@ int main(int argc, char** argv) {
       if (freed > 0) {
         CV_LOG_INFO("覆盖释放旧内容 blob " << orphans.size() << " 个，" << freed << " 字节");
       }
-    } else if (!repo.insertFile(name, dir, static_cast<std::int64_t>(data.size()), contentHash,
-                                chunkHashes, chunkSizes, id, err)) {
+    } else if (!repo.insertFile(name, dir, oid, static_cast<std::int64_t>(data.size()),
+                                contentHash, chunkHashes, chunkSizes, id, err)) {
       resp.setError(500, std::string("db failed: ") + err);
       return;
     }
@@ -913,7 +1002,8 @@ int main(int argc, char** argv) {
     // 静态加密开启时镜像已自动关闭（避免明文副本），此路径跳过。
     if (mirrorEnabled) {
       std::string mirrorErr;
-      if (!store.materializeFromChunks(chunkHashes, diskFilePath(cfg, dir, name), mirrorErr)) {
+      if (!store.materializeFromChunks(chunkHashes, mirrorPathFor(cfg, oid, dir, name),
+                                      mirrorErr)) {
         CV_LOG_WARN("镜像文件树失败 id=" << id << ": " << mirrorErr);
       }
     }
@@ -936,6 +1026,8 @@ int main(int argc, char** argv) {
   // ---- POST /api/v1/files/new （新建空文件；含同名检测）----
   server.route("POST", "/api/v1/files/new", [&](const net::Request& req, net::Response& resp) {
     std::string perr;
+    const std::int64_t auth = req.authUserId;
+    const std::int64_t oid = scopeOwner(auth);
     json::Value body = parseJsonBody(req.body, perr);
     if (!perr.empty()) {
       resp.setError(400, "invalid json: " + perr);
@@ -965,7 +1057,7 @@ int main(int argc, char** argv) {
     }
 
     FileRow same;
-    if (repo.findByPath(dir, name, same, perr)) {
+    if (repo.findByPath(oid, dir, name, same, perr)) {
       json::Value v = json::Value::object();
       v.set("error", "name exists in target directory");
       v.set("exists", true);
@@ -984,13 +1076,13 @@ int main(int argc, char** argv) {
       return;
     }
     std::int64_t id = 0;
-    if (!repo.insertFile(name, dir, 0, emptyHash, {}, {}, id, perr)) {
+    if (!repo.insertFile(name, dir, oid, 0, emptyHash, {}, {}, id, perr)) {
       resp.setError(500, std::string("db failed: ") + perr);
       return;
     }
     if (mirrorEnabled) {
       std::string mirrorErr;
-      if (!store.materializeFromChunks({}, diskFilePath(cfg, dir, name), mirrorErr)) {
+      if (!store.materializeFromChunks({}, mirrorPathFor(cfg, oid, dir, name), mirrorErr)) {
         CV_LOG_WARN("镜像文件树失败 id=" << id << ": " << mirrorErr);
       }
     }
@@ -1009,6 +1101,7 @@ int main(int argc, char** argv) {
   server.route("POST", "/api/v1/files/:id/rename",
                [&](const net::Request& req, net::Response& resp) {
                  std::string perr;
+                 const std::int64_t auth = req.authUserId;
                  std::int64_t id = 0;
                  if (!parseId(req.param("id"), id)) {
                    resp.setError(404, "file not found");
@@ -1016,6 +1109,11 @@ int main(int argc, char** argv) {
                  }
                  FileRow row;
                  if (!repo.findById(id, row, perr)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 // 归属校验：越权一律 404（fail-closed；不暴露"该 id 存在"）
+                 if (!ownerVisible(row, auth)) {
                    resp.setError(404, "file not found");
                    return;
                  }
@@ -1046,7 +1144,7 @@ int main(int argc, char** argv) {
                    return;
                  }
                  bool exists = false;
-                 if (!repo.nameExists(row.dir, newName, id, exists, perr)) {
+                 if (!repo.nameExists(scopeOwner(auth), row.dir, newName, id, exists, perr)) {
                    resp.setError(500, std::string("db failed: ") + perr);
                    return;
                  }
@@ -1065,8 +1163,8 @@ int main(int argc, char** argv) {
                  }
                  // 物理镜像同步改名（尽力而为；失败则按新名重建）
                  std::error_code rec;
-                 fs::rename(diskFilePath(cfg, row.dir, row.name),
-                            diskFilePath(cfg, row.dir, newName), rec);
+                 fs::rename(mirrorPathFor(cfg, row.ownerId, row.dir, row.name),
+                            mirrorPathFor(cfg, row.ownerId, row.dir, newName), rec);
                  if (rec && mirrorEnabled) {
                    std::string mirrorErr;
                    std::vector<std::string> chunkHashes;
@@ -1088,6 +1186,7 @@ int main(int argc, char** argv) {
   server.route("DELETE", "/api/v1/files/:id",
                [&](const net::Request& req, net::Response& resp) {
                  std::string perr;
+                 const std::int64_t auth = req.authUserId;
                  std::int64_t id = 0;
                  if (!parseId(req.param("id"), id)) {
                    resp.setError(404, "file not found");
@@ -1098,6 +1197,10 @@ int main(int argc, char** argv) {
                    resp.setError(404, "file not found");
                    return;
                  }
+                 if (!ownerVisible(row, auth)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
                  std::vector<std::string> orphans;
                  if (!repo.softDelete(id, orphans, perr)) {
                    resp.setError(500, std::string("db failed: ") + perr);
@@ -1105,8 +1208,8 @@ int main(int argc, char** argv) {
                  }
                  // 释放磁盘空间：删镜像 + 删引用计数归零的 blob
                  std::error_code rec;
-                 const auto mirrorSize = fs::file_size(diskFilePath(cfg, row.dir, row.name), rec);
-                 fs::remove(diskFilePath(cfg, row.dir, row.name), rec);
+                 const auto mirrorSize = fs::file_size(mirrorPathFor(cfg, row.ownerId, row.dir, row.name), rec);
+                 fs::remove(mirrorPathFor(cfg, row.ownerId, row.dir, row.name), rec);
                  const std::int64_t freedBlob = dropOrphanBlobs(store, orphans);
                  const std::int64_t freedMirror = rec ? 0 : static_cast<std::int64_t>(mirrorSize);
                  json::Value v = json::Value::object();
@@ -1125,7 +1228,8 @@ int main(int argc, char** argv) {
                });
 
   // ---- GET /api/v1/storage （磁盘空间自查）----
-  server.route("GET", "/api/v1/storage", [&](const net::Request&, net::Response& resp) {
+  server.route("GET", "/api/v1/storage",
+               [&](const net::Request& req, net::Response& resp) {
     std::error_code ec;
     const std::int64_t freeBytes = diskFreeBytes(cfg.dataDir);
     std::int64_t totalBytes = 0;
@@ -1139,14 +1243,24 @@ int main(int argc, char** argv) {
     v.set("free_bytes", static_cast<long long>(freeBytes));
     v.set("total_bytes", static_cast<long long>(totalBytes));
     v.set("upload_safety_factor", static_cast<long long>(kSpaceSafetyFactor));
+    // 归属统计：登录用户只回传"自己已用字节"，避免泄漏他人占用。
+    if (req.authUserId != -1) {
+      std::string perr;
+      std::int64_t used = 0;
+      if (repo.sumSizeOfOwner(req.authUserId, used, perr)) {
+        v.set("used_bytes", static_cast<long long>(used));
+      }
+    }
     resp.setJson(200, json::dump(v));
   });
 
   // ---- GET /api/v1/files ----
-  server.route("GET", "/api/v1/files", [&](const net::Request&, net::Response& resp) {
+  server.route("GET", "/api/v1/files",
+               [&](const net::Request& req, net::Response& resp) {
     std::string err;
     std::vector<FileRow> rows;
-    if (!repo.listFiles(rows, err)) {
+    // 列表按 owner 过滤（SQL 层过滤，避免 C++ 侧泄漏他人元数据）
+    if (!repo.listFiles(scopeOwner(req.authUserId), rows, err)) {
       resp.setError(500, std::string("db failed: ") + err);
       return;
     }
@@ -1161,6 +1275,7 @@ int main(int argc, char** argv) {
   // ---- GET /api/v1/files/:id ----
   server.route("GET", "/api/v1/files/:id", [&](const net::Request& req, net::Response& resp) {
     std::string err;
+    const std::int64_t auth = req.authUserId;
     std::int64_t id = 0;
     if (!parseId(req.param("id"), id)) {
       resp.setError(404, "file not found");
@@ -1171,6 +1286,10 @@ int main(int argc, char** argv) {
       resp.setError(404, "file not found");
       return;
     }
+    if (!ownerVisible(row, auth)) {
+      resp.setError(404, "file not found");
+      return;
+    }
     resp.setJson(200, json::dump(fileToJson(row)));
   });
 
@@ -1178,6 +1297,7 @@ int main(int argc, char** argv) {
   server.route("GET", "/api/v1/files/:id/content",
                [&](const net::Request& req, net::Response& resp) {
                  std::string err;
+                 const std::int64_t auth = req.authUserId;
                  std::int64_t id = 0;
                  if (!parseId(req.param("id"), id)) {
                    resp.setError(404, "file not found");
@@ -1185,6 +1305,10 @@ int main(int argc, char** argv) {
                  }
                  FileRow row;
                  if (!repo.findById(id, row, err)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 if (!ownerVisible(row, auth)) {
                    resp.setError(404, "file not found");
                    return;
                  }
@@ -1197,6 +1321,8 @@ int main(int argc, char** argv) {
   server.route("GET", "/api/v1/download",
                [&](const net::Request& req, net::Response& resp) {
                  std::string err;
+                 const std::int64_t auth = req.authUserId;
+                 const std::int64_t oid = scopeOwner(auth);
                  std::string raw = req.header("x-cv-path");
                  if (raw.empty()) raw = queryParam(req.query, "path");
                  std::string norm;
@@ -1211,14 +1337,15 @@ int main(int argc, char** argv) {
                  std::string name =
                      (slash == std::string::npos) ? norm : norm.substr(slash + 1);
                  FileRow row;
-                 if (!repo.findByPath(dir, name, row, err)) {
+                 // owner 作用域：越权/不存在统一 404，不泄漏他人文件名存在性
+                 if (!repo.findByPath(oid, dir, name, row, err)) {
                    resp.setError(404,
                                  "file not found under allowed root (path rejected or "
                                  "not recorded)");
                    return;
                  }
                  // 防御纵深：镜像树中该文件若存在，校验其真实路径未逃出允许根
-                 std::string disk = diskFilePath(cfg, row.dir, row.name);
+                 std::string disk = mirrorPathFor(cfg, row.ownerId, row.dir, row.name);
                  std::error_code ec;
                  if (fs::symlink_status(disk, ec).type() == fs::file_type::symlink) {
                    resp.setError(403, "refuse symlink in file tree");
@@ -1245,6 +1372,8 @@ int main(int argc, char** argv) {
   server.route("POST", "/api/v1/dirs",
                [&](const net::Request& req, net::Response& resp) {
                  std::string perr;
+                 const std::int64_t auth = req.authUserId;
+                 const std::int64_t oid = scopeOwner(auth);
                  json::Value body = parseJsonBody(req.body, perr);
                  if (!perr.empty()) {
                    resp.setError(400, "invalid json: " + perr);
@@ -1261,15 +1390,16 @@ int main(int argc, char** argv) {
                    resp.setError(400, "empty path (root always exists)");
                    return;
                  }
-                 // 物理侧：逐级创建，任何一级符号链接/逃逸都拒绝
+                 // 物理侧：逐级创建，任何一级符号链接/逃逸都拒绝。
+                 // 目录树按 owner 作用域隔离，避免 B 建 /docs 撞 A 的目录（否则冲突错误会泄漏 A 的目录名存在）。
                  std::string ferr;
-                 if (!ensureRealDirUnder(filesRoot(cfg), dir, ferr)) {
+                 if (!ensureRealDirUnder(userFilesRoot(cfg, oid), dir, ferr)) {
                    resp.setError(403, ferr);
                    return;
                  }
-                 // 元数据侧：幂等登记
+                 // 元数据侧：按 owner 幂等登记（复合主键 owner_id,path）
                  bool created = false;
-                 if (!repo.createDir(dir, created, perr)) {
+                 if (!repo.createDir(oid, dir, created, perr)) {
                    resp.setError(500, std::string("db failed: ") + perr);
                    return;
                  }
@@ -1282,10 +1412,12 @@ int main(int argc, char** argv) {
                });
 
   // ---- GET /api/v1/dirs （列出已登记目录）----
-  server.route("GET", "/api/v1/dirs", [&](const net::Request&, net::Response& resp) {
+  server.route("GET", "/api/v1/dirs",
+               [&](const net::Request& req, net::Response& resp) {
     std::string err;
     std::vector<std::string> dirs;
-    if (!repo.listDirs(dirs, err)) {
+    // 仅列出调用者名下的目录（按 owner 隔离）
+    if (!repo.listDirs(scopeOwner(req.authUserId), dirs, err)) {
       resp.setError(500, std::string("db failed: ") + err);
       return;
     }
@@ -1301,11 +1433,13 @@ int main(int argc, char** argv) {
   // 受全局鉴权保护（白名单仅豁免 /healthz，本接口需有效 Bearer 令牌）；
   // 不分页；从 dir_node + file_node/file_dir 在内存按路径段建树，
   // 目录在前文件在后、同类 name 升序；空目录以 children:[] 出现；路径为规范化相对路径（'/' 分隔）。
-  server.route("GET", "/api/v1/tree", [&](const net::Request&, net::Response& resp) {
+  // 仅构建调用者名下的目录/文件（按 owner 隔离）。
+  server.route("GET", "/api/v1/tree",
+               [&](const net::Request& req, net::Response& resp) {
     std::string err;
     json::Value rootArr;
     std::int64_t totalDirs = 0, totalFiles = 0;
-    buildFileTree(repo, rootArr, totalDirs, totalFiles, err);
+    buildFileTree(repo, rootArr, totalDirs, totalFiles, scopeOwner(req.authUserId), err);
     if (!err.empty()) {
       resp.setError(500, std::string("db failed: ") + err);
       return;
@@ -1323,6 +1457,8 @@ int main(int argc, char** argv) {
   server.route("POST", "/api/v1/uploads/init",
                [&](const net::Request& req, net::Response& resp) {
                  std::string perr;
+                 const std::int64_t auth = req.authUserId;
+                 const std::int64_t oid = scopeOwner(auth);
                  json::Value body = parseJsonBody(req.body, perr);
                  if (!perr.empty()) {
                    resp.setError(400, "invalid json: " + perr);
@@ -1393,60 +1529,106 @@ int main(int argc, char** argv) {
                  if (pov && pov->type() == json::Value::Type::Bool) {
                    overwrite = pov->boolValue();
                  }
-                 {
-                   FileRow same;
-                   if (repo.findByPath(dir, name, same, perr) && !overwrite) {
-                     json::Value v = json::Value::object();
-                     v.set("error", "name exists in target directory");
-                     v.set("exists", true);
-                     v.set("file_id", static_cast<long long>(same.id));
-                     v.set("name", name);
-                     v.set("dir", dir);
-                     resp.setJson(409, json::dump(v));
-                     return;
-                   }
+                 // 同名检测：目标目录下已存在同名文件 → 记录 sameName；未声明覆盖则 409。
+                 // （nameTaken/sameName 提升到路由作用域，供下方秒传"覆盖"分支复用。）
+                 FileRow sameName;
+                 bool nameTaken = repo.findByPath(oid, dir, name, sameName, perr);
+                 if (nameTaken && !overwrite) {
+                   json::Value v = json::Value::object();
+                   v.set("error", "name exists in target directory");
+                   v.set("exists", true);
+                   v.set("file_id", static_cast<long long>(sameName.id));
+                   v.set("name", name);
+                   v.set("dir", dir);
+                   resp.setJson(409, json::dump(v));
+                   return;
                  }
 
-                 // 秒传：file_hash 已在内容库命中 → 直接返回已存在文件
-                 if (!fileHash.empty()) {
-                   FileRow existing;
-                   if (repo.findByContentHash(fileHash, existing, perr)) {
-                     json::Value v = json::Value::object();
-                     v.set("upload_id", static_cast<long long>(0));
-                     v.set("done", true);
-                     v.set("file_id", static_cast<long long>(existing.id));
-                     v.set("name", name);
-                     v.set("size", static_cast<long long>(size));
-                     v.set("chunk_size", static_cast<long long>(chunkSize));
-                     v.set("hash", fileHash);
-                     v.set("uploaded", json::Value::array());
-                     v.set("received_bytes", static_cast<long long>(size));
-                     resp.setJson(200, json::dump(v));
-                     CV_LOG_INFO("init 秒传命中 hash=" << fileHash
-                                                      << " file_id=" << existing.id);
-                     return;
-                   }
-                   // 断点复用：同 (file_hash,size,chunk_size) 的未完成会话
-                   UploadSession s;
-                   if (up.findResumable(fileHash, size, chunkSize, s, perr)) {
-                     json::Value v = buildOk(s);
-                     resp.setJson(200, json::dump(v));
-                     CV_LOG_INFO("init 复用断点 upload_id=" << s.id
-                                                           << " hash=" << fileHash);
-                     return;
-                   }
-                 }
+                // 秒传：file_hash 已在内容库命中 → 复用既有内容，但必须为"调用者"新建一行
+                // file_node（owner=调用者、落在目标 dir），把 ref_count 正确 +1，
+                // 返回**新建的 id**（绝不直接把命中那行——可能是别人的——id 回给调用者，
+                // 那既是越权入口、也导致"秒传成功"却不在调用者目录树里）。
+                // 与同名检测交互：目标目录下已有同名文件且声明 overwrite → 走既有"覆盖"语义。
+                if (!fileHash.empty()) {
+                  FileRow existing;
+                  if (repo.findByContentHash(fileHash, existing, perr)) {
+                    std::vector<std::string> ch;
+                    std::vector<std::size_t> cs;
+                    if (!repo.chunkHashesOf(existing.id, ch, perr) ||
+                        !repo.chunkSizesOf(ch, cs, perr)) {
+                      resp.setError(500, std::string("db failed: ") + perr);
+                      return;
+                    }
+                    std::int64_t newFileId = 0;
+                    if (nameTaken && overwrite) {
+                      // 覆盖目标目录同名文件：保留其 id/名，替换内容（引用计数同步增减）
+                      std::vector<std::string> orphans;
+                      if (!repo.replaceContent(sameName.id, existing.size, fileHash, ch, cs,
+                                               orphans, perr)) {
+                        resp.setError(500, std::string("db failed: ") + perr);
+                        return;
+                      }
+                      newFileId = sameName.id;
+                      const std::int64_t freed = dropOrphanBlobs(store, orphans);
+                      if (freed > 0) {
+                        CV_LOG_INFO("覆盖释放旧内容 blob " << orphans.size() << " 个，" << freed
+                                                          << " 字节");
+                      }
+                    } else {
+                      if (!repo.insertFile(name, dir, oid, existing.size, fileHash, ch, cs,
+                                          newFileId, perr)) {
+                        resp.setError(500, std::string("db failed: ") + perr);
+                        return;
+                      }
+                    }
+                    // 物理镜像树（尽力而为；ref_content 以 blob + DB 为权威）
+                    if (mirrorEnabled) {
+                      std::string mirrorErr;
+                      if (freeSpaceBelow(cfg, static_cast<std::int64_t>(existing.size))) {
+                        CV_LOG_WARN("跳过镜像（空间不足）file_id=" << newFileId);
+                      } else if (!store.materializeFromChunks(
+                                     ch, mirrorPathFor(cfg, oid, dir, name), mirrorErr)) {
+                        CV_LOG_WARN("镜像文件树失败 file_id=" << newFileId << ": " << mirrorErr);
+                      }
+                    }
+                    json::Value v = json::Value::object();
+                    v.set("upload_id", static_cast<long long>(0));
+                    v.set("done", true);
+                    v.set("file_id", static_cast<long long>(newFileId));
+                    v.set("name", name);
+                    v.set("size", static_cast<long long>(size));
+                    v.set("chunk_size", static_cast<long long>(chunkSize));
+                    v.set("hash", fileHash);
+                    v.set("uploaded", json::Value::array());
+                    v.set("received_bytes", static_cast<long long>(size));
+                    v.set("instant", true);
+                    resp.setJson(200, json::dump(v));
+                    CV_LOG_INFO("init 秒传命中 hash=" << fileHash
+                                                      << " → 新建 file_id=" << newFileId
+                                                      << " owner=" << oid);
+                    return;
+                  }
+                  // 断点复用：同 (file_hash,size,chunk_size,owner) 的未完成会话
+                  UploadSession s;
+                  if (up.findResumable(fileHash, size, chunkSize, oid, s, perr)) {
+                    json::Value v = buildOk(s);
+                    resp.setJson(200, json::dump(v));
+                    CV_LOG_INFO("init 复用断点 upload_id=" << s.id
+                                                          << " hash=" << fileHash);
+                    return;
+                  }
+                }
 
                  // 新建会话前才做空间预检（秒传命中 / 断点复用都不额外占盘）
                  if (!checkSpaceForUpload(cfg, size, resp)) {
                    return;
                  }
-                 // 新建会话
-                 std::int64_t newId = 0;
-                 if (!up.create(name, size, chunkSize, fileHash, newId, perr)) {
-                   resp.setError(500, std::string("db failed: ") + perr);
-                   return;
-                 }
+                // 新建会话
+                std::int64_t newId = 0;
+                if (!up.create(oid, name, size, chunkSize, fileHash, newId, perr)) {
+                  resp.setError(500, std::string("db failed: ") + perr);
+                  return;
+                }
                  up.setDir(newId, dir, perr);   // 登记目标目录，complete 时取用
                  up.setOverwrite(newId, overwrite, perr);   // 登记覆盖标志
                  std::error_code msec;
@@ -1469,6 +1651,7 @@ int main(int argc, char** argv) {
   server.route("GET", "/api/v1/uploads/:id",
                [&](const net::Request& req, net::Response& resp) {
                  std::string perr;
+                 const std::int64_t auth = req.authUserId;
                  std::int64_t id = 0;
                  if (!parseId(req.param("id"), id)) {
                    resp.setError(404, "session not found");
@@ -1476,6 +1659,10 @@ int main(int argc, char** argv) {
                  }
                  UploadSession s;
                  if (!up.findById(id, s, perr)) {
+                   resp.setError(404, "session not found");
+                   return;
+                 }
+                 if (!ownerVisible(s, auth)) {
                    resp.setError(404, "session not found");
                    return;
                  }
@@ -1495,6 +1682,7 @@ int main(int argc, char** argv) {
   server.route("PUT", "/api/v1/uploads/:id/chunk/:seq",
                [&](const net::Request& req, net::Response& resp) {
                  std::string perr;
+                 const std::int64_t auth = req.authUserId;
                  std::int64_t id = 0, seq = 0;
                  if (!parseId(req.param("id"), id) || !parseId(req.param("seq"), seq)) {
                    resp.setError(404, "session or chunk not found");
@@ -1502,6 +1690,10 @@ int main(int argc, char** argv) {
                  }
                  UploadSession s;
                  if (!up.findById(id, s, perr)) {
+                   resp.setError(404, "session not found");
+                   return;
+                 }
+                 if (!ownerVisible(s, auth)) {
                    resp.setError(404, "session not found");
                    return;
                  }
@@ -1551,6 +1743,7 @@ int main(int argc, char** argv) {
   server.route("POST", "/api/v1/uploads/:id/complete",
                [&](const net::Request& req, net::Response& resp) {
                  std::string perr;
+                 const std::int64_t auth = req.authUserId;
                  std::int64_t id = 0;
                  if (!parseId(req.param("id"), id)) {
                    resp.setError(404, "session not found");
@@ -1558,6 +1751,10 @@ int main(int argc, char** argv) {
                  }
                  UploadSession s;
                  if (!up.findById(id, s, perr)) {
+                   resp.setError(404, "session not found");
+                   return;
+                 }
+                 if (!ownerVisible(s, auth)) {
                    resp.setError(404, "session not found");
                    return;
                  }
@@ -1668,9 +1865,9 @@ int main(int argc, char** argv) {
                  bool overwrite = false;
                  up.getOverwrite(id, overwrite, perr);
                  perr.clear();
-                 // 覆盖：同目录同名已存在且会话声明了 overwrite → 替换原记录内容
+                 // 覆盖：同目录同名已存在（且归属本会话 owner）且会话声明了 overwrite → 替换原记录内容
                  FileRow sameName;
-                 bool replace = overwrite && repo.findByPath(dir, s.name, sameName, perr);
+                 bool replace = overwrite && repo.findByPath(s.ownerId, dir, s.name, sameName, perr);
                  perr.clear();
                  if (replace) {
                    fileId = sameName.id;
@@ -1685,8 +1882,8 @@ int main(int argc, char** argv) {
                      CV_LOG_INFO("覆盖释放旧内容 blob " << orphans.size() << " 个，" << freed
                                                         << " 字节");
                    }
-                 } else if (!repo.insertFile(s.name, dir, s.size, computed, chunkHashes,
-                                            chunkSizes, fileId, perr)) {
+                 } else if (!repo.insertFile(s.name, dir, s.ownerId, s.size, computed,
+                                            chunkHashes, chunkSizes, fileId, perr)) {
                    resp.setError(500, std::string("db failed: ") + perr);
                    return;
                  }
@@ -1696,9 +1893,9 @@ int main(int argc, char** argv) {
                    std::string mirrorErr;
                    if (freeSpaceBelow(cfg, static_cast<std::int64_t>(s.size))) {
                      CV_LOG_WARN("跳过镜像（空间不足）file_id=" << fileId);
-                   } else if (!store.materializeFromChunks(chunkHashes,
-                                                          diskFilePath(cfg, dir, s.name),
-                                                          mirrorErr)) {
+                   } else if (!store.materializeFromChunks(
+                                  chunkHashes,
+                                  mirrorPathFor(cfg, s.ownerId, dir, s.name), mirrorErr)) {
                      CV_LOG_WARN("镜像文件树失败 file_id=" << fileId << ": " << mirrorErr);
                    }
                  }
