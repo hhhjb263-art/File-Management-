@@ -262,9 +262,8 @@ Item {
                     color: Theme.bg
                     border.width: 1
                     border.color: Theme.border
-                    // 失效/已撤销项弱化视觉（撤销优先级更高）
-                    opacity: shareRow.info.revoked === true ? 0.45
-                                        : (isExpired ? 0.62 : 1.0)
+                    // 按用户要求：失效/已撤销项**不做浅色弱化**——
+                    // 状态用徽标表达；「进行中」视图里整行直接隐藏（不显示）。
 
                     ColumnLayout {
                         id: rowCol
