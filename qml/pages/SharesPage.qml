@@ -209,7 +209,7 @@ Item {
             DangerButton {
                 visible: page.showInvalid && page.invalidCount > 0
                 glyph: "🧹"
-                text: qsTr("清除无效分享")
+                text: qsTr("🧹 清理")
                 enabled: !page.sharesBusy
                 onClicked: cleanupConfirm.open()
                 ToolTip.visible: hovered
@@ -369,32 +369,36 @@ Item {
                             }
                             GhostButton {
                                 glyph: "⧉"
-                                text: qsTr("复制链接")
+                                implicitWidth: Theme.controlHeight
                                 enabled: !page.sharesBusy && shareRow.url.length > 0
                                 onClicked: page.copyLink(shareRow.url)
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("复制链接")
                             }
                             // 「打开」：用系统默认浏览器验证/查看分享链接（Qt.openUrlExternally）。
                             // 过期项仍允许打开（浏览器会显示过期提示，正好可用于验证），按钮给 ToolTip 说明。
                             GhostButton {
                                 id: openLinkBtn
                                 glyph: "🌐"
-                                text: qsTr("打开")
+                                implicitWidth: Theme.controlHeight
                                 enabled: !page.sharesBusy && shareRow.url.length > 0
                                 onClicked: page.openExternal(shareRow.url)
                                 ToolTip.visible: openLinkBtn.hovered
                                 ToolTip.text: shareRow.isExpired
-                                              ? qsTr("该分享已过期，打开后浏览器会提示；可用于验证链接状态")
-                                              : qsTr("在系统默认浏览器中打开该链接")
+                                              ? qsTr("已过期：打开可验证链接状态")
+                                              : qsTr("在系统默认浏览器中打开")
                             }
                             DangerButton {
                                 glyph: "🗑"
-                                text: qsTr("撤销")
+                                implicitWidth: Theme.controlHeight
                                 enabled: !page.sharesBusy
                                 onClicked: {
                                     revokeConfirm.shareId = page.sval(shareRow.info, "id", "")
                                     revokeConfirm.shareName = page.sval(shareRow.info, "fileName", "")
                                     revokeConfirm.open()
                                 }
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("撤销此分享（链接立即失效）")
                             }
                         }
                     }
