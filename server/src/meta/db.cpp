@@ -31,8 +31,15 @@ bool Db::open(const std::string& path, std::string& err) {
 }
 
 bool Db::initSchema(std::string& err) {
-  if (!exec(kSchemaSql, err)) return false;
-  return migrateSchema(db_, err);
+  // ⚠️ 顺序很关键：**先迁移既有表，再跑完整建表脚本**。
+  // 反过来的话，在老库上会崩（真机实测 main.cpp:825「建表失败: no such column: owner_id」）：
+  //   kSchemaSql 里的 `CREATE TABLE IF NOT EXISTS file_node` 在老库上是**空操作**
+  //   （表已存在且没有 owner_id），紧接着 `CREATE INDEX ... ON file_node(owner_id, deleted)`
+  //   就因列不存在而失败，initSchema 直接 return false，**迁移根本轮不到执行**。
+  // 改为：migrateSchema 只负责"已存在但缺列"的表（老库），
+  //       kSchemaSql 负责"建缺失的表 + 建索引"（新库直接建出含 owner_id 的结构）。
+  if (!migrateSchema(db_, err)) return false;
+  return exec(kSchemaSql, err);
 }
 
 namespace {
@@ -49,6 +56,21 @@ bool tableHasColumn(sqlite3* db, const std::string& table, const std::string& co
     if (rc != SQLITE_ROW) return false;  // 真错误
     if (stmt.text(1) == col) return true;  // PRAGMA table_info 第 2 列为列名
   }
+  return false;
+}
+
+// 表是否存在（迁移用：**表不存在 ⇒ 交给建表脚本创建含 owner_id 的新结构，不迁移**）
+bool tableExists(sqlite3* db, const std::string& table, std::string& err) {
+  std::string sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
+  cv::Stmt stmt(db, sql, err);
+  if (!stmt.ok()) return false;
+  if (!stmt.bind(1, table)) {
+    err = "bind failed";
+    return false;
+  }
+  const int rc = stmt.step(err);
+  if (rc == SQLITE_ROW) return true;
+  if (rc == SQLITE_DONE) return false;
   return false;
 }
 
@@ -84,15 +106,15 @@ bool migrateSchema(sqlite3* db, std::string& err) {
   }
 
   // 1) file_node.owner_id（缺失才加；NOT NULL + DEFAULT 0 让老行自动归 0）
-  if (!tableHasColumn(db, "file_node", "owner_id", err)) {
+  if (tableExists(db, "file_node", err) && !tableHasColumn(db, "file_node", "owner_id", err)) {
     std::vector<std::string> stmts = {
         "ALTER TABLE file_node ADD COLUMN owner_id INTEGER NOT NULL DEFAULT 0",
         "CREATE INDEX IF NOT EXISTS idx_file_owner ON file_node(owner_id, deleted)",
     };
     if (!execAll(db, stmts, err)) return false;
   }
-  // 索引幂等兜底（首次建新库时 kSchemaSql 已建，这里保证老库也补上）
-  {
+  // 索引幂等兜底（老库补上；新库由 kSchemaSql 创建）——仅在表存在时执行
+  if (tableExists(db, "file_node", err)) {
     char* msg = nullptr;
     sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_file_owner ON file_node(owner_id, deleted)",
                  nullptr, nullptr, &msg);
@@ -100,7 +122,7 @@ bool migrateSchema(sqlite3* db, std::string& err) {
   }
 
   // 2) upload_session.owner_id
-  if (!tableHasColumn(db, "upload_session", "owner_id", err)) {
+  if (tableExists(db, "upload_session", err) && !tableHasColumn(db, "upload_session", "owner_id", err)) {
     std::vector<std::string> stmts = {
         "ALTER TABLE upload_session ADD COLUMN owner_id INTEGER NOT NULL DEFAULT 0",
     };
@@ -110,7 +132,7 @@ bool migrateSchema(sqlite3* db, std::string& err) {
   // 3) dir_node：重建为 PRIMARY KEY(owner_id, path)。
   //    SQLite 不能 ALTER 主键，必须"建新表→拷数据→删旧表→改名"。
   //    detection：旧表无 owner_id 列即视为待迁移。
-  if (!tableHasColumn(db, "dir_node", "owner_id", err)) {
+  if (tableExists(db, "dir_node", err) && !tableHasColumn(db, "dir_node", "owner_id", err)) {
     std::vector<std::string> stmts = {
         "CREATE TABLE dir_node_new ("
         "owner_id INTEGER NOT NULL DEFAULT 0, "
@@ -125,8 +147,8 @@ bool migrateSchema(sqlite3* db, std::string& err) {
     if (!execAll(db, stmts, err)) return false;
   }
 
-  // 4) schema_info.version 真正用上：标记已迁移到版本 2（幂等标记，重复启动不再做任何事）。
-  {
+  // 4) schema_info.version 标记（幂等标记）。表可能还不存在（全新库）→ 跳过，由建表脚本创建。
+  if (tableExists(db, "schema_info", err)) {
     char* msg = nullptr;
     sqlite3_exec(db,
                  "UPDATE schema_info SET version = 2 WHERE version < 2",
