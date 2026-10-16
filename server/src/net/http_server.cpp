@@ -473,14 +473,27 @@ void HttpServer::handleClient(const Conn& conn) {
     std::ostringstream head;
     head << "HTTP/1.1 " << resp.status << ' ' << statusText(resp.status) << "\r\n"
          << "Content-Type: " << resp.contentType << "\r\n"
-         << "Content-Length: " << resp.body.size() << "\r\n";
+         << "Content-Length: "
+         << (resp.streamLength >= 0 ? resp.streamLength
+                                    : static_cast<std::int64_t>(resp.body.size()))
+         << "\r\n";
     for (const auto& kv : resp.extraHeaders) {
       head << kv.first << ": " << kv.second << "\r\n";
     }
     head << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n\r\n";
     std::string headStr = head.str();
     if (!writeAll(conn, headStr.data(), headStr.size())) { closeConn(conn); return; }
-    if (!resp.body.empty()) {
+    if (resp.streamLength >= 0 && resp.nextChunk) {
+      // 流式：逐块写。任何一块写失败就断开 —— 对端已经走了，没必要继续读盘。
+      // 中途读失败无法再改状态码（头已发出），表现为"长度不符的截断响应"，客户端会判失败；
+      // 这比静默回一份内容不对的数据要好。所以下面失败时只断开。
+      std::string chunk;
+      while (resp.nextChunk(chunk)) {
+        if (chunk.empty()) break;   // 空块视为结束，避免实现里出现"一直返回 true 但不产出"的死循环
+        if (!writeAll(conn, chunk.data(), chunk.size())) { closeConn(conn); return; }
+        chunk.clear();
+      }
+    } else if (!resp.body.empty()) {
       if (!writeAll(conn, resp.body.data(), resp.body.size())) { closeConn(conn); return; }
     }
 

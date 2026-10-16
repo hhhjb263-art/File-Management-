@@ -70,6 +70,22 @@ bool loadFile(const std::string& path, Config& cfg, std::string& err) {
     else if (k == "auth_token") cfg.authToken = v;
     else if (k == "http") cfg.httpEnabled = (toLowerLocal(v) != "off");
     else if (k == "data_key") cfg.dataKey = v;
+    else if (k == "version_keep") cfg.versionKeepCount = toInt(v, cfg.versionKeepCount);
+    else if (k == "version_days") cfg.versionRetentionDays = toInt(v, cfg.versionRetentionDays);
+    else if (k == "blob_gc") cfg.blobGcEnabled = (toLowerLocal(v) != "off");
+    else if (k == "blob_gc_grace_min") cfg.blobGcGraceMinutes = toInt(v, cfg.blobGcGraceMinutes);
+    else if (k == "backup_db") cfg.backupDbDir = v;
+    else if (k == "scrub") cfg.scrubNow = (toLowerLocal(v) == "now" || toLowerLocal(v) == "on" ||
+                                          toLowerLocal(v) == "true" || toLowerLocal(v) == "1");
+    else if (k == "scrub_interval_hours") cfg.scrubIntervalHours = toInt(v, cfg.scrubIntervalHours);
+    else if (k == "user_quota") cfg.defaultUserQuotaBytes = toSize(v, cfg.defaultUserQuotaBytes);
+    else if (k == "backup_blobs") cfg.backupBlobsDir = v;
+    else if (k == "restore_blobs") cfg.restoreBlobsDir = v;
+    else if (k == "scan") cfg.scanEnabled = (toLowerLocal(v) != "off");
+    else if (k == "scan_api_key") cfg.scanApiKey = v;
+    else if (k == "scan_block_threshold") cfg.scanBlockThreshold = toInt(v, cfg.scanBlockThreshold);
+    else if (k == "scan_fail_open") cfg.scanFailOpen = (toLowerLocal(v) != "off");
+    else if (k == "scan_timeout_ms") cfg.scanTimeoutMs = toInt(v, cfg.scanTimeoutMs);
   }
   return true;
 }
@@ -95,9 +111,26 @@ std::string configUsage(const char* program) {
      << "  --http=<on|off>    明文 HTTP 监听开关（默认 on；off 时仅保留 HTTPS）\n"
      << "  --data-key=<path>  静态数据加密密钥文件（64 hex 或 32 字节原文；非空即启用 blob 加密）\n"
      << "  --help             显示帮助\n"
+     << "  --version-keep=<n> 每文件历史版本条数上限（默认 10，0=不限）\n"
+     << "  --version-days=<n> 历史版本保留天数（默认 90，0=不限）\n"
+     << "  --blob-gc=<on|off> 启动期回收孤儿 blob（默认 on）\n"
+     << "  --blob-gc-grace-min=<n> 孤儿回收宽限期分钟数（默认 60，0=不限）\n"
+     << "  --backup-db=<dir>  备份元数据库与账号库到该目录后退出（不启动服务）\n"
+     << "  --scrub            全量巡检内容库（重新校验每个块的哈希）后退出\n"
+     << "  --scrub-interval-hours=<n> 后台每 n 小时巡检一次（默认 0 = 关闭）\n"
+     << "  --user-quota=<bytes> 默认用户配额（0 = 不限；用户表里的 quota_bytes 优先）\n"
+     << "  --backup-blobs=<dir> 增量镜像内容库到该目录后退出（放另一块盘，可 cron）\n"
+     << "  --restore-blobs=<dir> 以该目录为副本，修复主库缺失/损坏的块后退出\n"
+     << "  --scan=<on|off>      恶意文件判定（按 hash 查 VirusTotal，默认 off）\n"
+     << "  --scan-api-key=<key> VirusTotal API Key（为空则不发外网请求）\n"
+     << "  --scan-block-threshold=<n> 报毒引擎数 ≥ n 即拒绝（默认 1）\n"
+     << "  --scan-timeout-ms=<n> 单次远端查询超时（默认 3000；同步调用，会占住上传线程）\n"
      << "\n环境变量：CV_CONFIG / CV_DATA_DIR / CV_FILES_ROOT / CV_LISTEN / CV_PORT /\n"
      << "          CV_WORKERS / CV_CHUNK_SIZE / CV_LOG_FILE / CV_LOG_LEVEL /\n"
-     << "          CV_TLS_PORT / CV_TLS_CERT / CV_TLS_KEY / CV_AUTH_TOKEN / CV_HTTP / CV_DATA_KEY\n";
+     << "          CV_TLS_PORT / CV_TLS_CERT / CV_TLS_KEY / CV_AUTH_TOKEN / CV_HTTP / CV_DATA_KEY\n"
+     << "          CV_VERSION_KEEP / CV_VERSION_DAYS / CV_BLOB_GC / CV_BLOB_GC_GRACE_MIN\n"
+     << "          CV_BACKUP_DB / CV_SCRUB / CV_SCRUB_INTERVAL_HOURS / CV_USER_QUOTA\n"
+     << "          CV_BACKUP_BLOBS / CV_RESTORE_BLOBS / CV_SCAN / CV_SCAN_API_KEY\n";
   return os.str();
 }
 
@@ -133,6 +166,22 @@ Config loadConfig(int argc, char** argv) {
     cfg.httpEnabled = (toLowerLocal(envOr("CV_HTTP", "")) != "off");
   }
   cfg.dataKey = envOr("CV_DATA_KEY", cfg.dataKey);
+  cfg.versionKeepCount = toInt(envOr("CV_VERSION_KEEP", ""), cfg.versionKeepCount);
+  cfg.versionRetentionDays = toInt(envOr("CV_VERSION_DAYS", ""), cfg.versionRetentionDays);
+  if (!envOr("CV_BLOB_GC", "").empty())
+    cfg.blobGcEnabled = (toLowerLocal(envOr("CV_BLOB_GC", "")) != "off");
+  cfg.blobGcGraceMinutes = toInt(envOr("CV_BLOB_GC_GRACE_MIN", ""), cfg.blobGcGraceMinutes);
+  cfg.backupDbDir = envOr("CV_BACKUP_DB", cfg.backupDbDir);
+  if (!envOr("CV_SCRUB", "").empty())
+    cfg.scrubNow = (toLowerLocal(envOr("CV_SCRUB", "")) != "off");
+  cfg.scrubIntervalHours = toInt(envOr("CV_SCRUB_INTERVAL_HOURS", ""), cfg.scrubIntervalHours);
+  cfg.defaultUserQuotaBytes = toSize(envOr("CV_USER_QUOTA", ""), cfg.defaultUserQuotaBytes);
+  cfg.backupBlobsDir  = envOr("CV_BACKUP_BLOBS", cfg.backupBlobsDir);
+  cfg.restoreBlobsDir = envOr("CV_RESTORE_BLOBS", cfg.restoreBlobsDir);
+  if (!envOr("CV_SCAN", "").empty())
+    cfg.scanEnabled = (toLowerLocal(envOr("CV_SCAN", "")) != "off");
+  cfg.scanApiKey = envOr("CV_SCAN_API_KEY", cfg.scanApiKey);
+  cfg.scanTimeoutMs = toInt(envOr("CV_SCAN_TIMEOUT_MS", ""), cfg.scanTimeoutMs);
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -161,12 +210,45 @@ Config loadConfig(int argc, char** argv) {
     if (!take("auth-token").empty()) cfg.authToken = take("auth-token");
     if (!take("http").empty()) cfg.httpEnabled = (toLowerLocal(take("http")) != "off");
     if (!take("data-key").empty()) cfg.dataKey = take("data-key");
+    if (!take("version-keep").empty())
+      cfg.versionKeepCount = toInt(take("version-keep"), cfg.versionKeepCount);
+    if (!take("version-days").empty())
+      cfg.versionRetentionDays = toInt(take("version-days"), cfg.versionRetentionDays);
+    if (!take("blob-gc").empty()) cfg.blobGcEnabled = (toLowerLocal(take("blob-gc")) != "off");
+    if (!take("blob-gc-grace-min").empty())
+      cfg.blobGcGraceMinutes = toInt(take("blob-gc-grace-min"), cfg.blobGcGraceMinutes);
+    if (!take("backup-db").empty()) cfg.backupDbDir = take("backup-db");
+    if (has("scrub")) cfg.scrubNow = true;
+    if (!take("scrub-interval-hours").empty())
+      cfg.scrubIntervalHours = toInt(take("scrub-interval-hours"), cfg.scrubIntervalHours);
+    if (!take("user-quota").empty())
+      cfg.defaultUserQuotaBytes = toSize(take("user-quota"), cfg.defaultUserQuotaBytes);
+    if (!take("backup-blobs").empty()) cfg.backupBlobsDir = take("backup-blobs");
+    if (!take("restore-blobs").empty()) cfg.restoreBlobsDir = take("restore-blobs");
+    if (!take("scan").empty()) cfg.scanEnabled = (toLowerLocal(take("scan")) != "off");
+    if (!take("scan-api-key").empty()) cfg.scanApiKey = take("scan-api-key");
+    if (!take("scan-block-threshold").empty())
+      cfg.scanBlockThreshold = toInt(take("scan-block-threshold"), cfg.scanBlockThreshold);
+    if (!take("scan-fail-open").empty())
+      cfg.scanFailOpen = (toLowerLocal(take("scan-fail-open")) != "off");
+    if (!take("scan-timeout-ms").empty())
+      cfg.scanTimeoutMs = toInt(take("scan-timeout-ms"), cfg.scanTimeoutMs);
   }
 
   if (cfg.workers < 1) cfg.workers = 1;
   if (cfg.port <= 0 || cfg.port > 65535) cfg.port = 8080;
   if (cfg.tlsPort < 0 || cfg.tlsPort > 65535) cfg.tlsPort = 0;
   if (cfg.chunkSize == 0) cfg.chunkSize = 5u * 1024u * 1024u;
+  if (cfg.versionKeepCount < 0) cfg.versionKeepCount = 0;
+  if (cfg.versionRetentionDays < 0) cfg.versionRetentionDays = 0;
+  if (cfg.blobGcGraceMinutes < 0) cfg.blobGcGraceMinutes = 0;
+  if (cfg.scrubIntervalHours < 0) cfg.scrubIntervalHours = 0;
+  if (cfg.defaultUserQuotaBytes < 0) cfg.defaultUserQuotaBytes = 0;
+  if (cfg.scanBlockThreshold < 1) cfg.scanBlockThreshold = 1;
+  if (cfg.scanTimeoutMs < 200) cfg.scanTimeoutMs = 200;      // 太小等于必然超时
+  if (cfg.scanTimeoutMs > 30000) cfg.scanTimeoutMs = 30000;  // 上限：别把线程占太久
+  // Key 为空 = 未真正启用：避免"开着开关却没有凭据"却仍然发请求
+  if (cfg.scanApiKey.empty()) cfg.scanEnabled = false;
   return cfg;
 }
 

@@ -52,6 +52,8 @@ public:
         StateRole,                     // "state"（queued/hashing/running/paused/completed/failed/canceled）
         MessageRole,                   // "message"（错误 / 提示文案）
         ProgressRatioRole,             // "progressRatio"（0.0..1.0，供 ProgressBar.value）
+        LocalPathRole,                 // "localPath"（本机绝对路径：下载=落地位置，上传=源文件）
+        RemotePathRole,                // "remotePath"（云端目标路径，仅上传有）
         StateTextRole                  // "stateText"（中文展示）
     };
     Q_ENUM(Roles)

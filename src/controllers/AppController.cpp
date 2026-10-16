@@ -149,8 +149,12 @@ void AppController::setTrustSelfSigned(bool on)
 
 QString AppController::unsupportedNotice() const
 {
-    return QStringLiteral("服务端暂不支持：登录 / 用户体系、回收站、文件版本、分享链接、"
-                          "标签、全文检索。相关入口已置灰。");
+    // 文案已随服务端落地而更新：登录/用户体系、分享链接、回收站、文件版本、标签
+    // 均已实现（见 server/src/app/main.cpp 的路由表），此处不再把它们列为"不支持"。
+    // 目前七个导航入口全部 supported=true，本文案只在"某服务端版本确实缺能力"
+    // 时作为兜底提示显示，故改成不点名具体功能的通用说明。
+    return QStringLiteral("当前服务端不支持该功能。请确认服务端版本较新，"
+                          "或在设置页检查服务器地址。");
 }
 
 // ---- 自动刷新（加法式；读写 Settings 并立即落盘）----

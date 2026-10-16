@@ -91,7 +91,12 @@ signals:
     void changed();
     // 任务开始（含展示所需信息）——上层据此在 TransferModel 中建行；每任务只发一次。
     // fileName：上传=本地文件基名；下载=服务端文件名（非 file id）。total 未知时可为 0。
+    // localPath：本机落地的绝对路径（下载=写完的位置；上传=源文件）
+    // remotePath：云端目标位置（上传=目标路径；下载=空）
+    // 这两个是"传输栏里显示文件地址"用的 —— 任务行里本来就有这两个字段，
+    // 只是没随信号传出来，所以界面拿不到。
     void taskStarted(const QString &taskId, const QString &fileName, TransferKind kind,
+                     const QString &localPath, const QString &remotePath,
                      qint64 total);
     void taskProgress(const QString &taskId, qint64 done, qint64 total);
     void taskFinished(const QString &taskId, bool ok, const QString &message);

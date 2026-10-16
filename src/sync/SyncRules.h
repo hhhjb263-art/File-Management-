@@ -26,6 +26,23 @@ public:
 
     // 单条规则匹配（支持 * ? 通配符）
     static bool matches(const QString &pattern, const QString &name, bool isDir);
+
+    // ---- 以下为本次实现时新增的加法式接口（不改动上面既有签名）----
+
+    // 带 relPath 的匹配：模式含 '/' 时按整条相对路径匹配，否则只匹配末段
+    static bool matches(const QString &pattern, const QString &relPath, const QString &name,
+                        bool isDir);
+
+    // 按给定模式列表判定（逐条、后匹配者胜，支持 '!' 取反）——引擎用这个，
+    // 因为内置规则 + .cvignore 必须一起参与判定
+    static bool isIgnored(const QStringList &patterns, const QString &relPath, const QString &name,
+                          bool isDir);
+
+    // 便捷重载：直接从 relPath 取末段，避免调用方到处 split
+    static bool isIgnoredPath(const QStringList &patterns, const QString &relPath, bool isDir);
+
+    // 内置 + 该同步根的 .cvignore（顺序：内置在前，用户规则在后 ⇒ 用户可用 '!' 覆盖内置）
+    static QStringList effectivePatterns(const QString &syncRoot);
 };
 
 } // namespace cv

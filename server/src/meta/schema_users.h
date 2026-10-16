@@ -41,7 +41,11 @@ CREATE TABLE IF NOT EXISTS users (
   failed_attempts INTEGER NOT NULL DEFAULT 0,
   locked_until  INTEGER NOT NULL DEFAULT 0,
   status        TEXT NOT NULL DEFAULT 'active',
-  token_version INTEGER NOT NULL DEFAULT 1
+  token_version INTEGER NOT NULL DEFAULT 1,
+  -- 空间配额（PRD FR-1-4）。0 = 不限（默认，也是"整盘共享"）。
+  -- 老库没有这列，由 app 层在 exec 本 schema 之后补 ALTER —— CREATE TABLE IF NOT EXISTS
+  -- 对已存在的表是空操作，不会把新列加进去。
+  quota_bytes   INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username COLLATE NOCASE);
 

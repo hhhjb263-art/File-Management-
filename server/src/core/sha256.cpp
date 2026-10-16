@@ -140,6 +140,20 @@ std::string Sha256::hex() {
   return cached_;
 }
 
+std::string Sha256::bytes() {
+  finalize();
+  std::string out;
+  out.reserve(32);
+  for (int i = 0; i < 8; ++i) {
+    const unsigned int v = state_[i];
+    out.push_back(static_cast<char>((v >> 24) & 0xFF));
+    out.push_back(static_cast<char>((v >> 16) & 0xFF));
+    out.push_back(static_cast<char>((v >> 8) & 0xFF));
+    out.push_back(static_cast<char>(v & 0xFF));
+  }
+  return out;
+}
+
 std::string Sha256::of(const void* data, std::size_t len) {
   Sha256 s;
   s.update(data, len);

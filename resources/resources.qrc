@@ -5,9 +5,11 @@
 
         <!-- 设计令牌单例（qmldir 必需：singleton 声明） -->
         <file alias="qml/theme/Theme.qml">../qml/theme/Theme.qml</file>
+        <file alias="qml/theme/Icons.qml">../qml/theme/Icons.qml</file>
         <file alias="qml/theme/qmldir">../qml/theme/qmldir</file>
 
         <!-- 复用控件 -->
+        <file alias="qml/controls/CvIcon.qml">../qml/controls/CvIcon.qml</file>
         <file alias="qml/controls/PrimaryButton.qml">../qml/controls/PrimaryButton.qml</file>
         <file alias="qml/controls/SecondaryButton.qml">../qml/controls/SecondaryButton.qml</file>
         <file alias="qml/controls/GhostButton.qml">../qml/controls/GhostButton.qml</file>
@@ -32,6 +34,8 @@
         <file alias="qml/pages/TagsPage.qml">../qml/pages/TagsPage.qml</file>
         <file alias="qml/pages/TrashPage.qml">../qml/pages/TrashPage.qml</file>
         <file alias="qml/pages/VersionsPage.qml">../qml/pages/VersionsPage.qml</file>
+        <file alias="qml/pages/SyncPage.qml">../qml/pages/SyncPage.qml</file>
+        <file alias="qml/dialogs/MoveToDialog.qml">../qml/dialogs/MoveToDialog.qml</file>
 
         <!-- 对话框 -->
         <file alias="qml/dialogs/NewFileDialog.qml">../qml/dialogs/NewFileDialog.qml</file>
@@ -42,6 +46,7 @@
         <file alias="qml/dialogs/CertMismatchDialog.qml">../qml/dialogs/CertMismatchDialog.qml</file>
         <file alias="qml/dialogs/AboutDialog.qml">../qml/dialogs/AboutDialog.qml</file>
         <file alias="qml/dialogs/ShareDialog.qml">../qml/dialogs/ShareDialog.qml</file>
+        <file alias="qml/dialogs/TagAssignDialog.qml">../qml/dialogs/TagAssignDialog.qml</file>
 
         <!-- 控件风格配置 -->
         <file alias="qtquickcontrols2.conf">qtquickcontrols2.conf</file>

@@ -77,7 +77,18 @@ public:
     Q_INVOKABLE void enterDir(const QString &dir);       // 进入相对目录（'' = 根）
     Q_INVOKABLE void createFile(const QString &name);    // 新建空文件
     Q_INVOKABLE void rename(const QString &id, const QString &name);
-    Q_INVOKABLE void remove(const QString &id);          // 真实删除（契约 §8.1）
+    // 目录树 CRUD：把文件移到另一个目录（targetParentId 与列表里的目录项 id 同一套）。
+    Q_INVOKABLE void moveTo(const QString &id, const QString &targetParentId);
+    // 目录树 CRUD：目录重命名（dirPath 是目录的相对路径，不是 id —— 目录在两个数据源里
+    // 的 id 口径不同，而 path 是共同的、稳定的标识）。
+    Q_INVOKABLE void renameFolder(const QString &dirPath, const QString &newName);
+    // 目录树 CRUD：列出所有可选目标目录（供"移动到…"的选择器）。
+    // 返回 [{id, label, depth}]：id 用**列表里的目录 id**（两个数据源各自的口径，
+    // 调用方不需要知道差别）；label 是去掉前导斜杠的显示路径；depth 用于缩进成树形。
+    Q_INVOKABLE QVariantList allFolders();
+    // 移入回收站（软删除）。**不是**永久删除 —— 内容与引用计数原样保留，可在回收站页恢复。
+    // 永久删除（purge）只从回收站页发起：那是不可逆动作，入口必须唯一且带二次确认。
+    Q_INVOKABLE void remove(const QString &id);
     Q_INVOKABLE void createFolder(const QString &path);  // 相对路径，自动补齐中间目录
     Q_INVOKABLE void uploadHere();                       // 请求 QML 选择文件并上传到 currentDir
     Q_INVOKABLE void downloadSelected();                 // 下载 selectedIds

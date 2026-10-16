@@ -68,14 +68,16 @@ TransferController::TransferController(TransferManager *manager, QObject *parent
         // 任务开始：在模型里建行（fileName/kind/total 来自信号；state=排队中）
         connect(m_manager, &TransferManager::taskStarted, this,
                 [this](const QString &taskId, const QString &fileName, TransferKind kind,
-                       qint64 total) {
+                       const QString &localPath, const QString &remotePath, qint64 total) {
                     if (m_taskModel) {
                         TransferTask t;
-                        t.id       = taskId;
-                        t.fileName = fileName;
-                        t.kind     = kind;
-                        t.total    = total;
-                        t.state    = TransferState::Queued;
+                        t.id         = taskId;
+                        t.fileName   = fileName;
+                        t.kind       = kind;
+                        t.localPath  = localPath;   // 界面要显示"文件地址"
+                        t.remotePath = remotePath;
+                        t.total      = total;
+                        t.state      = TransferState::Queued;
                         m_taskModel->addTask(t); // 不存在则插入，已存在退化为更新（去重）
                     }
                     m_runningRows.remove(taskId);

@@ -371,6 +371,119 @@ Result<FileItem> MockBackend::ensureFolderPath(const QString &remotePath)
     return Result<FileItem>::success(last);
 }
 
+namespace {
+// 规范化相对路径：去首尾斜杠与空白（与仓储层/服务端的归一化口径保持一致）
+QString normRel(const QString &p)
+{
+    QString s = p.trimmed();
+    while (s.startsWith(QLatin1Char('/')))
+        s.remove(0, 1);
+    while (s.endsWith(QLatin1Char('/')))
+        s.chop(1);
+    return s;
+}
+}   // namespace
+
+Ok MockBackend::moveFile(const QString &id, const QString &newParentId)
+{
+    QMutexLocker locker(&m_mutex);
+
+    auto it = m_files.find(id);
+    if (it == m_files.end())
+        return err(QStringLiteral("文件不存在"));
+    if (it.value().isDir)
+        return err(QStringLiteral("这是目录，请用目录移动（目录带子树，不能走文件移动）"));
+
+    QString newPath;
+    QString parentId;
+    if (newParentId == kRootId || newParentId == kRootPath || newParentId.isEmpty()) {
+        newPath  = kRootPath;
+        parentId = kRootId;
+    } else {
+        auto pit = m_files.find(newParentId);
+        if (pit == m_files.end() || !pit.value().isDir || pit.value().trashed)
+            return err(QStringLiteral("目标目录不存在"));
+        newPath  = pit.value().path;
+        parentId = newParentId;
+    }
+
+    const QString target = Util::joinPath(newPath, it.value().name);
+    // 同名冲突（把自己排除在外 —— 否则"移到当前目录"会被误判成冲突）
+    for (auto f = m_files.constBegin(); f != m_files.constEnd(); ++f) {
+        if (f.key() != id && !f.value().trashed && f.value().path == target)
+            return err(QStringLiteral("目标目录下已存在同名条目"));
+    }
+
+    FileItem item = it.value();
+    item.parentId = parentId;
+    item.path     = target;
+    item.modified = QDateTime::currentDateTimeUtc();
+    item.rev      = Crypto::randomHex(6);
+    item.device   = Util::deviceName();
+    it.value()    = item;   // 文件没有子树，不需要递归改名
+    save();
+    return ok();
+}
+
+Ok MockBackend::moveDir(const QString &fromRaw, const QString &toRaw)
+{
+    QMutexLocker locker(&m_mutex);
+
+    const QString from = normRel(fromRaw);
+    const QString to   = normRel(toRaw);
+    if (from.isEmpty())
+        return err(QStringLiteral("不能移动根目录"));
+    if (to.isEmpty())
+        return err(QStringLiteral("目标路径不能为空"));
+    if (from == to)
+        return ok();   // 空操作
+
+    QString dirId;
+    for (auto f = m_files.constBegin(); f != m_files.constEnd(); ++f) {
+        if (f.value().isDir && !f.value().trashed && f.value().path == from) {
+            dirId = f.key();
+            break;
+        }
+    }
+    if (dirId.isEmpty())
+        return err(QStringLiteral("源目录不存在"));
+
+    // 不能移到自己或子孙里：否则子树会从树上"脱落"（数据都在，但没有任何路径能到达）
+    if (to.startsWith(from + QLatin1Char('/')))
+        return err(QStringLiteral("不能把目录移动到它自己或它的子目录里"));
+
+    for (auto f = m_files.constBegin(); f != m_files.constEnd(); ++f) {
+        if (!f.value().trashed && f.value().path == to)
+            return err(QStringLiteral("目标位置已存在同名条目"));
+    }
+
+    const int slash = to.lastIndexOf(QLatin1Char('/'));
+    const QString parentPath = slash < 0 ? QString() : to.left(slash);
+    QString       parentId   = kRootId;
+    if (!parentPath.isEmpty()) {
+        bool found = false;
+        for (auto f = m_files.constBegin(); f != m_files.constEnd(); ++f) {
+            if (f.value().isDir && !f.value().trashed && f.value().path == parentPath) {
+                parentId = f.key();
+                found    = true;
+                break;
+            }
+        }
+        if (!found)
+            return err(QStringLiteral("目标父目录不存在"));
+    }
+
+    FileItem item = m_files.value(dirId);
+    item.parentId = parentId;
+    item.path     = to;
+    item.modified = QDateTime::currentDateTimeUtc();
+    item.rev      = Crypto::randomHex(6);
+    m_files.insert(dirId, item);
+    renameRecursive(dirId, to);   // 子孙目录/文件的 path 随之更新
+    save();
+    return ok();
+}
+
 Ok MockBackend::rename(const QString &id, const QString &newName)
 {
     QMutexLocker locker(&m_mutex);

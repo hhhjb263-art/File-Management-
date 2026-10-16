@@ -88,6 +88,8 @@ QVariant TransferModel::data(const QModelIndex &index, int role) const
     case StateRole:         return stateToken(t.state);
     case MessageRole:       return t.error;
     case ProgressRatioRole: return t.total > 0 ? double(t.done) / double(t.total) : 0.0;
+    case LocalPathRole:     return t.localPath;
+    case RemotePathRole:    return t.remotePath;
     case StateTextRole:     return stateLabel(t.state);
     case Qt::DisplayRole:   return t.fileName; // 兜底
     default:                return QVariant();
@@ -108,6 +110,8 @@ QHash<int, QByteArray> TransferModel::roleNames() const
     roles[MessageRole]       = QByteArrayLiteral("message");
     roles[ProgressRatioRole] = QByteArrayLiteral("progressRatio");
     roles[StateTextRole]     = QByteArrayLiteral("stateText");
+    roles[LocalPathRole]     = QByteArrayLiteral("localPath");
+    roles[RemotePathRole]    = QByteArrayLiteral("remotePath");
     return roles;
 }
 

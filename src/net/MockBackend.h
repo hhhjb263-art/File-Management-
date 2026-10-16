@@ -35,6 +35,8 @@ public:
     Result<FileItem>          statByPath(const QString &remotePath) override;
     Result<FileItem>          createFolder(const QString &parentId, const QString &name) override;
     Result<FileItem>          ensureFolderPath(const QString &remotePath) override;
+    Ok                        moveFile(const QString &id, const QString &newParentId) override;
+    Ok                        moveDir(const QString &from, const QString &to) override;
     Ok                        rename(const QString &id, const QString &newName) override;
     Ok                        moveToTrash(const QString &id) override;
     Ok                        restore(const QString &id) override;

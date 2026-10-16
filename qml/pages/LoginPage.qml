@@ -16,31 +16,51 @@ Item {
     id: page
 
     anchors.fill: parent
-    // 默认规则：未登录且服务端**具备**账号体系时挡在前面。
+    // 默认规则：未登录且服务端**具备**账号体系、且用户没有主动跳过时挡在前面。
     // 例外（`forced`）：服务端还没有任何账号（/me 返回 501 → legacy 模式）时本页默认不显示，
     // 但顶栏「登录 / 注册」可强制打开它 —— 否则永远注册不出第一个账号，账号体系永远启用不了。
+    //
+    // ⚠️ loginSkipped：用户点过「跳过登录」后不再自动弹出。
+    //    没有这一条时本页会把整个界面永久挡住：登录动作依赖后端（不可达/未配置时必然失败），
+    //    而此前**没有任何关闭入口**（跳过按钮只在 forced 时可见）→ 用户被彻底锁死。
     visible: Auth.supported && !Auth.loggedIn && !Auth.initializing
-             && (!Auth.legacyMode || forced)
+             && ((!Auth.legacyMode && !loginSkipped) || forced)
 
     // 由 Main 置真以强制显示（legacy 模式下用户主动点「登录 / 注册」）
     property bool forced: false
     signal closed()
 
+    // 用户是否已主动跳过登录（typeof 守卫：C++ 侧未落地时按"未跳过"处理，行为与改动前一致）
+    readonly property bool loginSkipped:
+        (typeof Auth !== "undefined" && Auth.loginSkipped !== undefined)
+        ? Auth.loginSkipped : false
+
     // 半透明遮罩，阻止与下层界面交互（未登录时不应能操作文件等）。
     Rectangle {
         anchors.fill: parent
-        color: Qt.rgba(Theme.bg.r, Theme.bg.g, Theme.bg.b, 0.82)
+        color: Theme.overlay
     }
 
-    // 仅"强制打开"时给一个退出入口：legacy 用户本来靠访问令牌直连，
-    // 不该被登录页锁死（默认规则下本页不会被强制显示，故无需此按钮）。
-    ToolButton {
-        visible: page.forced
-        text: "✕  " + qsTr("稍后（继续用访问令牌）")
+    // ---- 常驻关闭入口（右上角 ✕）----
+    // 无论本页是自动弹出还是被强制打开，用户都必须能关掉它 ——
+    // 这是"跳过登录、继续用访问令牌"的唯一出口。
+    GhostButton {
+        iconName: "close"
         anchors.top: parent.top
         anchors.right: parent.right
         anchors.margins: Theme.spaceM
-        font.pointSize: Theme.fontSecondary
+        ToolTip.visible: hovered
+        ToolTip.text: qsTr("关闭（继续使用访问令牌）")
+        onClicked: page.closed()
+    }
+
+    // ---- 底部「稍后」入口（文案更明确，与右上角 ✕ 同义）----
+    GhostButton {
+        iconName: "logout"
+        text: qsTr("暂不登录，继续使用访问令牌")
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Theme.spaceXl
         onClicked: page.closed()
     }
 
@@ -97,12 +117,31 @@ Item {
         width: Math.min(380, page.width - Theme.spaceXl * 2)
         spacing: Theme.spaceL
 
-        Label {
+        // 品牌区：应用标记 + 名称（与主窗口 header 同一形态）
+        RowLayout {
             Layout.alignment: Qt.AlignHCenter
-            text: "☁  " + qsTr("云匣 CloudVault")
-            color: Theme.textPrimary
-            font.pointSize: Theme.fontTitle + 4
-            font.bold: true
+            spacing: Theme.spaceS
+
+            Rectangle {
+                implicitWidth: 34
+                implicitHeight: 34
+                radius: 9
+                color: Theme.primary
+
+                CvIcon {
+                    anchors.centerIn: parent
+                    name: "cloud"
+                    size: 20
+                    color: Theme.textOnPrimary
+                }
+            }
+
+            Label {
+                text: qsTr("云匣 CloudVault")
+                color: Theme.textPrimary
+                font.pointSize: Theme.fontTitle + 4
+                font.bold: true
+            }
         }
         Label {
             Layout.alignment: Qt.AlignHCenter

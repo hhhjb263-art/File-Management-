@@ -20,6 +20,8 @@ AuthController::AuthController(Backend *backend, AppController *app, QObject *pa
     m_rememberPassword = Settings::instance().rememberPassword();
     m_savedUserName    = Settings::instance().savedUser();
     m_savedPassword    = Settings::instance().savedPassword();
+    // 上次是否主动跳过了登录门（持久化，重启后保持 —— 否则每次启动都要再关一次）
+    m_loginSkipped     = Settings::instance().skipLogin();
 }
 
 // ---------------------------------------------------------------------------
@@ -28,6 +30,12 @@ AuthController::AuthController(Backend *backend, AppController *app, QObject *pa
 void AuthController::startupCheck()
 {
     if (!m_hb) {
+        // 本地引擎（--mock）没有账号体系 → 按 legacy 模式处理，不显示登录门。
+        // ⚠️ 这里必须置 legacyMode：否则 QML 的登录门
+        //    （Auth.supported && !loggedIn && !legacyMode && !initializing）会永久显示，
+        //    而登录动作同样依赖 m_hb（必然失败）→ 整个界面被锁死、无法使用。
+        setLegacyMode(true);
+        setLoggedIn(false);
         setInitializing(false);
         return;
     }
@@ -190,6 +198,13 @@ void AuthController::onServerUrlChanged()
 {
     // 切换服务器：无论是否登录都清空（避免把 A 的令牌发给 B）。
     resetSession(QStringLiteral("server-changed"));
+    // 换了服务器要重新询问一次（上一台的"跳过"决定不应带过来）。
+    if (m_loginSkipped) {
+        m_loginSkipped = false;
+        Settings::instance().setSkipLogin(false);
+        Settings::instance().sync();
+        emit loginSkippedChanged();
+    }
 }
 
 void AuthController::setRememberPassword(bool on)
@@ -218,6 +233,31 @@ void AuthController::clearSavedPassword()
     emit savedLoginChanged();
 }
 
+// ---------------------------------------------------------------------------
+//  登录门开关
+// ---------------------------------------------------------------------------
+void AuthController::skipLogin()
+{
+    if (!m_loginSkipped) {
+        m_loginSkipped = true;
+        emit loginSkippedChanged();
+    }
+    // 即便状态未变也落盘：保证"用户点过跳过"这件事一定被记住
+    Settings::instance().setSkipLogin(true);
+    Settings::instance().sync();
+    emit statusMessage(tr("已跳过登录，继续使用访问令牌直连"), true);
+}
+
+void AuthController::resumeLogin()
+{
+    if (m_loginSkipped) {
+        m_loginSkipped = false;
+        emit loginSkippedChanged();
+    }
+    Settings::instance().setSkipLogin(false);
+    Settings::instance().sync();
+}
+
 void AuthController::resetSession(const QString &reason)
 {
     const bool wasLoggedIn = m_loggedIn;
@@ -237,6 +277,12 @@ void AuthController::adoptUser(const QString &id, const QString &username,
     setUserId(id);
     setUserName(username);
     setDisplayName(displayName);
+    // 已登录 → 「跳过登录」的偏好自然失效（否则下次启动会带着旧偏好把登录门藏起来）
+    if (m_loginSkipped) {
+        m_loginSkipped = false;
+        Settings::instance().setSkipLogin(false);
+        emit loginSkippedChanged();
+    }
     if (storeToken && !token.isEmpty()) {
         Settings::instance().setToken(token);
         Settings::instance().sync();

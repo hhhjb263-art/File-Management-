@@ -125,6 +125,8 @@ add_library(cv_meta STATIC
   src/meta/upload_repository.cpp
   src/meta/share_repository.cpp
   src/meta/user_repository.cpp
+  src/meta/version_repository.cpp
+  src/meta/tag_repository.cpp
 )
 target_include_directories(cv_meta PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(cv_meta PUBLIC cv_core SQLite::SQLite3)

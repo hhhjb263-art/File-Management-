@@ -8,14 +8,20 @@ import "."
 /*!
     传输历史分组（可折叠）——「已上传」/「已下载」共用控件。
 
-    从原 TransfersPage.qml 的内联 `component HistoryGroup` 抽出，供**传输整页**与
-    **传输抽屉**两处复用（避免复制两份配色 / 交互）。
+    供**传输整页**与**传输抽屉**两处复用（避免复制两份配色 / 交互）。
 
     语义约定（保持既有，勿改坏）：
       · 默认折叠（expanded: false），且**不持久化**（每次重建都重新折叠）。
-      · count === 0 时整组隐藏。
-      · 头部整行可点（MouseArea 盖满）+ hover 反馈；右侧「清空记录」按钮（清空的是**全部**历史）。
+      · count === 0 时整组隐藏（除非 alwaysShowHeader）。
+      · 头部整行可点（MouseArea 盖满）+ hover 反馈；右侧「清空记录」按钮
+        （清空的是**全部**历史）。
       · 展开体高度由内容决定、并以 maxBodyHeight 为上限（超出则内部滚动）。
+
+    视觉规格（现代桌面效率风）
+      · 头部 = card 底 + 1px 边框；折叠箭头改用矢量图标（chevron）
+      · 展开体 = surfaceSunken 底 —— 用"下沉"表达"这是头部的从属内容"，
+        而不是再套一层同亮的卡片（那样层级会糊）
+      · 记录行 = card 底 + 1px divider 边框，从下沉底上"浮"出来
 
     数据来源：TransferModel.uploadHistoryAt(i) / downloadHistoryAt(i)（函数调用，
     QML 无法自动追踪依赖 → 用内部自增的 historyVersion 作为显式依赖）。
@@ -26,12 +32,12 @@ ColumnLayout {
     property string title: ""
     property bool   upload: true
     property int    count: 0
-      property bool   expanded: false           // 默认折叠；不持久化
-      property int    maxBodyHeight: 220         // 展开体高度上限（调用方可覆盖）
-      // 空历史时是否仍显示分组头（默认 false = 整组隐藏，保持传输整页既有观感）。
-      // 传输抽屉里置 true：需求要求「展开后的传输队列包含已下载/已上传两个栏目」，
-      // 若空历史就整组消失，首次使用的用户看不到这两栏的存在。
-      property bool   alwaysShowHeader: false
+    property bool   expanded: false       // 默认折叠；不持久化
+    property int    maxBodyHeight: 220    // 展开体高度上限（调用方可覆盖）
+    // 空历史时是否仍显示分组头（默认 false = 整组隐藏，保持传输整页既有观感）。
+    // 传输抽屉里置 true：需求要求「展开后的传输队列包含已下载/已上传两个栏目」，
+    // 若空历史就整组消失，首次使用的用户看不到这两栏的存在。
+    property bool   alwaysShowHeader: false
 
     // 历史变化版本号：historyAt() 是函数调用，QML 无法自动追踪其依赖，
     // 用一个自增版本号作为显式依赖，保证历史增删后行内容被重新求值。
@@ -79,10 +85,11 @@ ColumnLayout {
             anchors.rightMargin: Theme.spaceS
             spacing: Theme.spaceS
 
-            Text {
-                text: group.expanded ? "▾" : "▸"
-                font.pointSize: Theme.fontBody
-                color: Theme.textSecondary
+            CvIcon {
+                Layout.alignment: Qt.AlignVCenter
+                name: group.expanded ? "chevron-down" : "chevron-right"
+                size: Theme.iconSizeSmall
+                color: Theme.textTertiary
             }
 
             Label {
@@ -96,14 +103,14 @@ ColumnLayout {
 
             // 注意：clearHistory() 清空的是**全部**历史（含另一组），故文案写「清空记录」。
             GhostButton {
-                glyph: "🗑"
+                iconName: "trash"
                 text: qsTr("清空记录")
                 onClicked: TransferModel.clearHistory()
             }
         }
     }
 
-    // ---- 展开体 ----
+    // ---- 展开体（下沉底，表达"头部的从属内容"）----
     Rectangle {
         Layout.fillWidth: true
         visible: group.expanded
@@ -112,7 +119,7 @@ ColumnLayout {
                           + Theme.spaceS * 2
                         : 0
         radius: Theme.radiusControl
-        color: Theme.card
+        color: Theme.surfaceSunken
         border.width: 1
         border.color: Theme.border
         clip: true
@@ -137,7 +144,7 @@ ColumnLayout {
                     Layout.margins: Theme.spaceS
                     visible: group.count === 0
                     text: qsTr("暂无记录")
-                    color: Theme.textSecondary
+                    color: Theme.textTertiary
                     font.pointSize: Theme.fontSecondary
                     horizontalAlignment: Text.AlignHCenter
                 }
@@ -157,9 +164,9 @@ ColumnLayout {
                         Layout.fillWidth: true
                         implicitHeight: rowColumn.implicitHeight + Theme.spaceS * 2
                         radius: Theme.radiusControl
-                        color: Theme.bg
+                        color: Theme.card
                         border.width: 1
-                        border.color: Theme.border
+                        border.color: Theme.divider
 
                         ColumnLayout {
                             id: rowColumn
@@ -171,9 +178,10 @@ ColumnLayout {
                                 Layout.fillWidth: true
                                 spacing: Theme.spaceS
 
-                                Text {
-                                    text: historyRow.info.kind === "download" ? "⬇" : "⬆"
-                                    font.pointSize: Theme.fontBody
+                                CvIcon {
+                                    Layout.alignment: Qt.AlignVCenter
+                                    name: historyRow.info.kind === "download" ? "download" : "upload"
+                                    size: Theme.iconSize
                                     color: historyRow.info.kind === "download"
                                            ? Theme.info : Theme.primary
                                 }
@@ -213,7 +221,7 @@ ColumnLayout {
                                 Layout.fillWidth: true
                                 text: historyRow.info.displayPath !== undefined
                                       ? String(historyRow.info.displayPath) : ""
-                                color: Theme.textSecondary
+                                color: Theme.textTertiary
                                 font.pointSize: Theme.fontSecondary
                                 elide: Text.ElideRight
                             }

@@ -18,6 +18,7 @@
 #endif
 
 #include "core/sha256.h"
+#include "store/durable_io.h"   // 落盘屏障：写 blob 必须 fsync 后才允许提交引用它的 DB 事务
 
 namespace cv {
 namespace fs = std::filesystem;
@@ -28,31 +29,15 @@ namespace {
 constexpr char kBlobMagic[4] = {'C', 'V', 'B', '1'};
 constexpr std::size_t kNonceLen = 12;
 constexpr std::size_t kTagLen = 16;
+// 加密 blob 相对明文的固定头部开销（magic + nonce + tag）
+constexpr std::size_t kEncOverhead = 4 + kNonceLen + kTagLen;
 
+// ⚠️ 原子写已收敛到 store/durable_io.h::durable::writeFileAtomic —— 原实现只有
+//    `flush() + rename`（页缓存，非落盘），是断电后"blob 名字在、数据不在"的根因之一。
+//    这里保留一个同名转发，避免散落的调用点语义变化。
 bool writeFileAtomic(const std::string& finalPath, const std::string& data,
                      std::string& err) {
-  std::string tmp = finalPath + ".tmp";
-  {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-      err = "cannot write " + tmp + ": " + std::strerror(errno);
-      return false;
-    }
-    if (!data.empty()) out.write(data.data(), static_cast<std::streamsize>(data.size()));
-    out.flush();
-    if (!out.good()) {
-      err = "write failed: " + tmp;
-      return false;
-    }
-  }
-  std::error_code ec;
-  fs::rename(tmp, finalPath, ec);
-  if (ec) {
-    fs::remove(tmp, ec);
-    err = "rename failed: " + ec.message();
-    return false;
-  }
-  return true;
+  return durable::writeFileAtomic(finalPath, data, err);
 }
 
 bool readFileAll(const std::string& path, std::string& out, std::string& err) {
@@ -205,6 +190,47 @@ std::string ContentStore::pathOf(const std::string& hex) const {
   return root_ + "/" + hex.substr(0, 2) + "/" + hex + (encEnabled_ ? ".enc" : "");
 }
 
+bool ContentStore::listBlobs(std::vector<BlobInfo>& out, std::string& err) const {
+  out.clear();
+  std::error_code ec;
+  if (!fs::exists(root_, ec)) return true;   // 还没建库 ⇒ 空清单，不是错误
+
+  // C++17 的 file_time_type 与 system_clock 不同源，需按"相对现在"换算
+  const auto toUnixMs = [](fs::file_time_type t) -> std::int64_t {
+    const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        t - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+    return static_cast<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(sys.time_since_epoch()).count());
+  };
+
+  for (fs::recursive_directory_iterator it(root_, fs::directory_options::skip_permission_denied, ec), end;
+       it != end; it.increment(ec)) {
+    if (ec) { ec.clear(); continue; }
+    if (!it->is_regular_file(ec) || ec) { ec.clear(); continue; }
+
+    std::string name = it->path().filename().string();
+    // 加密 blob 落盘名带 .enc 后缀；去重时统一按 hash 处理
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".enc") == 0)
+      name.erase(name.size() - 4);
+
+    if (!validHash(name)) continue;   // 非 blob 命名 → 跳过，绝不当垃圾删
+
+    // 分片目录必须是 hash 的前两位，否则说明文件放错了位置（同样跳过）
+    const std::string shard = it->path().parent_path().filename().string();
+    if (shard != name.substr(0, 2)) continue;
+
+    BlobInfo b;
+    b.hash    = name;
+    b.path    = it->path().string();
+    b.size    = static_cast<std::int64_t>(it->file_size(ec));
+    if (ec) { ec.clear(); b.size = 0; }
+    b.mtimeMs = toUnixMs(it->last_write_time(ec));
+    if (ec) { ec.clear(); b.mtimeMs = 0; }
+    out.push_back(b);
+  }
+  return true;
+}
+
 std::string ContentStore::resolvePath(const std::string& hex) const {
   // 读取/存在性/删除时实际落盘路径：加密优先 <hash>.enc，否则回退同名明文 <hash>，
   // 以便从明文库平滑迁移（旧 blob 仍为明文，新 blob 为 .enc）。两者皆无则返回首选路径。
@@ -249,12 +275,32 @@ bool ContentStore::exists(const std::string& hex) const {
   return fs::exists(resolvePath(hex), ec);
 }
 
+bool ContentStore::sizeMatches(const std::string& hex, std::int64_t plainSize) const {
+  if (!validHash(hex) || plainSize < 0) return false;
+
+  const std::string p = resolvePath(hex);
+  std::error_code ec;
+  if (!fs::exists(p, ec) || ec) return false;
+
+  const auto sz = fs::file_size(p, ec);
+  if (ec) return false;
+
+  // 加密 blob 在明文之外还有固定头部（magic + nonce + tag），GCM 密文长度 == 明文长度。
+  const bool isEncrypted = (p.size() >= 4 && p.compare(p.size() - 4, 4, ".enc") == 0);
+  const std::int64_t expect =
+      plainSize + (isEncrypted ? static_cast<std::int64_t>(kEncOverhead) : 0);
+  return static_cast<std::int64_t>(sz) == expect;
+}
+
 bool ContentStore::put(const std::string& hex, const std::string& data, std::string& err) {
   if (!validHash(hex)) {
     err = "invalid content hash";
     return false;
   }
-  if (exists(hex)) return true;  // 去重：内容相同直接成功
+  // 去重判定必须带**尺寸**：只判 `exists()` 的话，一个断电留下的 0 字节/截断 blob
+  // 会被当成"内容已存在"直接返回成功 —— 坏内容就此永久固化（秒传永远不会重传它）。
+  // 尺寸不符时**不提前返回**，顺着往下走覆盖写：这既是修复也是自愈。
+  if (sizeMatches(hex, static_cast<std::int64_t>(data.size()))) return true;
 
   std::string dir = root_ + "/" + hex.substr(0, 2);
   std::error_code ec;
@@ -437,6 +483,13 @@ bool ContentStore::materializeFromChunks(const std::vector<std::string>& chunkHa
       return false;
     }
   }
+  // 落盘屏障：ofstream 析构已关闭文件，这里对临时文件 fsync（内容先落盘），
+  // 再 rename，最后 fsync 父目录（目录项也落盘）。
+  if (!durable::flushFile(tmp, err)) {
+    std::error_code rec;
+    fs::remove(tmp, rec);
+    return false;
+  }
   std::error_code ec;
   fs::remove(targetAbs, ec);
   fs::rename(tmp, targetAbs, ec);
@@ -446,16 +499,20 @@ bool ContentStore::materializeFromChunks(const std::vector<std::string>& chunkHa
     err = "rename failed: " + ec.message();
     return false;
   }
+  std::string dirErr;
+  (void)durable::flushDirOf(targetAbs, dirErr);
   return true;
 }
 
 bool ContentStore::putFromFile(const std::string& hex, const std::string& srcPath,
-                               std::string& err) {
+                               std::int64_t plainSize, std::string& err) {
   if (!validHash(hex)) {
     err = "invalid hash";
     return false;
   }
-  if (exists(hex)) {
+  // 去重判定必须带尺寸 —— 理由同 put()：只判 exists() 会把断电留下的
+  // 0 字节/截断 blob 当成"已存在"，源文件随即被调用方清理，坏内容永久固化。
+  if (sizeMatches(hex, plainSize)) {
     return true;   // 内容已去重命中：源文件由调用方清理
   }
   std::error_code ec;
@@ -480,10 +537,18 @@ bool ContentStore::putFromFile(const std::string& hex, const std::string& srcPat
   }
 #endif
 
-  // 同盘 rename = 零拷贝搬移（tmp → blobs），避免 tmp 与 blob 双份占盘
+  // 同盘 rename = 零拷贝搬移（tmp → blobs），避免 tmp 与 blob 双份占盘。
+  //
+  // 🔴 这里是全仓最隐蔽的一条断电风险：`rename` **只改名字，零字节写入、零 fsync**。
+  //    分块的数据是早先写 `.part` 时进的页缓存，rename 不会替你刷下去。而调用方紧接着就要
+  //    提交引用它的 DB 事务（synchronous=FULL，真的落盘）—— 于是"元数据说内容在，
+  //    blob 数据块却从未落盘"。所以搬移之后必须显式 flushFile。
   ec.clear();
   fs::rename(fs::path(srcPath), dst, ec);
   if (!ec) {
+    if (!durable::flushFile(dst.string(), err)) return false;
+    std::string dirErr;
+    (void)durable::flushDirOf(dst.string(), dirErr);  // 目录项：尽力而为
     return true;
   }
   // 跨设备等场景：复制后删源
@@ -493,6 +558,10 @@ bool ContentStore::putFromFile(const std::string& hex, const std::string& srcPat
     err = "move/copy failed: " + cec.message();
     return false;
   }
+  // 复制路径同样要落盘屏障（copy_file 也是写脏页，不保证持久）
+  if (!durable::flushFile(dst.string(), err)) return false;
+  std::string dirErr;
+  (void)durable::flushDirOf(dst.string(), dirErr);
   fs::remove(fs::path(srcPath), cec);
   return true;
 }

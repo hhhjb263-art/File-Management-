@@ -10,6 +10,10 @@ class Backend;
 class TransferManager;
 class FileListModel;
 class TransferModel;
+class TagModel;
+class VersionModel;
+class SyncPairModel;
+class LocalIndex;
 class AppController;
 class AuthController;
 class FileController;
@@ -17,6 +21,9 @@ class SyncController;
 class TransferController;
 class ShareController;
 class StatsController;
+class TrashController;
+class TagController;
+class VersionController;
 }
 
 // 应用装配（依赖注入的唯一位置）：
@@ -49,6 +56,11 @@ private:
     cv::TransferManager  *m_transfer = nullptr;
     cv::FileListModel    *m_fileModel = nullptr;
     cv::TransferModel    *m_transferModel = nullptr;
+    cv::TagModel         *m_tagModel = nullptr;
+    cv::VersionModel     *m_versionModel = nullptr;
+    cv::FileListModel    *m_trashModel = nullptr;  // 回收站专用（独立于文件页模型）
+    cv::SyncPairModel    *m_syncPairs = nullptr;   // 同步对列表（同步页专用）
+    cv::LocalIndex       *m_syncIndex = nullptr;   // 同步索引（SQLite，记上次两端一致状态）
     cv::AppController    *m_app = nullptr;
     cv::AuthController   *m_auth = nullptr;
     cv::FileController   *m_files = nullptr;
@@ -56,4 +68,7 @@ private:
     cv::TransferController *m_transfers = nullptr;
     cv::ShareController  *m_shares = nullptr;
     cv::StatsController  *m_stats = nullptr;
+    cv::TrashController  *m_trash = nullptr;
+    cv::TagController    *m_tags = nullptr;
+    cv::VersionController *m_versions = nullptr;
 };

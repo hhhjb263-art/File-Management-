@@ -44,7 +44,8 @@ ApplicationWindow {
     readonly property int pageTags: 3
     readonly property int pageTrash: 4
     readonly property int pageVersions: 5
-    readonly property int pageSettings: 6
+    readonly property int pageSync: 6
+    readonly property int pageSettings: 7
 
     property int navIndex: pageFiles
 
@@ -73,21 +74,39 @@ ApplicationWindow {
     }
 
     // 主导航项（supported=false → 置灰 + tooltip；页面形状仍保留）
+    // icon 为矢量图标名（见 qml/theme/Icons.qml）—— 不再用 emoji：
+    // emoji 跨平台字形不一、无法跟随主题着色、16px 下糊成一团。
+    //
+    // 「标签 / 回收站 / 版本」三项已由服务端实现（回收站含目录进站与配额语义、
+    // 版本含覆盖自动留档与回滚前备份、标签含 NOCASE 去重与级联清理），故 supported 全为 true。
+    // 若将来某服务端版本不支持，对应页面内部仍有 UnsupportedPage 兜底，不会白屏。
     readonly property var navItems: [
-        { label: qsTr("文件"),   glyph: "🗂", supported: true },
-        { label: qsTr("传输"),   glyph: "⇅",  supported: true },
-        { label: qsTr("分享"),   glyph: "🔗", supported: true },
-        { label: qsTr("标签"),   glyph: "🏷", supported: false },
-        { label: qsTr("回收站"), glyph: "🗑", supported: false },
-        { label: qsTr("版本"),   glyph: "🕘", supported: false },
-        { label: qsTr("设置"),   glyph: "⚙",  supported: true }
+        { label: qsTr("文件"),   icon: "grid",     supported: true },
+        { label: qsTr("传输"),   icon: "transfer", supported: true },
+        { label: qsTr("分享"),   icon: "link",     supported: true },
+        { label: qsTr("标签"),   icon: "tag",      supported: true },
+        { label: qsTr("回收站"), icon: "trash",    supported: true },
+        { label: qsTr("版本"),   icon: "history",  supported: true },
+        { label: qsTr("同步"),   icon: "exchange", supported: true },
+        { label: qsTr("设置"),   icon: "settings", supported: true }
     ]
 
     readonly property var compactNav: [
-        { label: qsTr("文件"), glyph: "🗂", index: 0 },
-        { label: qsTr("传输"), glyph: "⇅",  index: 1 },
-        { label: qsTr("设置"), glyph: "⚙",  index: 6 }
+        { label: qsTr("文件"), icon: "grid",     index: 0 },
+        { label: qsTr("传输"), icon: "transfer", index: 1 },
+        { label: qsTr("设置"), icon: "settings", index: 6 }
     ]
+
+    // ---- 主题：把 C++ 解析好的最终结果灌进 Theme 单例 ----
+    // 单一数据源是 AppTheme（C++）：它同时驱动 Qt 内建控件的 ColorScheme/QPalette；
+    // 这里只把「是否深色」同步给 Theme.qml，让自绘控件与内建控件永远同色。
+    // typeof 守卫：AppTheme 未注入时退化为浅色，不报错。
+    Binding {
+        target: Theme
+        property: "darkMode"
+        value: (typeof AppTheme !== "undefined" && AppTheme.isDark !== undefined)
+               ? AppTheme.isDark : false
+    }
 
     // ==================================================================
     //  header
@@ -112,10 +131,20 @@ ApplicationWindow {
             anchors.rightMargin: Theme.spaceM
             spacing: Theme.spaceS
 
-            Text {
-                text: "☁"
-                font.pointSize: 20
+            // 应用标记：强调色圆角方块 + 云图标（替代原来裸放一个 emoji）
+            Rectangle {
+                Layout.alignment: Qt.AlignVCenter
+                implicitWidth: 26
+                implicitHeight: 26
+                radius: 7
                 color: Theme.primary
+
+                CvIcon {
+                    anchors.centerIn: parent
+                    name: "cloud"
+                    size: Theme.iconSize
+                    color: Theme.textOnPrimary
+                }
             }
             Label {
                 visible: !window.compact
@@ -129,7 +158,7 @@ ApplicationWindow {
 
             GhostButton {
                 visible: !window.compact
-                glyph: "⇄"
+                iconName: "exchange"
                 text: qsTr("健康检查")
                 enabled: !App.busy
                 onClicked: App.healthCheck()
@@ -138,7 +167,7 @@ ApplicationWindow {
             // 「传输队列」抽屉开关：宽屏与紧凑**共用同一个抽屉**，默认隐藏；
             // 带进行中数量徽标（activeCount>0 时显示计数）。
             GhostButton {
-                glyph: "⇅"
+                iconName: "transfer"
                 text: Transfers.activeCount > 0
                       ? qsTr("传输队列 %1").arg(Transfers.activeCount)
                       : qsTr("传输队列")
@@ -146,26 +175,31 @@ ApplicationWindow {
                                                   : transfersDrawer.open()
             }
 
-            ToolButton {
+            GhostButton {
                 id: loginBtn
                 visible: !Auth.loggedIn
-                text: "🔑 " + qsTr("登录 / 注册")
-                font.pointSize: Theme.fontBody
-                onClicked: window.loginForced = true
+                iconName: "key"
+                text: qsTr("登录 / 注册")
+                onClicked: {
+                    // 用户主动要求登录：解除「已跳过」状态并强制打开登录页
+                    // （否则登录页会被 loginSkipped 一直挡住，点按钮毫无反应）。
+                    if (typeof Auth.resumeLogin === "function")
+                        Auth.resumeLogin()
+                    window.loginForced = true
+                }
             }
 
-            ToolButton {
+            GhostButton {
                 id: accountBtn
                 visible: Auth.loggedIn && !Auth.legacyMode
-                text: "👤 " + (Auth.displayName.length > 0 ? Auth.displayName : Auth.userName)
-                font.pointSize: Theme.fontBody
+                iconName: "user"
+                text: Auth.displayName.length > 0 ? Auth.displayName : Auth.userName
                 onClicked: accountMenu.open()
             }
 
-            ToolButton {
+            GhostButton {
                 id: overflowBtn
-                text: "⋮"
-                font.pointSize: 18
+                iconName: "more"
                 onClicked: overflowMenu.open()
             }
         }
@@ -176,7 +210,7 @@ ApplicationWindow {
     // ==================================================================
     footer: ToolBar {
         id: footerBar
-        implicitHeight: window.compact ? 58 : 34
+        implicitHeight: window.compact ? 56 : Theme.statusBarHeight
 
         background: Rectangle {
             color: Theme.card
@@ -189,6 +223,8 @@ ApplicationWindow {
         }
 
         // ---- 状态条（非 compact）----
+        // 现代做法：状态条只放"被动信息"，字号比正文更小、颜色更淡 ——
+        // 它的职责是随时可查，而不是抢注意力。
         RowLayout {
             anchors.fill: parent
             anchors.leftMargin: Theme.spaceM
@@ -199,22 +235,38 @@ ApplicationWindow {
             Label {
                 Layout.fillWidth: true
                 text: App.statusText
-                color: App.statusText.indexOf("✗") === 0 ? Theme.danger : Theme.textPrimary
-                font.pointSize: Theme.fontSecondary
+                color: App.statusText.indexOf("✗") === 0 ? Theme.danger : Theme.textSecondary
+                font.pointSize: Theme.fontMicro
                 elide: Text.ElideRight
             }
-            Label {
-                text: Stats.freeText.length > 0 ? qsTr("空间 %1").arg(Stats.freeText) : ""
-                color: Theme.textSecondary
-                font.pointSize: Theme.fontSecondary
+
+            // 空间用量：图标 + 数值（比纯文字更易扫读）
+            RowLayout {
+                spacing: Theme.spaceXs
+                visible: Stats.freeText.length > 0
+
+                CvIcon {
+                    Layout.alignment: Qt.AlignVCenter
+                    name: "drive"
+                    size: Theme.iconSizeSmall
+                    color: Theme.textTertiary
+                }
+                Label {
+                    text: qsTr("空间 %1").arg(Stats.freeText)
+                    color: Theme.textTertiary
+                    font.pointSize: Theme.fontMicro
+                }
             }
+
             Label {
+                visible: Transfers.statusText.length > 0
                 text: Transfers.statusText
-                color: Theme.textSecondary
-                font.pointSize: Theme.fontSecondary
+                color: Theme.textTertiary
+                font.pointSize: Theme.fontMicro
             }
+
             ProgressBar {
-                Layout.preferredWidth: 96
+                Layout.preferredWidth: 72
                 visible: Transfers.busy
                 indeterminate: true
             }
@@ -238,12 +290,12 @@ ApplicationWindow {
                     }
                     ColumnLayout {
                         anchors.centerIn: parent
-                        spacing: 0
-                        Text {
+                        spacing: 2
+                        CvIcon {
                             Layout.alignment: Qt.AlignHCenter
-                            text: modelData.glyph
-                            font.pointSize: 15
-                            color: window.navIndex === modelData.index ? Theme.primary : Theme.textPrimary
+                            name: modelData.icon
+                            size: Theme.iconSizeLarge
+                            color: window.navIndex === modelData.index ? Theme.primary : Theme.textSecondary
                         }
                         Label {
                             Layout.alignment: Qt.AlignHCenter
@@ -271,12 +323,12 @@ ApplicationWindow {
                 }
                 ColumnLayout {
                     anchors.centerIn: parent
-                    spacing: 0
-                    Text {
+                    spacing: 2
+                    CvIcon {
                         Layout.alignment: Qt.AlignHCenter
-                        text: "⋮"
-                        font.pointSize: 15
-                        color: Theme.textPrimary
+                        name: "more"
+                        size: Theme.iconSizeLarge
+                        color: Theme.textSecondary
                     }
                     Label {
                         Layout.alignment: Qt.AlignHCenter
@@ -339,13 +391,13 @@ ApplicationWindow {
                         ColumnLayout {
                             id: navCol
                             anchors.centerIn: parent
-                            spacing: 2
-                            Text {
+                            spacing: 3
+                            CvIcon {
                                 Layout.alignment: Qt.AlignHCenter
-                                text: modelData.glyph
-                                font.pointSize: 16
+                                name: modelData.icon
+                                size: Theme.iconSizeLarge
                                 color: modelData.supported
-                                       ? (window.navIndex === index ? Theme.primary : Theme.textPrimary)
+                                       ? (window.navIndex === index ? Theme.primary : Theme.textSecondary)
                                        : Theme.disabledText
                             }
                             Label {
@@ -395,9 +447,11 @@ ApplicationWindow {
                     anchors.rightMargin: Theme.spaceL
                     spacing: Theme.spaceS
 
-                    Text {
-                        text: window.toastOk ? "✅" : "⚠️"
-                        font.pointSize: Theme.fontBody
+                    CvIcon {
+                        Layout.alignment: Qt.AlignVCenter
+                        name: window.toastOk ? "check-circle" : "warning"
+                        size: Theme.iconSize
+                        color: window.toastOk ? Theme.success : Theme.danger
                     }
                     Label {
                         Layout.fillWidth: true
@@ -408,7 +462,7 @@ ApplicationWindow {
                     }
                     GhostButton {
                         visible: window.toastText.indexOf(qsTr("令牌无效")) >= 0
-                        glyph: "⚙"
+                        iconName: "settings"
                         text: qsTr("前往设置")
                         onClicked: {
                             window.navIndex = window.pageSettings
@@ -416,7 +470,7 @@ ApplicationWindow {
                         }
                     }
                     GhostButton {
-                        glyph: "✕"
+                        iconName: "close"
                         onClicked: window.toastVisible = false
                     }
                 }
@@ -430,12 +484,21 @@ ApplicationWindow {
                 FilesPage {
                     id: filesPage
                     onRequestSettings: window.navIndex = window.pageSettings
+                    // 「版本历史…」入口：把目标文件交给版本控制器并跳过去。
+                    // 为什么要走信号而不是 FilesPage 直接改 navIndex：
+                    // 页面不该知道主窗口的导航结构（StackLayout 索引是 Main 的私有约定）。
+                    onRequestVersions: (fileId, fileName) => {
+                        if (typeof Versions !== "undefined" && Versions.open !== undefined)
+                            Versions.open(String(fileId), String(fileName))
+                        window.navIndex = window.pageVersions
+                    }
                 }
                 TransfersPage { id: transfersPage }
                 SharesPage { id: sharesPage }
                 TagsPage { id: tagsPage }
                 TrashPage { id: trashPage }
                 VersionsPage { id: versionsPage }
+                SyncPage { id: syncPage }
                 SettingsPage { id: settingsPage }
             }
         }
@@ -481,30 +544,31 @@ ApplicationWindow {
     // ==================================================================
     //  菜单
     // ==================================================================
-    // 顶部溢出菜单：分组（诊断 / 安全 / 关于）+ 图标
+    // 顶部溢出菜单：分组（诊断 / 安全 / 关于）
+    // 菜单项一律纯文字：菜单里的 emoji 前缀会破坏行高与对齐，且无法跟随主题着色。
     Menu {
         id: overflowMenu
         width: 220
         // ---- 诊断 ----
-        MenuItem { text: "⇄  " + qsTr("健康检查"); onTriggered: App.healthCheck() }
-        MenuItem { text: "⟳  " + qsTr("刷新文件列表"); onTriggered: filesPage.refreshNow() }
-        MenuItem { text: "💽  " + qsTr("刷新存储空间"); onTriggered: Stats.refresh() }
+        MenuItem { text: qsTr("健康检查"); onTriggered: App.healthCheck() }
+        MenuItem { text: qsTr("刷新文件列表"); onTriggered: filesPage.refreshNow() }
+        MenuItem { text: qsTr("刷新存储空间"); onTriggered: Stats.refresh() }
         MenuSeparator { }
         // ---- 安全 ----
         MenuItem {
-            text: "🔒  " + qsTr("证书与信任…")
+            text: qsTr("证书与信任…")
             onTriggered: window.navIndex = window.pageSettings
         }
         MenuSeparator { }
         // ---- 账户 ----
         MenuItem {
-            text: "🚪  " + qsTr("退出登录")
+            text: qsTr("退出登录")
             visible: Auth.loggedIn && !Auth.legacyMode
             onTriggered: Auth.logout()
         }
         MenuSeparator { }
         // ---- 关于 ----
-        MenuItem { text: "ℹ  " + qsTr("关于云匣"); onTriggered: aboutDialog.open() }
+        MenuItem { text: qsTr("关于云匣"); onTriggered: aboutDialog.open() }
     }
 
     // 账户菜单：当前用户 + 退出登录
@@ -517,7 +581,7 @@ ApplicationWindow {
         }
         MenuSeparator { }
         MenuItem {
-            text: "🚪  " + qsTr("退出登录")
+            text: qsTr("退出登录")
             onTriggered: Auth.logout()
         }
     }
@@ -525,13 +589,13 @@ ApplicationWindow {
     Menu {
         id: compactMoreMenu
         width: 220
-        MenuItem { text: "🔗  " + qsTr("分享"); onTriggered: window.navIndex = window.pageShares }
-        MenuItem { text: "🏷  " + qsTr("标签（暂不支持）"); enabled: false }
-        MenuItem { text: "🗑  " + qsTr("回收站（暂不支持）"); enabled: false }
-        MenuItem { text: "🕘  " + qsTr("版本（暂不支持）"); enabled: false }
+        MenuItem { text: qsTr("分享"); onTriggered: window.navIndex = window.pageShares }
+        MenuItem { text: qsTr("标签（暂不支持）"); enabled: false }
+        MenuItem { text: qsTr("回收站（暂不支持）"); enabled: false }
+        MenuItem { text: qsTr("版本（暂不支持）"); enabled: false }
         MenuSeparator { }
-        MenuItem { text: "⚙  " + qsTr("连接设置"); onTriggered: window.navIndex = window.pageSettings }
-        MenuItem { text: "ℹ  " + qsTr("关于云匣"); onTriggered: aboutDialog.open() }
+        MenuItem { text: qsTr("连接设置"); onTriggered: window.navIndex = window.pageSettings }
+        MenuItem { text: qsTr("关于云匣"); onTriggered: aboutDialog.open() }
     }
 
     // ==================================================================
@@ -574,7 +638,13 @@ ApplicationWindow {
         id: loginPage
         anchors.fill: parent
         forced: window.loginForced
-        onClosed: window.loginForced = false
+        // 关闭登录页 = 用户选择「暂不登录」：记下这个决定（持久化），继续用访问令牌直连。
+        // 登录页的 visible 依赖 Auth.loginSkipped，故本动作会让它自己消失。
+        onClosed: {
+            window.loginForced = false
+            if (typeof Auth.skipLogin === "function")
+                Auth.skipLogin()
+        }
         // 登录成功后自动收起强制态（visible 本身也要求 !loggedIn）
         Connections {
             target: Auth
@@ -676,16 +746,29 @@ ApplicationWindow {
         // 自检钩子：CV_START_PAGE 指定初始页（未设置时保持默认页，无副作用）
         if (typeof CvStartPage !== "undefined" && String(CvStartPage).length > 0) {
             const map = { "files": 0, "transfers": 1, "shares": 2, "tags": 3,
-                          "trash": 4, "versions": 5, "settings": 6 }
+                          "trash": 4, "versions": 5, "sync": 6, "settings": 7 }
             const v = map[String(CvStartPage).toLowerCase()]
             if (v !== undefined)
                 window.navIndex = v
         }
+        // 自检钩子：CV_START_FILE="<文件id>[|<显示名>]" + 当前在版本页 → 直接打开该文件的
+        // 版本历史。版本页的目标平时来自文件页右键菜单，无头环境点不了 —— 没有这个钩子，
+        // 版本列表的渲染就只能验到空态。
+        if (typeof CvStartFile !== "undefined" && String(CvStartFile).length > 0
+                && window.navIndex === window.pageVersions
+                && typeof Versions !== "undefined" && Versions.open !== undefined) {
+            const raw = String(CvStartFile)
+            const bar = raw.indexOf("|")
+            const fid = bar >= 0 ? raw.substring(0, bar) : raw
+            const fname = bar >= 0 ? raw.substring(bar + 1) : raw
+            Versions.open(fid, fname)
+        }
         // 启动判定：探测服务端是否具备账号体系（同步、本地回环通常立即返回）。
-        // 仅在「已登录」或「legacy 模式（无账号体系）」时才主动拉文件列表；
-        // 需要登录时不拉（无有效令牌，避免 401 风暴）。
+        // 仅在「已登录」/「legacy 模式（无账号体系）」/「用户已主动跳过登录」时才主动拉
+        // 文件列表；需要登录且用户未跳过时不拉（无有效令牌，避免 401 风暴）。
         Auth.startupCheck()
-        if (Auth.loggedIn || Auth.legacyMode) {
+        if (Auth.loggedIn || Auth.legacyMode
+                || (typeof Auth.loginSkipped !== "undefined" && Auth.loginSkipped)) {
             Files.refresh()
             Stats.refresh()
         }

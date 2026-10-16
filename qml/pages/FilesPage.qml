@@ -28,6 +28,10 @@ Item {
     property string ctxId: ""
     property string ctxName: ""
     property bool ctxIsDir: false
+    // 右键目标**所在**的目录（相对路径）。用来拼出文件夹自身的完整路径：
+    // 不用 page.dirPathOf(ctxId) —— 那是靠 substring(4) 剥 HttpBackend 的 id 前缀，
+    // 对 MockBackend 的内部 id 会得到垃圾。path 才是两个数据源共有的稳定标识。
+    property string ctxDir: ""
 
     // 排序状态（与模型内排序保持一致）
     property int sortKey: 2
@@ -41,6 +45,10 @@ Item {
 
     // 请求跳转到设置页（错误态「检查令牌」引导）
     signal requestSettings()
+
+    // 请求打开指定文件的版本历史（Main.qml 负责把目标交给 Versions 控制器并切页）。
+    // 页面不直接改 navIndex：StackLayout 的页索引是 Main 的私有约定，页面不该知道。
+    signal requestVersions(string fileId, string fileName)
 
     // 请求主窗口弹出通知：复用 Main.qml 唯一的 window.showToast，不新造第二套 toast。
     signal notify(string message, bool ok)
@@ -119,7 +127,6 @@ Item {
     readonly property bool narrow: width < 560
     readonly property int colSizeWidth: 96
     readonly property int colTimeWidth: 170
-    readonly property int colStatusWidth: 76
 
     // ------------------------------------------------------------------
     //  工具函数
@@ -363,13 +370,25 @@ Item {
                 model: page.crumbs
                 delegate: RowLayout {
                     spacing: Theme.spaceXs
-                    GhostButton {
+                    readonly property bool isCurrent: index === (page.crumbs.length - 1)
+
+                    // 当前所在层**不再渲染成按钮**：以前用 enabled:false 的 GhostButton，
+                    // 但禁用态的观感几乎与可点状态一样 ⇒ 用户点了"根目录"却看不出自己已经在根目录。
+                    // 改成明显的"当前位置"标签（主色 + 加粗），一眼就知道自己在哪。
+                    Label {
+                        visible: parent.isCurrent
                         text: modelData.label
-                        enabled: index !== (page.crumbs.length - 1)
+                        color: Theme.primary
+                        font.pointSize: Theme.fontBody
+                        font.bold: true
+                    }
+                    GhostButton {
+                        visible: !parent.isCurrent
+                        text: modelData.label
                         onClicked: Files.enterDir(modelData.path)
                     }
                     Label {
-                        visible: index !== (page.crumbs.length - 1)
+                        visible: !parent.isCurrent
                         text: "/"
                         color: Theme.textSecondary
                         font.pointSize: Theme.fontSecondary
@@ -394,56 +413,94 @@ Item {
                 anchors.fill: parent
                 spacing: 0
 
-                // 表头
+                // 表头：比数据行略矮 + 更小更淡的字 + **可点击排序**。
+                // 现代表格的层次感来自「表头退后、数据前置」，而排序入口必须在表头上 ——
+                // 藏进右键菜单是十年前的做法。
                 Rectangle {
                     Layout.fillWidth: true
-                    implicitHeight: Theme.rowHeight
-                    color: Theme.hover
+                    implicitHeight: Theme.tableHeaderHeight
+                    color: Theme.tableHeader
+
+                    Rectangle {
+                        anchors.bottom: parent.bottom
+                        width: parent.width
+                        height: 1
+                        color: Theme.border
+                    }
+
                     RowLayout {
                         anchors.fill: parent
                         anchors.leftMargin: Theme.spaceM
                         anchors.rightMargin: Theme.spaceM
                         spacing: Theme.spaceS
 
-                        Label {
-                            Layout.fillWidth: true
-                            text: qsTr("名称")
-                            color: Theme.textSecondary
-                            font.pointSize: Theme.fontSecondary
-                            font.bold: true
-                        }
-                        Label {
-                            Layout.preferredWidth: page.colSizeWidth
-                            horizontalAlignment: Text.AlignRight
-                            text: qsTr("大小")
-                            color: Theme.textSecondary
-                            font.pointSize: Theme.fontSecondary
-                            font.bold: true
-                        }
-                        Label {
-                            visible: !page.narrow
-                            Layout.preferredWidth: page.colTimeWidth
-                            horizontalAlignment: Text.AlignRight
-                            text: qsTr("修改时间")
-                            color: Theme.textSecondary
-                            font.pointSize: Theme.fontSecondary
-                            font.bold: true
-                        }
-                        Label {
-                            Layout.preferredWidth: page.colStatusWidth
-                            horizontalAlignment: Text.AlignHCenter
-                            text: qsTr("状态")
-                            color: Theme.textSecondary
-                            font.pointSize: Theme.fontSecondary
-                            font.bold: true
+                        Repeater {
+                            // width < 0 表示"占满剩余宽度"（名称列）
+                            model: [
+                                { label: qsTr("名称"),     key: 0, width: -1,
+                                  right: false, shown: true },
+                                { label: qsTr("大小"),     key: 1, width: page.colSizeWidth,
+                                  right: true,  shown: true },
+                                { label: qsTr("修改时间"), key: 2, width: page.colTimeWidth,
+                                  right: true,  shown: !page.narrow }
+                            ]
+
+                            delegate: Item {
+                                id: headCell
+
+                                readonly property var cell: modelData
+                                readonly property bool active: page.sortKey === cell.key
+
+                                Layout.fillWidth: cell.width < 0
+                                Layout.preferredWidth: cell.width < 0 ? 0 : cell.width
+                                Layout.fillHeight: true
+                                visible: cell.shown
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    color: headMouse.containsMouse ? Theme.hover : "transparent"
+                                    Behavior on color { ColorAnimation { duration: Theme.animFast } }
+                                }
+
+                                // 表头内容对齐：显式按 x 定位（width = 内容宽），
+                                // 不依赖 spacer 的 fillWidth 语义 —— 右对齐列必须与数据列严格对齐。
+                                RowLayout {
+                                    id: cellRow
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: implicitWidth
+                                    x: headCell.cell.right ? parent.width - width : 0
+                                    spacing: Theme.spaceXs
+
+                                    Label {
+                                        text: headCell.cell.label
+                                        color: headCell.active ? Theme.textSecondary : Theme.textTertiary
+                                        font.pointSize: Theme.fontMicro
+                                        font.bold: headCell.active
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+
+                                    // 排序方向指示（仅当前排序列显示）
+                                    CvIcon {
+                                        visible: headCell.active
+                                        name: page.sortAsc ? "chevron-up" : "chevron-down"
+                                        size: Theme.iconSizeSmall
+                                        color: Theme.textSecondary
+                                        Layout.alignment: Qt.AlignVCenter
+                                    }
+                                }
+
+                                MouseArea {
+                                    id: headMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    // 点同一列 → 切换升降序；点别的列 → 换列并默认升序
+                                    onClicked: page.applySort(headCell.cell.key,
+                                                              headCell.active ? !page.sortAsc : true)
+                                }
+                            }
                         }
                     }
-                }
-
-                Rectangle {
-                    Layout.fillWidth: true
-                    implicitHeight: 1
-                    color: Theme.border
                 }
 
                 // 列表
@@ -467,6 +524,16 @@ Item {
                         color: isSelected ? Theme.selected
                              : (rowMouse.containsMouse ? Theme.hover : "transparent")
 
+                        // 行分隔细线：现代表格的"结构感"来自 1px 极淡的分隔线，
+                        // 而不是斑马纹或粗边框。悬停/选中行不画线（避免和背景色打架）。
+                        Rectangle {
+                            anchors.bottom: parent.bottom
+                            width: parent.width
+                            height: 1
+                            color: Theme.divider
+                            visible: !rowDelegate.isSelected && !rowMouse.containsMouse
+                        }
+
                         MouseArea {
                             id: rowMouse
                             anchors.fill: parent
@@ -481,6 +548,7 @@ Item {
                                     page.ctxId = model.fid
                                     page.ctxName = model.name
                                     page.ctxIsDir = rowDelegate.isDir
+                                    page.ctxDir = model.dir
                                     const p = rowMouse.mapToItem(page, mouse.x, mouse.y)
                                     ctxMenu.popup(page, p.x, p.y)
                                 }
@@ -494,10 +562,11 @@ Item {
                             anchors.rightMargin: Theme.spaceM
                             spacing: Theme.spaceS
 
-                            Text {
-                                text: rowDelegate.isDir ? "📁" : "📄"
-                                font.pointSize: Theme.fontBody
-                                color: Theme.textSecondary
+                            CvIcon {
+                                Layout.alignment: Qt.AlignVCenter
+                                name: rowDelegate.isDir ? "folder" : "file"
+                                size: Theme.iconSize
+                                color: Theme.textTertiary
                             }
 
                             Label {
@@ -525,24 +594,6 @@ Item {
                                 color: Theme.textSecondary
                                 font.pointSize: Theme.fontSecondary
                                 elide: Text.ElideRight
-                            }
-
-                            Item {
-                                Layout.preferredWidth: page.colStatusWidth
-                                implicitHeight: Theme.rowHeight
-                                StatusBadge {
-                                    anchors.centerIn: parent
-                                    visible: model.status === "是"
-                                    tone: "success"
-                                    text: qsTr("秒传")
-                                }
-                                Label {
-                                    anchors.centerIn: parent
-                                    visible: model.status !== "是"
-                                    text: "-"
-                                    color: Theme.textSecondary
-                                    font.pointSize: Theme.fontSecondary
-                                }
                             }
                         }
                     }
@@ -636,8 +687,8 @@ Item {
     Menu {
         id: newMenu
         width: 180
-        MenuItem { text: "📄  " + qsTr("新建文件"); onTriggered: newFileDialog.openFor("file") }
-        MenuItem { text: "📁  " + qsTr("新建文件夹"); onTriggered: newFileDialog.openFor("folder") }
+        MenuItem { text: qsTr("新建文件"); onTriggered: newFileDialog.openFor("file") }
+        MenuItem { text: qsTr("新建文件夹"); onTriggered: newFileDialog.openFor("folder") }
     }
 
     /*!
@@ -661,7 +712,7 @@ Item {
         // ---- 组1 操作 ----
         MenuItem {
             id: miOpen
-            text: "📂  " + (page.ctxIsDir ? qsTr("打开文件夹") : qsTr("打开下载目录"))
+            text: (page.ctxIsDir ? qsTr("打开文件夹") : qsTr("打开下载目录"))
             onTriggered: {
                 if (page.ctxIsDir)
                     Files.enterDir(page.dirPathOf(page.ctxId))
@@ -670,13 +721,13 @@ Item {
             }
         }
         MenuItem {
-            text: "⬇  " + qsTr("下载")
+            text: qsTr("下载")
             enabled: !page.ctxIsDir
             onTriggered: Transfers.download([page.ctxId], "")
         }
         MenuItem {
             // 新建分享的唯一入口（分享页只管理已有分享）
-            text: "🔗  " + qsTr("分享…")
+            text: qsTr("分享…")
             // 仅当「恰好选中 1 项」时可用：0 个 / 多选 → 禁用
             enabled: page.selectedIds.length === 1
             onTriggered: {
@@ -684,19 +735,52 @@ Item {
                 shareDialog.openFor(id, page.nameForId(id))
             }
         }
+        MenuItem {
+            // 给单个文件打标签。用右键目标（ctxId）而非 selectedIds：
+            // 右键不会改变选中集，若用 selectedIds，"右键未选中的行"就会打错目标。
+            text: qsTr("标签…")
+            enabled: page.ctxId.length > 0 && !page.ctxIsDir
+            onTriggered: tagAssignDialog.openFor(page.ctxId, page.ctxName)
+        }
+        MenuItem {
+            // 查看单个文件的历史版本。目录没有版本概念 → 禁用
+            text: qsTr("版本历史…")
+            enabled: page.ctxId.length > 0 && !page.ctxIsDir
+            onTriggered: page.requestVersions(page.ctxId, page.ctxName)
+        }
 
         MenuSeparator { }
 
         // ---- 组2 修改 ----
         MenuItem {
-            text: "✏  " + qsTr("重命名")
-            enabled: !page.ctxIsDir
-            onTriggered: renameDialog.openFor(page.ctxId, page.ctxName)
+            text: page.ctxIsDir ? qsTr("重命名文件夹") : qsTr("重命名")
+            enabled: page.ctxId.length > 0
+            onTriggered: {
+                if (page.ctxIsDir) {
+                    // 文件夹传**路径**（目录在两个数据源里的 id 口径不同，path 才是共同标识）
+                    const p = page.ctxDir.length > 0
+                              ? page.ctxDir + "/" + page.ctxName
+                              : page.ctxName
+                    folderRenameDialog.openFor(p, page.ctxName)
+                } else {
+                    renameDialog.openFor(page.ctxId, page.ctxName)
+                }
+            }
+        }
+        MenuItem {
+            // 移动到另一个文件夹（目录树 CRUD）。文件夹也支持 —— 整棵子树跟着走。
+            text: qsTr("移动到…")
+            enabled: page.ctxId.length > 0
+            onTriggered: moveToDialog.openFor(page.ctxId, page.ctxName)
         }
         MenuItem {
             id: miDelete
-            text: "🗑  " + qsTr("删除")
-            enabled: !page.ctxIsDir
+            // ⚠️ 语义已变更：这里不再是永久删除，而是**移入回收站**（可恢复）。
+            //    真正的永久删除收敛到回收站页的「彻底删除」，入口唯一且带二次确认。
+            //    目录也可删除：服务端支持整个目录进站，其下文件一并标记，
+            //    回收站里看到的是那个文件夹，而不是散开的 N 个文件。
+            text: qsTr("移入回收站")
+            enabled: page.ctxId.length > 0
             onTriggered: deleteDialog.openFor(page.ctxId, page.ctxName)
             contentItem: Text {
                 text: miDelete.text
@@ -710,15 +794,15 @@ Item {
         MenuSeparator { }
 
         // ---- 组3 新建 ----
-        MenuItem { text: "📄  " + qsTr("新建文件"); onTriggered: newFileDialog.openFor("file") }
-        MenuItem { text: "📁  " + qsTr("新建文件夹"); onTriggered: newFileDialog.openFor("folder") }
-        MenuItem { text: "⬆  " + qsTr("上传到此目录"); onTriggered: Files.uploadHere() }
+        MenuItem { text: qsTr("新建文件"); onTriggered: newFileDialog.openFor("file") }
+        MenuItem { text: qsTr("新建文件夹"); onTriggered: newFileDialog.openFor("folder") }
+        MenuItem { text: qsTr("上传到此目录"); onTriggered: Files.uploadHere() }
 
         MenuSeparator { }
 
         // ---- 组4 排序（子菜单，单选）----
         Menu {
-            title: "↕  " + qsTr("排序")
+            title: qsTr("排序")
             MenuItem {
                 text: qsTr("名称")
                 checkable: true
@@ -766,14 +850,46 @@ Item {
         }
     }
 
+    // 标签变更后自动刷新文件列表（否则打了标签要手动刷新才看得到）
+    Connections {
+        target: (typeof Tags !== "undefined") ? Tags : null
+        function onFileTagsAssigned(fileId) { page.refreshNow() }
+    }
+
     RenameDialog {
         id: renameDialog
         onSubmit: (id, name) => Files.rename(id, name)
     }
 
+    // 文件夹重命名：复用同一个 RenameDialog（只换文案），避免复制一份对话框出来。
+    // 注意这里 submit 的第 1 个参数是**文件夹路径**而不是 id —— 上面的 openFor 传的就是路径。
+    RenameDialog {
+        id: folderRenameDialog
+        dialogTitle: qsTr("重命名文件夹")
+        hintText: qsTr("输入新的文件夹名称（不能包含 '/' 或 '\\'）")
+        okText: qsTr("重命名")
+        onSubmit: (dirPath, name) => Files.renameFolder(dirPath, name)
+    }
+
+    MoveToDialog {
+        id: moveToDialog
+        onSubmit: (id, targetId) => Files.moveTo(id, targetId)
+    }
+
+    /*!
+        删除确认框：语义 = **移入回收站**（软删除，可恢复），因此用默认语气（非 danger 红）。
+        文案由对话框自身提供（含"不再计入已用空间、但磁盘尚未释放"这句），这里不再重复。
+        ⚠️ 不要再改成调用 Files.purge / Backend::purge —— 那是不可恢复的彻底删除，
+           入口只保留在回收站页（唯一且带二次确认）。
+    */
     DeleteConfirmDialog {
         id: deleteDialog
         onConfirmed: (id) => Files.remove(id)
+    }
+
+    // 标签关联（右键「标签…」入口）：针对单个文件的标签全量提交
+    TagAssignDialog {
+        id: tagAssignDialog
     }
 
     // 新建分享（右键「分享…」入口）

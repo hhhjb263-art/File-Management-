@@ -46,6 +46,46 @@ public:
     virtual Result<FileItem>          createFolder(const QString &parentId, const QString &name) = 0;
     virtual Result<FileItem>          ensureFolderPath(const QString &remotePath) = 0;
     virtual Ok                        rename(const QString &id, const QString &newName) = 0;
+
+    // ---------------- 目录树：移动 / 重命名（加法式，默认不支持）----------------
+    // 为什么是加法式：抽象接口早已冻结，直接加纯虚会让既有实现（含测试替身）全部无法编译。
+    // 两个真实数据源都已实现，默认实现只为"不破坏既有实现"而存在。
+    //
+    // 把文件移到另一个目录。newParentId 与 createFolder 的 parentId 是同一套 id 体系
+    // （根目录用 kRootId / kRootPath）。
+    virtual Ok moveFile(const QString &id, const QString &newParentId)
+    {
+        (void)id;
+        (void)newParentId;
+        return err(QStringLiteral("[unsupported] 该数据源不支持移动文件"));
+    }
+    // 目录重命名 / 移动：from 与 to 都是相对路径，to 为完整目标路径。
+    // 同一份实现兼作"重命名"（同父换名）与"移动"（换父）。
+    virtual Ok moveDir(const QString &from, const QString &to)
+    {
+        (void)from;
+        (void)to;
+        return err(QStringLiteral("[unsupported] 该数据源不支持移动目录"));
+    }
+    // 目录重命名（同父换名）。默认实现**复用 moveDir** —— 实现方只需提供 moveDir，
+    // 免得两个后端各写一遍"怎么把新名字拼成完整路径"这段容易写歪的逻辑。
+    virtual Ok renameDir(const QString &dirPath, const QString &newName)
+    {
+        QString name = newName.trimmed();
+        while (name.startsWith(QLatin1Char('/')))
+            name.remove(0, 1);
+        while (name.endsWith(QLatin1Char('/')))
+            name.chop(1);
+        if (name.isEmpty())
+            return err(QStringLiteral("目录名不能为空"));
+        if (name.contains(QLatin1Char('/')))
+            return err(QStringLiteral("目录名不能包含 “/”"));
+
+        const int slash = dirPath.lastIndexOf(QLatin1Char('/'));
+        const QString parent = slash < 0 ? QString() : dirPath.left(slash);
+        const QString to = parent.isEmpty() ? name : (parent + QLatin1Char('/') + name);
+        return moveDir(dirPath, to);
+    }
     virtual Ok                        moveToTrash(const QString &id) = 0;
     virtual Ok                        restore(const QString &id) = 0;
     virtual Ok                        purge(const QString &id) = 0;
@@ -76,6 +116,22 @@ public:
     virtual Ok                           restoreVersion(const QString &fileId,
                                                         const QString &versionId) = 0;
 
+    // 附加能力（加法式，带默认实现）：手动把当前内容存成一个历史版本。
+    // 默认返回 unsupported —— 既有数据源无需改动即可继续编译。
+    virtual Ok snapshotVersion(const QString &fileId, const QString &note)
+    {
+        (void)fileId;
+        (void)note;
+        return Ok::fail(QStringLiteral("[unsupported] 该数据源不支持手动创建版本快照"));
+    }
+    // 附加能力（加法式）：删除某个历史版本。默认不支持。
+    virtual Ok deleteVersion(const QString &fileId, const QString &versionId)
+    {
+        (void)fileId;
+        (void)versionId;
+        return Ok::fail(QStringLiteral("[unsupported] 该数据源不支持删除历史版本"));
+    }
+
     // ---------------- 分享 ----------------
     virtual Result<QVector<ShareLink>> shares() = 0;
     virtual Result<ShareLink>          createShare(const QString &fileId, const QString &code,
@@ -98,6 +154,15 @@ public:
     // typeFilter: -1 全部，其余见 FileType
     virtual Result<QVector<FileItem>> search(const QString &keyword, const QStringList &tagIds,
                                              int typeFilter) = 0;
+
+    // 附加能力（加法式）：某文件当前关联的标签。
+    // 默认返回 unsupported —— 抽象接口原本没有这项查询（既有实现无从得知关联关系）。
+    virtual Result<QVector<Tag>> tagsOfFile(const QString &fileId)
+    {
+        (void)fileId;
+        return Result<QVector<Tag>>::fail(
+            QStringLiteral("[unsupported] 该数据源不支持单文件标签查询"));
+    }
 
     // ---------------- 统计 ----------------
     virtual Result<UsageStats> usage() = 0;

@@ -47,6 +47,15 @@ struct Response {
   // 附加响应头（如 Accept-Ranges / Content-Range），键已转小写
   std::map<std::string, std::string> extraHeaders;
 
+  // ── 流式回包（大文件下载用）──
+  // streamLength >= 0 且 nextChunk 非空时启用：Content-Length 取 streamLength，
+  // 然后反复调用 nextChunk(buf) 直到返回 false（buf 为空也视为结束，防死循环）。
+  // 为什么需要它：原先 body 是整份 std::string，导致大文件下载只能"要么整份进内存、
+  // 要么给个截断的 206/409" —— 后者在**浏览器**里表现为"网络错误，无法下载"
+  // （浏览器不会像我们自己的客户端那样按段续拉）。
+  std::int64_t                          streamLength = -1;
+  std::function<bool(std::string& out)> nextChunk;
+
   void setJson(int code, const std::string& json);
   void setText(int code, const std::string& text);
   void setBinary(int code, const std::string& data, const std::string& type);

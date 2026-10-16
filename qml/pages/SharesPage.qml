@@ -464,10 +464,13 @@ Item {
             RowLayout {
                 Layout.fillWidth: true
                 spacing: Theme.spaceS
-                Text {
-                    text: "⚠️"
-                    font.pointSize: 22
+                CvIcon {
+                    Layout.alignment: Qt.AlignTop
+                    Layout.topMargin: 2
+                    name: "warning"
+                    size: 22
                     color: Theme.danger
+                    strokeWidth: 1.8
                 }
                 Label {
                     Layout.fillWidth: true

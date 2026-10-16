@@ -27,6 +27,7 @@
 #include "Backend.h"
 
 #include <QByteArray>
+#include <QJsonArray>
 #include <atomic>
 
 #include <QHash>
@@ -172,6 +173,8 @@ public:
 
     Result<QVector<FileItem>> listFolder(const QString &parentId) override;
     Result<QVector<FileItem>> listUnderPath(const QString &remotePath) override;
+    Ok                        moveFile(const QString &id, const QString &newParentId) override;
+    Ok                        moveDir(const QString &from, const QString &to) override;
     Result<QVector<FileItem>> listTrash() override;
     Result<FileItem>          statById(const QString &id) override;
     Result<FileItem>          statByPath(const QString &remotePath) override;
@@ -195,6 +198,10 @@ public:
     Result<QVector<FileVersion>> versions(const QString &fileId) override;
     Ok                           restoreVersion(const QString &fileId,
                                                 const QString &versionId) override;
+    Ok                           snapshotVersion(const QString &fileId,
+                                                 const QString &note) override;
+    Ok                           deleteVersion(const QString &fileId,
+                                               const QString &versionId) override;
 
     Result<QVector<ShareLink>> shares() override;
     Result<ShareLink>          createShare(const QString &fileId, const QString &code,
@@ -207,6 +214,10 @@ public:
     Ok                   deleteTag(const QString &tagId) override;
     Result<QVector<FileItem>> search(const QString &keyword, const QStringList &tagIds,
                                      int typeFilter) override;
+
+    // 附加能力：某文件当前关联的标签（GET /api/v1/files/:id/tags）。
+    // 抽象接口原本没有这项查询（HttpBackend 覆写了 Backend 的默认 unsupported 实现）。
+    Result<QVector<Tag>> tagsOfFile(const QString &fileId) override;
 
     Result<UsageStats> usage() override;
 
@@ -252,6 +263,11 @@ private:
 
     Response request(Method method, const QString &path, const QByteArray &body = {},
                      const QHash<QByteArray, QByteArray> &headers = {});
+    // 带"剩余重试次数"的内部实现。抽成独立重载，而不是让闭包自引用（shared_ptr<std::function>
+    // 捕获自身会成环 → 每次请求泄漏一份；且"执行中销毁自身"是 UB）。
+    void requestAsyncOnce(Method method, const QString &path, const QByteArray &body,
+                          const QHash<QByteArray, QByteArray> &headers,
+                          std::function<void(Response)> done, int timeoutMs, int retriesLeft);
     // 回调版底层请求：不建 QEventLoop；由 reply::finished / QTimer 超时 / sslErrors 驱动
     // done(Response)。done **恰好被调用一次**（超时后仍会 abort 并回调失败）。
     void requestAsync(Method method, const QString &path, const QByteArray &body,
@@ -265,6 +281,15 @@ private:
 
     // 解析：由「目录请求 + 目录登记请求」的响应合成当前目录条目。
     // 同步 listFolder 与异步 listFolderAsync 共用（单一来源）。
+    // 翻页拉取 /api/v1/files（extraQuery 形如 "dir=xxx"，不含 '?'）。
+    // 服务端每页有上限（默认 1000、上限 5000），**必须按 hasMore 翻完**，
+    // 否则大库会静默丢条目（历史缺陷：服务端固定 LIMIT 500 + 客户端拉全表本地筛
+    // ⇒ 一个 owner 超过 500 个文件时，排在 500 名之外的目录显示为空）。
+    Result<QJsonArray> fetchAllFilePages(const QString &extraQuery);
+    Response           fetchFilePage(const QString &extraQuery, int limit, int offset);
+    // 把累加好的 items 重新包成 Response，以便复用既有的 buildFolderItems（不改其签名）
+    static Response    mergedFilesResponse(const QJsonArray &items);
+
     static Result<QVector<FileItem>> buildFolderItems(const QString &parentId,
                                                       const Response &files,
                                                       const Response &dirs);

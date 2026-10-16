@@ -7,6 +7,7 @@ HEADERS += \
     $$PWD/Util.h \
     $$PWD/Logging.h \
     $$PWD/AppPaths.h \
+    $$PWD/AppTheme.h \
     $$PWD/Settings.h \
     $$PWD/Crypto.h
 
@@ -14,5 +15,6 @@ SOURCES += \
     $$PWD/Util.cpp \
     $$PWD/Logging.cpp \
     $$PWD/AppPaths.cpp \
+    $$PWD/AppTheme.cpp \
     $$PWD/Settings.cpp \
     $$PWD/Crypto.cpp

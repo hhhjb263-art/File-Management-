@@ -66,6 +66,7 @@
 #include <QDateTime>
 #include <QEventLoop>
 #include <QJsonArray>
+#include <QPointer>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -144,6 +145,13 @@ QString dirFromParentId(const QString &parentId)
     QString p = parentId.trimmed();
     if (p.isEmpty() || p == kRootId || p == kRootPath)
         return QString();
+    // ⚠️ 必须先剥掉目录 id 的前缀（"dir:"）。调用方传进来的往往是**列表里的目录 id**
+    //    （ensureFolderPath() 返回的正是 folderItemFor(rel) 的 id），而不是裸路径。
+    //    漏这一步的后果极隐蔽：服务端 sanitizeRelPath 见到 ':' 会判成**盘符/绝对路径**，
+    //    直接回 403 "path escapes allowed root: absolute path/drive letter not allowed"
+    //    —— 现象是"双向同步传不上去"，而 MockBackend 用自己的内部 id 所以完全复现不出来。
+    if (p.startsWith(kDirIdPrefix))
+        p = p.mid(kDirIdPrefix.size());
     while (p.startsWith(QLatin1Char('/')))
         p.remove(0, 1);
     while (p.endsWith(QLatin1Char('/')))
@@ -238,6 +246,48 @@ FileItem folderItemFor(const QString &relDir)
     f.isDir   = true;
     f.type    = FileType::Folder;
     return f;
+}
+
+// 回收站位点 body：id 是合成目录标识 "dir:<rel>" 时传 dir，否则传数字 file_id。
+// 服务端刻意不用 URL 路径参数承接目录（http_server 的路径段不做百分号解码，
+// 含中文/冒号的 "dir:照片/2026" 塞进路径永远比对不上）。
+QByteArray trashTargetBody(const QString &id)
+{
+    QJsonObject o;
+    if (isDirId(id)) {
+        o.insert(QStringLiteral("dir"), id.mid(kDirIdPrefix.size()));
+    } else {
+        o.insert(QStringLiteral("file_id"), id.toLongLong());
+    }
+    return QJsonDocument(o).toJson(QJsonDocument::Compact);
+}
+
+// 服务端版本对象 -> FileVersion（GET /api/v1/files/:id/versions 的 items 元素）
+FileVersion fileVersionFromServer(const QJsonObject &o)
+{
+    FileVersion v;
+    v.id      = QString::number(o.value(QStringLiteral("id")).toVariant().toLongLong());
+    v.fileId  = QString::number(o.value(QStringLiteral("file_id")).toVariant().toLongLong());
+    v.version = o.value(QStringLiteral("version")).toInt(1);
+    v.size    = o.value(QStringLiteral("size")).toVariant().toLongLong();
+    const qint64 ms = o.value(QStringLiteral("created_at")).toVariant().toLongLong();
+    if (ms > 0)
+        v.created = QDateTime::fromMSecsSinceEpoch(ms).toUTC();
+    v.device  = o.value(QStringLiteral("device")).toString();
+    v.note    = o.value(QStringLiteral("note")).toString();
+    v.current = o.value(QStringLiteral("current")).toBool(false);
+    return v;
+}
+
+// 服务端标签对象 -> Tag
+Tag tagFromServer(const QJsonObject &o)
+{
+    Tag t;
+    t.id    = QString::number(o.value(QStringLiteral("id")).toVariant().toLongLong());
+    t.name  = o.value(QStringLiteral("name")).toString();
+    t.color = o.value(QStringLiteral("color")).toString();
+    t.count = o.value(QStringLiteral("count")).toInt(0);
+    return t;
 }
 
 // HTTP 状态码 + 服务端 JSON 错误字段 -> 可识别失败文案
@@ -357,6 +407,15 @@ void HttpBackend::requestAsync(Method method, const QString &path, const QByteAr
                                const QHash<QByteArray, QByteArray> &headers,
                                std::function<void(Response)> done, int timeoutMs)
 {
+    // 幂等方法留 1 次重试余地（详见 requestAsyncOnce 里"陈旧连接"的说明）
+    requestAsyncOnce(method, path, body, headers, std::move(done), timeoutMs, 1);
+}
+
+void HttpBackend::requestAsyncOnce(Method method, const QString &path, const QByteArray &body,
+                                   const QHash<QByteArray, QByteArray> &headers,
+                                   std::function<void(Response)> done, int timeoutMs,
+                                   int retriesLeft)
+{
     QNetworkRequest req((QUrl(m_baseUrl + path)));
     req.setRawHeader("Accept", "application/json");
     if (!m_token.isEmpty())
@@ -388,7 +447,12 @@ void HttpBackend::requestAsync(Method method, const QString &path, const QByteAr
     auto fired  = std::make_shared<bool>(false);
     // 需要 this：内部要读 m_token 并在 401 时 emit unauthorized()（会话过期通知上层）。
     // this 的生命周期由本对象保证；reply 是它的子对象，回调不会晚于对象析构。
-    auto finish = [this, reply, timer, fired, done, timeoutMs](bool timedOut) {
+    // 是否允许在"连接被对端关闭"时重试一次：只对 GET / PUT。
+    //   · GET 无副作用；PUT 在本 API 里只有分块上传（按 seq 定位），重复写同一块幂等；
+    //   · POST / DELETE 可能非幂等（新建、删除），**不重试** —— 宁可报错也不能重复执行。
+    const bool mayRetry = (method == Method::Get || method == Method::Put);
+    auto finish = [this, method, path, body, headers, mayRetry, retriesLeft, reply, timer, fired,
+                   done, timeoutMs](bool timedOut) {
         if (*fired)
             return;
         *fired = true;
@@ -412,6 +476,18 @@ void HttpBackend::requestAsync(Method method, const QString &path, const QByteAr
                         out.retryAfter = v;
                 }
             } else if (out.status <= 0) {
+                // 陈旧 keep-alive：服务端空闲超时（30s）关掉了连接，而我们复用了那个刚被关掉的
+                // socket ⇒ 本次请求以 RemoteHostClosedError 失败。**这不是真的断网**，
+                // 重发一次即可（用户看到的现象正是"老是断开连接"）。
+                if (!timedOut && reply->error() == QNetworkReply::RemoteHostClosedError &&
+                    mayRetry && retriesLeft > 0) {
+                    reply->deleteLater();
+                    // 这里**不**调 done、**不** emit unauthorized：直接以少一次额度重发。
+                    // done 仍保证恰好被调用一次（由重发那次的 finish 负责）。
+                    requestAsyncOnce(method, path, body, headers, done, timeoutMs,
+                                     retriesLeft - 1);
+                    return;
+                }
                 const QVariant pin = reply->property("cvPinMismatch");
                 if (pin.isValid()) {
                     // 指纹不一致：给出可识别原因（控制器会翻成中文警告，且不提供"继续"）
@@ -754,40 +830,183 @@ Result<QVector<FileItem>> HttpBackend::buildFolderItems(const QString &parentId,
     return Result<QVector<FileItem>>::success(out);
 }
 
+// 文件列表分页常量：与服务端 kDefaultFileListLimit/kMaxFileListLimit 对应。
+constexpr int kFileListPageSize = 1000;
+// 安全上限：防止服务端 hasMore 恒真时无限翻页（1000*200 = 20 万条，够覆盖 PRD 的 10 万文件目标）
+constexpr int kMaxFileListPages = 200;
+
+// 把累加好的 items 重新包成一个 Response，复用既有的 buildFolderItems
+HttpBackend::Response HttpBackend::mergedFilesResponse(const QJsonArray &items)
+{
+    QJsonObject o;
+    o.insert(QStringLiteral("total"), items.size());
+    o.insert(QStringLiteral("items"), items);
+    Response r;
+    r.status = 200;
+    r.body   = QJsonDocument(o).toJson(QJsonDocument::Compact);
+    return r;
+}
+
+HttpBackend::Response HttpBackend::fetchFilePage(const QString &extraQuery, int limit, int offset)
+{
+    QString path = QStringLiteral("/api/v1/files");
+    QString q    = extraQuery;
+    if (!q.isEmpty())
+        q += QLatin1Char('&');
+    q += QStringLiteral("limit=%1&offset=%2").arg(limit).arg(offset);
+    return request(Method::Get, path + QLatin1Char('?') + q);
+}
+
+Result<QJsonArray> HttpBackend::fetchAllFilePages(const QString &extraQuery)
+{
+    QJsonArray all;
+    int        offset = 0;
+    for (int page = 0; page < kMaxFileListPages; ++page) {
+        const Response r = fetchFilePage(extraQuery, kFileListPageSize, offset);
+        if (!r.ok())
+            return Result<QJsonArray>::fail(r.error);
+        const QJsonObject o     = QJsonDocument::fromJson(r.body).object();
+        const QJsonArray  items = o.value(QStringLiteral("items")).toArray();
+        for (const QJsonValue &v : items)
+            all.append(v);
+        // 老服务端没有 hasMore 字段 → toBool(false) → 视为"只有一页"，保持向后兼容
+        if (!o.value(QStringLiteral("hasMore")).toBool(false) || items.isEmpty())
+            break;
+        offset += items.size();
+    }
+    return Result<QJsonArray>::success(all);
+}
+
 Result<QVector<FileItem>> HttpBackend::listFolder(const QString &parentId)
 {
-    const Response fr = request(Method::Get, QStringLiteral("/api/v1/files"));
-    if (!fr.ok())
-        return Result<QVector<FileItem>>::fail(fr.error);
+    // 改为**服务端按目录过滤 + 翻页**，不再"拉全表回本地筛"。
+    // dir= 的**空值就是根目录**，所以必须显式带上这个参数（不能靠省略它来表达根目录）。
+    const QString dir = dirFromParentId(parentId);
+    const Result<QJsonArray> all =
+        fetchAllFilePages(QStringLiteral("dir=%1").arg(pct(dir)));
+    if (!all.ok)
+        return Result<QVector<FileItem>>::fail(all.error);
 
     const Response dr = request(Method::Get, QStringLiteral("/api/v1/dirs"));
-    return buildFolderItems(parentId, fr, dr);
+    return buildFolderItems(parentId, mergedFilesResponse(all.value), dr);
 }
 
 void HttpBackend::listFolderAsync(const QString &parentId,
                                   std::function<void(Result<QVector<FileItem>>)> done)
 {
-    // 与同步版同序：先取 files，成功后再取 dirs（目录失败不致命，交由 buildFolderItems 处理）。
-    requestAsync(Method::Get, QStringLiteral("/api/v1/files"), {}, {},
-                 [this, parentId, done](Response fr) {
-                     if (!fr.ok()) {
-                         done(Result<QVector<FileItem>>::fail(fr.error));
-                         return;
-                     }
-                     requestAsync(Method::Get, QStringLiteral("/api/v1/dirs"), {}, {},
-                                  [this, parentId, fr, done](Response dr) {
-                                      done(buildFolderItems(parentId, fr, dr));
-                                  });
-                 });
+    // 本变体是界面实际走的路径（避免同步调用阻塞 GUI），所以它同样必须翻页 ——
+    // 只修同步版等于什么都没修。
+    //
+    // 实现上用"首包拿到 total → 并发取其余页 → 按序拼装"，而不是递归回调：
+    // 递归需要让闭包捕获它自己（shared_ptr 自引用成环），每次调用都会泄漏整份累加结果，
+    // 也要在"执行中销毁自身"的边界上走钢丝。分页并发则没有这些问题。
+    const QString dir   = dirFromParentId(parentId);
+    const QString query = QStringLiteral("dir=%1").arg(pct(dir));
+
+    struct Acc
+    {
+        QJsonArray items;
+    };
+    auto                  acc = std::make_shared<Acc>();
+    QPointer<HttpBackend> self(this);
+
+    const auto finish = [self, parentId, acc, done]() {
+        if (!self) {
+            done(Result<QVector<FileItem>>::fail(QStringLiteral("连接已释放")));
+            return;
+        }
+        self->requestAsync(Method::Get, QStringLiteral("/api/v1/dirs"), {}, {},
+                           [self, parentId, acc, done](Response dr) {
+            if (!self) {
+                done(Result<QVector<FileItem>>::fail(QStringLiteral("连接已释放")));
+                return;
+            }
+            done(self->buildFolderItems(parentId, mergedFilesResponse(acc->items), dr));
+        });
+    };
+
+    const QString first = QStringLiteral("/api/v1/files?%1&limit=%2&offset=0")
+                              .arg(query)
+                              .arg(kFileListPageSize);
+    requestAsync(Method::Get, first, {}, {}, [self, query, acc, finish, done](Response fr) {
+        if (!self)
+            return;   // done 由 finish 负责；连接已释放时不再回调（调用方同期已销毁）
+        if (!fr.ok()) {
+            done(Result<QVector<FileItem>>::fail(fr.error));
+            return;
+        }
+        const QJsonObject o     = QJsonDocument::fromJson(fr.body).object();
+        const QJsonArray  items = o.value(QStringLiteral("items")).toArray();
+        for (const QJsonValue &v : items)
+            acc->items.append(v);
+
+        const qint64 total = static_cast<qint64>(o.value(QStringLiteral("total")).toDouble());
+        int          pages = 1;
+        if (total > 0)
+            pages = static_cast<int>((total + kFileListPageSize - 1) / kFileListPageSize);
+        pages = qBound(1, pages, kMaxFileListPages);
+
+        if (pages <= 1) {
+            finish();
+            return;
+        }
+
+        // 其余页并发取；按索引落位，最后按序拼装（顺序不能乱：界面/同步都依赖稳定顺序）
+        // 变量名不能叫 slots：它是 Qt 的关键字宏（展开为空），会直接造成语法错误
+        auto pageItems = std::make_shared<QVector<QJsonArray>>(pages);
+        auto remaining = std::make_shared<int>(pages - 1);
+        auto failed    = std::make_shared<bool>(false);
+        (*pageItems)[0] = items;
+
+        for (int p = 1; p < pages; ++p) {
+            const QString path = QStringLiteral("/api/v1/files?%1&limit=%2&offset=%3")
+                                     .arg(query)
+                                     .arg(kFileListPageSize)
+                                     .arg(p * kFileListPageSize);
+            // 本 lambda 捕获的是 self（QPointer）而不是 this，必须显式走 self->
+            self->requestAsync(Method::Get, path, {}, {},
+                               [self, pageItems, remaining, failed, p, finish, done](Response r) {
+                if (!self)
+                    return;
+                if (r.ok()) {
+                    (*pageItems)[p] = QJsonDocument::fromJson(r.body).object()
+                                      .value(QStringLiteral("items"))
+                                      .toArray();
+                } else {
+                    // 任何一页失败都算整体失败：宁可报错，也不要"少几个文件"的静默残缺
+                    *failed = true;
+                }
+                if (--(*remaining) == 0) {
+                    if (*failed) {
+                        done(Result<QVector<FileItem>>::fail(
+                            QStringLiteral("分页拉取文件列表时有页失败")));
+                        return;
+                    }
+                    QJsonArray all;
+                    for (const QJsonArray &a : *pageItems) {
+                        for (const QJsonValue &v : a)
+                            all.append(v);
+                    }
+                    pageItems->clear();
+                    // 交给 finish 去拉目录并组装
+                    finish();
+                }
+            });
+        }
+    });
 }
 
 Result<QVector<FileItem>> HttpBackend::listUnderPath(const QString &remotePath)
 {
     const QString base = normalizeRelPath(remotePath);
 
-    const Response fr = request(Method::Get, QStringLiteral("/api/v1/files"));
-    if (!fr.ok())
-        return Result<QVector<FileItem>>::fail(fr.error);
+    // 用服务端 under= 前缀过滤 + 翻页，替代"拉全表再本地按前缀筛"。
+    // ⚠️ 同步模块靠本函数拿**全量**云端树，漏一页就等于漏同步 —— 所以务必翻完所有页。
+    const Result<QJsonArray> all =
+        base.isEmpty() ? fetchAllFilePages(QString())
+                       : fetchAllFilePages(QStringLiteral("under=%1").arg(pct(base)));
+    if (!all.ok)
+        return Result<QVector<FileItem>>::fail(all.error);
 
     const Response dr = request(Method::Get, QStringLiteral("/api/v1/dirs"));
     QSet<QString> dirs;
@@ -805,12 +1024,10 @@ Result<QVector<FileItem>> HttpBackend::listUnderPath(const QString &remotePath)
     };
 
     QVector<FileItem> out;
-    const QJsonArray items =
-        QJsonDocument::fromJson(fr.body).object().value(QStringLiteral("items")).toArray();
-    for (const QJsonValue &v : items) {
+    for (const QJsonValue &v : all.value) {
         const QJsonObject o    = v.toObject();
         const QString     dir  = o.value(QStringLiteral("dir")).toString();
-        if (underBase(dir))
+        if (underBase(dir))   // 服务端已过滤；本地再校验一遍，防老服务端/异常返回
             out.append(fileItemFromServer(o));
     }
     for (const QString &d : dirs) {
@@ -826,7 +1043,34 @@ Result<QVector<FileItem>> HttpBackend::listUnderPath(const QString &remotePath)
 
 Result<QVector<FileItem>> HttpBackend::listTrash()
 {
-    return Result<QVector<FileItem>>::fail(unsupportedMsg(QStringLiteral("回收站列表")));
+    const Response r = request(Method::Get, QStringLiteral("/api/v1/trash"));
+    if (!r.ok())
+        return Result<QVector<FileItem>>::fail(r.error);
+
+    const QJsonObject root = QJsonDocument::fromJson(r.body).object();
+    QVector<FileItem> out;
+    // 文件条目（顶层：所属目录不在回收站）
+    for (const QJsonValue &v : root.value(QStringLiteral("items")).toArray()) {
+        const QJsonObject o = v.toObject();
+        FileItem f = fileItemFromServer(o);
+        f.trashed  = true;
+        const qint64 ms = o.value(QStringLiteral("deleted_at")).toVariant().toLongLong();
+        if (ms > 0)
+            f.trashedAt = QDateTime::fromMSecsSinceEpoch(ms).toUTC();
+        out.append(f);
+    }
+    // 目录条目（顶层：父目录不在回收站）—— 服务端只回顶层，界面不该看到"散开的 N 个文件"
+    for (const QJsonValue &v : root.value(QStringLiteral("dirs")).toArray()) {
+        const QJsonObject o = v.toObject();
+        FileItem f = folderItemFor(o.value(QStringLiteral("path")).toString());
+        f.trashed  = true;
+        f.size     = o.value(QStringLiteral("size")).toVariant().toLongLong();
+        const qint64 ms = o.value(QStringLiteral("deleted_at")).toVariant().toLongLong();
+        if (ms > 0)
+            f.trashedAt = QDateTime::fromMSecsSinceEpoch(ms).toUTC();
+        out.append(f);
+    }
+    return Result<QVector<FileItem>>::success(out);
 }
 
 // =========================================================================
@@ -943,34 +1187,80 @@ Ok HttpBackend::rename(const QString &id, const QString &newName)
     return r.ok() ? ok() : err(r.error);
 }
 
-Ok HttpBackend::moveToTrash(const QString &)
+Ok HttpBackend::moveFile(const QString &id, const QString &newParentId)
 {
-    return err(unsupportedMsg(QStringLiteral("回收站（软删除）")));
+    // 服务端按**目录路径**接收（与上传 init 的 dir 同一套口径）。
+    // ⚠️ 这里要同时接受两种传法：
+    //   · 目录在列表里的 id（folderItemFor 生成的 <前缀>+<路径>）—— 界面自然拿到的是这个；
+    //   · 裸相对路径（'' 或 'docs/2026'）—— 直接调 API 时更顺手。
+    //   两个后端对"目录 id"的口径本来就不一样（Mock 是内部 id），统一到"传列表里的 id 即可"
+    //   才算对外一致；否则调用方得知道自己接的是哪个后端，那等于没抽象。
+    QJsonObject body;
+    body.insert(QStringLiteral("dir"), dirFromParentId(newParentId));
+    const Response r = request(Method::Post,
+                               QStringLiteral("/api/v1/files/") + id + QStringLiteral("/move"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    return r.ok() ? ok() : err(r.error);
 }
 
-Ok HttpBackend::restore(const QString &)
+Ok HttpBackend::moveDir(const QString &from, const QString &to)
 {
-    return err(unsupportedMsg(QStringLiteral("回收站恢复")));
+    QJsonObject body;
+    body.insert(QStringLiteral("from"), normalizeRelPath(from));
+    body.insert(QStringLiteral("to"), normalizeRelPath(to));
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/dirs/move"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    return r.ok() ? ok() : err(r.error);
+}
+
+Ok HttpBackend::moveToTrash(const QString &id)
+{
+    // 软删除（进回收站）：POST /api/v1/trash，body 二选一 —— {file_id} 或 {dir}
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/trash"), trashTargetBody(id));
+    return r.ok() ? ok() : err(r.error);
+}
+
+Ok HttpBackend::restore(const QString &id)
+{
+    // 恢复：原目录若也在回收站，服务端会顺带把目录链恢复（否则"恢复成功却看不见"）
+    const Response r =
+        request(Method::Post, QStringLiteral("/api/v1/trash/restore"), trashTargetBody(id));
+    return r.ok() ? ok() : err(r.error);
 }
 
 Ok HttpBackend::purge(const QString &id)
 {
-    // 服务端 DELETE 即永久删除（等价 purge 语义）；仅「回收站」相关软删除不支持。
-    if (isDirId(id))
-        return err(unsupportedMsg(QStringLiteral("目录删除")));
-
-    const Response r = request(Method::Delete, QStringLiteral("/api/v1/files/") + pct(id));
+    // 彻底删除（不可恢复）：POST /api/v1/trash/purge。
+    // 注意与旧语义的区别：早先本方法映射到 DELETE /api/v1/files/:id，而那个端点现在
+    // 已改为"移入回收站"（配合回收站落地）。真正的永久删除只有这一条路径。
+    const Response r =
+        request(Method::Post, QStringLiteral("/api/v1/trash/purge"), trashTargetBody(id));
     return r.ok() ? ok() : err(r.error);
 }
 
 Ok HttpBackend::emptyTrash()
 {
-    return err(unsupportedMsg(QStringLiteral("回收站清空")));
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/trash/empty"),
+                               QByteArrayLiteral("{}"));
+    return r.ok() ? ok() : err(r.error);
 }
 
-Ok HttpBackend::setTags(const QString &, const QStringList &)
+Ok HttpBackend::setTags(const QString &id, const QStringList &tagIds)
 {
-    return err(unsupportedMsg(QStringLiteral("标签")));
+    if (isDirId(id))
+        return err(QStringLiteral("目录暂不支持标签"));
+
+    // 全量替换语义：服务端先清空该文件的全部关联，再按 tag_ids 重建
+    QJsonArray arr;
+    for (const QString &t : tagIds)
+        arr.append(t.toLongLong());
+    QJsonObject body;
+    body.insert(QStringLiteral("tag_ids"), arr);
+
+    const Response r = request(Method::Put,
+                               QStringLiteral("/api/v1/files/") + pct(id) + QStringLiteral("/tags"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    return r.ok() ? ok() : err(r.error);
 }
 
 // =========================================================================
@@ -1208,17 +1498,71 @@ Result<bool> HttpBackend::health()
 }
 
 // =========================================================================
-// 版本（服务端未实现 -> 不支持）
+// 版本（GET/POST /api/v1/files/:id/versions、POST .../versions/:vid/restore）
+//   服务端 file_version 只存历史快照，"当前版本"由服务端合成后一并返回（current=true）。
 // =========================================================================
 
-Result<QVector<FileVersion>> HttpBackend::versions(const QString &)
+Result<QVector<FileVersion>> HttpBackend::versions(const QString &fileId)
 {
-    return Result<QVector<FileVersion>>::fail(unsupportedMsg(QStringLiteral("文件版本")));
+    if (isDirId(fileId))
+        return Result<QVector<FileVersion>>::fail(QStringLiteral("目录没有历史版本"));
+
+    const Response r = request(Method::Get, QStringLiteral("/api/v1/files/") + pct(fileId)
+                                               + QStringLiteral("/versions"));
+    if (!r.ok())
+        return Result<QVector<FileVersion>>::fail(r.error);
+
+    const QJsonArray arr =
+        QJsonDocument::fromJson(r.body).object().value(QStringLiteral("items")).toArray();
+    QVector<FileVersion> out;
+    for (const QJsonValue &v : arr)
+        out.append(fileVersionFromServer(v.toObject()));
+    return Result<QVector<FileVersion>>::success(out);
 }
 
-Ok HttpBackend::restoreVersion(const QString &, const QString &)
+Ok HttpBackend::restoreVersion(const QString &fileId, const QString &versionId)
 {
-    return err(unsupportedMsg(QStringLiteral("版本回溯")));
+    if (isDirId(fileId))
+        return err(QStringLiteral("目录没有历史版本"));
+    if (versionId.isEmpty() || versionId == QStringLiteral("0"))
+        return err(QStringLiteral("「当前版本」无需回滚"));  // 合成条目，服务端没有这一行
+
+    // 服务端会在回滚前自动把当前内容备份成一条历史版本 —— 回滚不是单向删除
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/files/") + pct(fileId)
+                                                 + QStringLiteral("/versions/") + pct(versionId)
+                                                 + QStringLiteral("/restore"),
+                               QByteArrayLiteral("{}"));
+    return r.ok() ? ok() : err(r.error);
+}
+
+Ok HttpBackend::snapshotVersion(const QString &fileId, const QString &note)
+{
+    if (isDirId(fileId))
+        return err(QStringLiteral("目录没有历史版本"));
+
+    QJsonObject body;
+    if (!note.isEmpty())
+        body.insert(QStringLiteral("note"), note);
+
+    // 手动快照：把"当前内容"存成一条历史版本（服务端 version_no 单调递增，只增不减）
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/files/") + pct(fileId)
+                                                 + QStringLiteral("/versions"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    return r.ok() ? ok() : err(r.error);
+}
+
+Ok HttpBackend::deleteVersion(const QString &fileId, const QString &versionId)
+{
+    if (isDirId(fileId))
+        return err(QStringLiteral("目录没有历史版本"));
+    // id="0" 是服务端合成的「当前版本」条目，库里没有这一行，删它必然 404 —— 提前拦下
+    if (versionId.isEmpty() || versionId == QStringLiteral("0"))
+        return err(QStringLiteral("「当前版本」不是历史版本，无法删除"));
+
+    const Response r = request(Method::Delete, QStringLiteral("/api/v1/files/") + pct(fileId)
+                                                   + QStringLiteral("/versions/")
+                                                   + pct(versionId));
+    return r.ok() ? ok() : err(r.error);
 }
 
 // =========================================================================
@@ -1368,27 +1712,92 @@ Ok HttpBackend::touchShare(const QString &)
 }
 
 // =========================================================================
-// 标签与检索（服务端未实现 -> 不支持）
+// 标签与检索（GET/POST /api/v1/tags、DELETE /api/v1/tags/:id、
+//             PUT /api/v1/files/:id/tags、POST /api/v1/search）
 // =========================================================================
 
 Result<QVector<Tag>> HttpBackend::tags()
 {
-    return Result<QVector<Tag>>::fail(unsupportedMsg(QStringLiteral("标签")));
+    const Response r = request(Method::Get, QStringLiteral("/api/v1/tags"));
+    if (!r.ok())
+        return Result<QVector<Tag>>::fail(r.error);
+
+    const QJsonArray arr =
+        QJsonDocument::fromJson(r.body).object().value(QStringLiteral("items")).toArray();
+    QVector<Tag> out;
+    for (const QJsonValue &v : arr)
+        out.append(tagFromServer(v.toObject()));
+    return Result<QVector<Tag>>::success(out);
 }
 
-Result<Tag> HttpBackend::createTag(const QString &, const QString &)
+Result<Tag> HttpBackend::createTag(const QString &name, const QString &color)
 {
-    return Result<Tag>::fail(unsupportedMsg(QStringLiteral("标签")));
+    QJsonObject body;
+    body.insert(QStringLiteral("name"), name);
+    if (!color.isEmpty())
+        body.insert(QStringLiteral("color"), color);
+
+    // 同名（NOCASE）服务端返回 200 + created=false（幂等），同样算成功
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/tags"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    if (!r.ok())
+        return Result<Tag>::fail(r.error);
+    return Result<Tag>::success(tagFromServer(QJsonDocument::fromJson(r.body).object()));
 }
 
-Ok HttpBackend::deleteTag(const QString &)
+Ok HttpBackend::deleteTag(const QString &tagId)
 {
-    return err(unsupportedMsg(QStringLiteral("标签")));
+    // 服务端会级联清掉 file_tag 关联，不需要客户端补刀
+    const Response r = request(Method::Delete, QStringLiteral("/api/v1/tags/") + pct(tagId));
+    return r.ok() ? ok() : err(r.error);
 }
 
-Result<QVector<FileItem>> HttpBackend::search(const QString &, const QStringList &, int)
+// 附加能力：某文件当前关联的标签（GET /api/v1/files/:id/tags）。
+// Backend 抽象接口未提供此查询（MockBackend 从本地 FileItem.tagIds 反查），
+// 这里作为 HttpBackend 的加法式扩展暴露给 TagController。
+Result<QVector<Tag>> HttpBackend::tagsOfFile(const QString &fileId)
 {
-    return Result<QVector<FileItem>>::fail(unsupportedMsg(QStringLiteral("全文检索")));
+    if (isDirId(fileId))
+        return Result<QVector<Tag>>::success(QVector<Tag>());
+
+    const Response r = request(Method::Get, QStringLiteral("/api/v1/files/") + pct(fileId)
+                                               + QStringLiteral("/tags"));
+    if (!r.ok())
+        return Result<QVector<Tag>>::fail(r.error);
+
+    const QJsonArray arr =
+        QJsonDocument::fromJson(r.body).object().value(QStringLiteral("items")).toArray();
+    QVector<Tag> out;
+    for (const QJsonValue &v : arr)
+        out.append(tagFromServer(v.toObject()));
+    return Result<QVector<Tag>>::success(out);
+}
+
+Result<QVector<FileItem>> HttpBackend::search(const QString &keyword, const QStringList &tagIds,
+                                              int typeFilter)
+{
+    QJsonObject body;
+    if (!keyword.isEmpty())
+        body.insert(QStringLiteral("keyword"), keyword);
+    QJsonArray tags;
+    for (const QString &t : tagIds)
+        tags.append(t.toLongLong());
+    if (!tags.isEmpty())
+        body.insert(QStringLiteral("tag_ids"), tags);
+    if (typeFilter >= 0)
+        body.insert(QStringLiteral("type"), typeFilter);
+
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/search"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    if (!r.ok())
+        return Result<QVector<FileItem>>::fail(r.error);
+
+    const QJsonArray arr =
+        QJsonDocument::fromJson(r.body).object().value(QStringLiteral("items")).toArray();
+    QVector<FileItem> out;
+    for (const QJsonValue &v : arr)
+        out.append(fileItemFromServer(v.toObject()));
+    return Result<QVector<FileItem>>::success(out);
 }
 
 // =========================================================================

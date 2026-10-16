@@ -1,15 +1,16 @@
 /****************************************************************************
- * data/TagModel.h —— 标签数据模型（骨架）
+ * data/TagModel.h —— 标签列表模型（QML ListView 数据源）
  *
- * 服务端不支持标签（契约 §1 Unsupported 清单），本模型保留骨架：
- *   rowCount() == 0，roleNames() 暴露约定角色名，UI 入口置灰。
- * 角色名与 core/Types.h 的 Tag 字段一一对应，便于后续启用时零迁移。
+ * 角色名与 core/Types.h 的 Tag 字段一一对应（骨架期就这么定的，启用后零迁移）。
+ * 数据由 TagController 拉取后整批灌入（setTags），模型自身不做任何网络 / IO，
+ * 只在主线程读写 —— 与 FileListModel 同一套约定。
  ****************************************************************************/
 #pragma once
 
 #include <QAbstractListModel>
 #include <QHash>
-#include <QString>
+#include <QVariantMap>
+#include <QVector>
 
 #include "Types.h"
 
@@ -25,7 +26,7 @@ public:
         IdRole = Qt::UserRole + 1, // "id"
         NameRole,                  // "name"
         ColorRole,                 // "color"
-        CountRole                  // "count"
+        CountRole                  // "count"（关联的未删除文件数）
     };
     Q_ENUM(Roles)
 
@@ -37,8 +38,19 @@ public:
 
     int count() const;
 
+    // 整批替换（beginResetModel / endResetModel）
+    void setTags(const QVector<Tag> &tags);
+
+    // 供右键菜单 / 详情读取某行（越界返回空 map）。键：id/name/color/count。
+    Q_INVOKABLE QVariantMap at(int row) const;
+
+    Q_INVOKABLE void clear();
+
 signals:
     void countChanged();
+
+private:
+    QVector<Tag> m_tags;
 };
 
 } // namespace cv

@@ -41,6 +41,8 @@ class AuthController : public QObject
     Q_PROPERTY(QString errorKind           READ errorKind           NOTIFY errorChanged)
     Q_PROPERTY(QString errorText           READ errorText           NOTIFY errorChanged)
     Q_PROPERTY(int     retryAfterSeconds   READ retryAfterSeconds   NOTIFY errorChanged)
+    // 用户是否主动跳过了登录门（继续用访问令牌直连）。持久化，重启后保持。
+    Q_PROPERTY(bool    loginSkipped        READ loginSkipped        NOTIFY loginSkippedChanged)
     Q_PROPERTY(bool    rememberPassword    READ rememberPassword    WRITE setRememberPassword NOTIFY rememberPasswordChanged)
     Q_PROPERTY(QString savedUserName       READ savedUserName       NOTIFY savedLoginChanged)
     Q_PROPERTY(QString savedPassword       READ savedPassword       NOTIFY savedLoginChanged)
@@ -59,6 +61,7 @@ public:
     QString errorKind() const { return m_errorKind; }
     QString errorText() const { return m_errorText; }
     int     retryAfterSeconds() const { return m_retryAfterSeconds; }
+    bool    loginSkipped() const { return m_loginSkipped; }
     bool    rememberPassword() const { return m_rememberPassword; }
     QString savedUserName() const { return m_savedUserName; }
     QString savedPassword() const { return m_savedPassword; }
@@ -72,6 +75,14 @@ public:
     Q_INVOKABLE void startupCheck(); // 启动判定：探测服务端是否具备账号体系
     Q_INVOKABLE void clearSavedPassword(); // 关闭「记住密码」时清掉已存密码
     void setRememberPassword(bool on);   // Q_PROPERTY WRITE 用
+
+    // ---- 登录门开关（加法式）----
+    // 用户主动「跳过登录」：隐藏登录门、持久化，继续用 Settings::token() 直连。
+    // 场景：服务端需要账号，但用户只想用访问令牌；没有这个入口时登录门会永久挡住
+    // 整个界面（登录动作依赖后端，失败即死锁）。
+    Q_INVOKABLE void skipLogin();
+    // 重新显示登录门（顶栏「登录 / 注册」按钮调用）。
+    Q_INVOKABLE void resumeLogin();
 
 public slots:
     // 由 HttpBackend::unauthorized() 触发（收到 401 且持有令牌）。
@@ -93,6 +104,7 @@ signals:
 
     void initializingChanged();
     void legacyModeChanged();
+    void loginSkippedChanged();
     void busyChanged();
     void loggedInChanged();
     void userIdChanged();
@@ -128,6 +140,7 @@ private:
 
     bool   m_initializing = true;
     bool   m_legacyMode   = false;
+    bool   m_loginSkipped = false;
     bool   m_busy         = false;
     bool   m_loggedIn     = false;
     QString m_userId;

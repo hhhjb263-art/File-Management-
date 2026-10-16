@@ -129,6 +129,53 @@ bool migrateSchema(sqlite3* db, std::string& err) {
     if (!execAll(db, stmts, err)) return false;
   }
 
+  // 1.6) file_node.deleted_at（回收站：进站时间，0 = 未进站/历史硬删除）
+  //      老库补列后，历史 deleted=1 的行 deleted_at 仍为 0 → 按"不可恢复的硬删除"处理，
+  //      不会凭空出现在回收站里（这是刻意的向后兼容选择）。
+  if (tableExists(db, "file_node", err) && !tableHasColumn(db, "file_node", "deleted_at", err)) {
+    std::vector<std::string> stmts = {
+        "ALTER TABLE file_node ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0",
+    };
+    if (!execAll(db, stmts, err)) return false;
+  }
+  if (tableExists(db, "file_node", err)) {
+    char* msg = nullptr;
+    sqlite3_exec(db,
+                 "CREATE INDEX IF NOT EXISTS idx_file_trash "
+                 "ON file_node(owner_id, deleted, deleted_at)",
+                 nullptr, nullptr, &msg);
+    if (msg) sqlite3_free(msg);
+  }
+
+  // 1.7) dir_node 回收站列（目录也进回收站；老库补列，历史目录一律视为未删除）
+  if (tableExists(db, "dir_node", err)) {
+    std::vector<std::string> stmts;
+    if (!tableHasColumn(db, "dir_node", "deleted", err))
+      stmts.push_back("ALTER TABLE dir_node ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0");
+    if (!tableHasColumn(db, "dir_node", "deleted_at", err))
+      stmts.push_back("ALTER TABLE dir_node ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0");
+    if (!stmts.empty() && !execAll(db, stmts, err)) return false;
+    char* msg = nullptr;
+    sqlite3_exec(db,
+                 "CREATE INDEX IF NOT EXISTS idx_dir_trash "
+                 "ON dir_node(owner_id, deleted, deleted_at)",
+                 nullptr, nullptr, &msg);
+    if (msg) sqlite3_free(msg);
+  }
+
+  // 1.8) file_version 补齐版本元数据列（device / note / chunk_count）
+  //      —— 版本功能启用前这些列不存在；老库补列后历史版本行仍可用（默认空串）。
+  if (tableExists(db, "file_version", err)) {
+    std::vector<std::string> stmts;
+    if (!tableHasColumn(db, "file_version", "device", err))
+      stmts.push_back("ALTER TABLE file_version ADD COLUMN device TEXT NOT NULL DEFAULT ''");
+    if (!tableHasColumn(db, "file_version", "note", err))
+      stmts.push_back("ALTER TABLE file_version ADD COLUMN note TEXT NOT NULL DEFAULT ''");
+    if (!tableHasColumn(db, "file_version", "chunk_count", err))
+      stmts.push_back("ALTER TABLE file_version ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0");
+    if (!stmts.empty() && !execAll(db, stmts, err)) return false;
+  }
+
   // 2) upload_session.owner_id
   if (tableExists(db, "upload_session", err) && !tableHasColumn(db, "upload_session", "owner_id", err)) {
     std::vector<std::string> stmts = {

@@ -47,6 +47,17 @@ Settings::Settings(QObject *parent)
 {
     // Qt6 的 QSettings 已移除 setIniCodec()：INI 文件一律按 UTF-8 处理，
     // 且此处构造时已显式指定 QSettings::IniFormat，无需再做编码设置。
+
+    // 旧键迁移（一次性、幂等）：ui/darkMode（布尔）→ ui/themeMode（三态）。
+    // 放在构造函数里而不是 getter 里 —— getter 是 const，不应写配置。
+    const QString key = QStringLiteral("ui/themeMode");
+    const QString legacy = QStringLiteral("ui/darkMode");
+    if (!m_settings.contains(key) && m_settings.contains(legacy)) {
+        m_settings.setValue(key, m_settings.value(legacy, false).toBool()
+                                    ? QStringLiteral("dark")
+                                    : QStringLiteral("light"));
+        m_settings.remove(legacy);
+    }
 }
 
 Settings &Settings::instance()
@@ -84,10 +95,39 @@ void    Settings::setSavedUser(const QString &user) { m_settings.setValue(QStrin
 QString Settings::savedPassword() const { return m_settings.value(QStringLiteral("auth/savedPassword")).toString(); }
 void    Settings::setSavedPassword(const QString &pwd) { m_settings.setValue(QStringLiteral("auth/savedPassword"), pwd); }
 
+bool Settings::skipLogin() const { return m_settings.value(QStringLiteral("auth/skipLogin"), false).toBool(); }
+void Settings::setSkipLogin(bool on) { m_settings.setValue(QStringLiteral("auth/skipLogin"), on); }
+
 // ---------------- 外观 ----------------
 
-bool Settings::darkMode() const { return m_settings.value(QStringLiteral("ui/darkMode"), false).toBool(); }
-void Settings::setDarkMode(bool dark) { m_settings.setValue(QStringLiteral("ui/darkMode"), dark); }
+QString Settings::themeMode() const
+{
+    // 纯读：旧键迁移已在构造函数中完成（见 Settings::Settings）。
+    const QString m = m_settings.value(QStringLiteral("ui/themeMode"),
+                                       QStringLiteral("system"))
+                          .toString()
+                          .trimmed()
+                          .toLower();
+    if (m == QLatin1String("light") || m == QLatin1String("dark") || m == QLatin1String("system"))
+        return m;
+    return QStringLiteral("system");
+}
+
+void Settings::setThemeMode(const QString &mode)
+{
+    const QString m = mode.trimmed().toLower();
+    const QString v = (m == QLatin1String("light") || m == QLatin1String("dark")
+                       || m == QLatin1String("system"))
+                          ? m
+                          : QStringLiteral("system");
+    m_settings.setValue(QStringLiteral("ui/themeMode"), v);
+}
+
+bool Settings::darkMode() const { return themeMode() == QLatin1String("dark"); }
+void Settings::setDarkMode(bool dark)
+{
+    setThemeMode(dark ? QStringLiteral("dark") : QStringLiteral("light"));
+}
 
 // ---------------- 常规 ----------------
 
@@ -166,6 +206,11 @@ QVector<SyncPair> Settings::syncPairs() const
         p.remotePath = o.value(QStringLiteral("remote")).toString();
         p.mode       = syncModeFromString(o.value(QStringLiteral("mode")).toString());
         p.enabled    = o.value(QStringLiteral("enabled")).toBool(true);
+        {
+          const QJsonArray ex = o.value(QStringLiteral("exclude")).toArray();
+          for (const QJsonValue &e : ex)
+            p.excludeDirs << e.toString();
+        }
         if (p.id.isEmpty())
             p.id = Crypto::randomHex(8);
         pairs.append(p);
@@ -183,6 +228,12 @@ void Settings::setSyncPairs(const QVector<SyncPair> &pairs)
         o.insert(QStringLiteral("remote"), p.remotePath);
         o.insert(QStringLiteral("mode"), syncModeToString(p.mode));
         o.insert(QStringLiteral("enabled"), p.enabled);
+        {
+          QJsonArray ex;
+          for (const QString &e : p.excludeDirs)
+            ex.append(e);
+          o.insert(QStringLiteral("exclude"), ex);
+        }
         arr.append(o);
     }
     m_settings.setValue(QStringLiteral("sync/pairs"),

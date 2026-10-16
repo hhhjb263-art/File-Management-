@@ -100,6 +100,19 @@ bool UploadRepository::findResumable(const std::string& fileHash, std::int64_t s
   return rowToSession(stmt, out);
 }
 
+bool UploadRepository::listAllIds(std::vector<std::int64_t>& out, std::string& err) {
+  out.clear();
+  Stmt stmt(db_.handle(), "SELECT id FROM upload_session", err);
+  if (!stmt.ok()) return false;
+  while (true) {
+    const int rc = stmt.step(err);
+    if (rc == SQLITE_DONE) break;
+    if (rc != SQLITE_ROW) return false;
+    out.push_back(stmt.int64(0));
+  }
+  return true;
+}
+
 bool UploadRepository::listChunks(std::int64_t id, std::vector<UploadChunkRow>& out,
                                  std::string& err) {
   out.clear();

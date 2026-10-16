@@ -22,6 +22,16 @@ Item {
     readonly property int contentMargin: Theme.spaceXl
     readonly property bool twoColumn: width >= 760
 
+    // 当前主题模式（"light" | "dark" | "system"）。
+    // 唯一数据源是 C++ 侧 AppTheme（它同时驱动 Qt 内建控件的配色）；
+    // typeof 守卫：未注入时退化为「跟随系统」，不报错。
+    readonly property string currentThemeMode:
+        (typeof AppTheme !== "undefined" && AppTheme.themeMode !== undefined)
+        ? String(AppTheme.themeMode) : "system"
+    readonly property bool systemIsDark:
+        (typeof AppTheme !== "undefined" && AppTheme.isDark !== undefined)
+        ? AppTheme.isDark : false
+
     // ------------------------------------------------------------------
     //  服务器地址三段（QML 侧拆分 / 合并 App.serverUrl）
     // ------------------------------------------------------------------
@@ -307,6 +317,104 @@ Item {
                 color: Theme.textPrimary
                 font.pointSize: Theme.fontTitle + 3
                 font.bold: true
+            }
+
+            // ==========================================================
+            //  ⓪ 外观（主题模式）
+            //  加法式新增卡片：不改动任何既有卡片的结构与顺序。
+            // ==========================================================
+            SectionCard {
+                Layout.fillWidth: true
+                Layout.leftMargin: page.contentMargin
+                Layout.rightMargin: page.contentMargin
+                iconName: "eye"
+                title: qsTr("外观")
+                subtitle: qsTr("选择界面主题。选「跟随系统」时，会随操作系统的深浅色设置自动切换。")
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.spaceS
+
+                    // ---- 分段控件（Segmented control）：三选一 ----
+                    // 为什么不用三个独立按钮：分段控件的"选中"语义更明确（互斥），
+                    // 且占位紧凑 —— 符合效率风的"一行解决一个选择"。
+                    Rectangle {
+                        Layout.alignment: Qt.AlignLeft
+                        implicitWidth: segRow.implicitWidth + 4
+                        implicitHeight: Theme.controlHeight + 4
+                        radius: Theme.radiusControl + 2
+                        color: Theme.surfaceSunken
+                        border.width: 1
+                        border.color: Theme.border
+
+                        RowLayout {
+                            id: segRow
+                            anchors.centerIn: parent
+                            spacing: 2
+
+                            Repeater {
+                                model: [
+                                    { mode: "light",  label: qsTr("浅色") },
+                                    { mode: "dark",   label: qsTr("深色") },
+                                    { mode: "system", label: qsTr("跟随系统") }
+                                ]
+
+                                delegate: Item {
+                                    id: segItem
+
+                                    readonly property bool selected:
+                                        page.currentThemeMode === modelData.mode
+
+                                    Layout.preferredWidth: segLabel.implicitWidth + Theme.spaceL * 2
+                                    Layout.preferredHeight: Theme.controlHeight
+
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        radius: Theme.radiusControl
+                                        color: segItem.selected ? Theme.card
+                                             : (segMouse.containsMouse ? Theme.hover : "transparent")
+                                        border.width: segItem.selected ? 1 : 0
+                                        border.color: Theme.border
+
+                                        Behavior on color { ColorAnimation { duration: Theme.animFast } }
+                                    }
+
+                                    Label {
+                                        id: segLabel
+                                        anchors.centerIn: parent
+                                        text: modelData.label
+                                        color: segItem.selected ? Theme.textPrimary
+                                                                : Theme.textSecondary
+                                        font.pointSize: Theme.fontBody
+                                        font.bold: segItem.selected
+                                    }
+
+                                    MouseArea {
+                                        id: segMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            if (typeof AppTheme !== "undefined")
+                                                AppTheme.setMode(modelData.mode)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- 跟随系统时的实时状态提示 ----
+                    Label {
+                        Layout.fillWidth: true
+                        visible: page.currentThemeMode === "system"
+                        text: qsTr("当前系统为%1主题，已自动跟随。")
+                              .arg(page.systemIsDark ? qsTr("深色") : qsTr("浅色"))
+                        color: Theme.textSecondary
+                        font.pointSize: Theme.fontSecondary
+                        wrapMode: Text.WordWrap
+                    }
+                }
             }
 
             // ==========================================================

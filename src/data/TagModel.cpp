@@ -1,6 +1,5 @@
 /****************************************************************************
- * data/TagModel.cpp —— 标签数据模型（骨架实现）
- * 服务端不支持标签 → rowCount() 恒为 0；仅暴露约定角色名。
+ * data/TagModel.cpp —— 标签列表模型实现
  ****************************************************************************/
 #include "TagModel.h"
 
@@ -10,15 +9,24 @@ TagModel::TagModel(QObject *parent) : QAbstractListModel(parent) {}
 
 int TagModel::rowCount(const QModelIndex &parent) const
 {
-    Q_UNUSED(parent);
-    return 0; // 骨架：无数据行
+    if (parent.isValid())
+        return 0;
+    return m_tags.size();
 }
 
 QVariant TagModel::data(const QModelIndex &index, int role) const
 {
-    Q_UNUSED(index);
-    Q_UNUSED(role);
-    return QVariant(); // 骨架：无数据
+    if (!index.isValid() || index.row() < 0 || index.row() >= m_tags.size())
+        return QVariant();
+
+    const Tag &t = m_tags.at(index.row());
+    switch (role) {
+    case IdRole:    return t.id;
+    case NameRole:  return t.name;
+    case ColorRole: return t.color;
+    case CountRole: return t.count;
+    default:        return QVariant();
+    }
 }
 
 QHash<int, QByteArray> TagModel::roleNames() const
@@ -33,7 +41,38 @@ QHash<int, QByteArray> TagModel::roleNames() const
 
 int TagModel::count() const
 {
-    return 0;
+    return m_tags.size();
+}
+
+void TagModel::setTags(const QVector<Tag> &tags)
+{
+    beginResetModel();
+    m_tags = tags;
+    endResetModel();
+    emit countChanged();
+}
+
+QVariantMap TagModel::at(int row) const
+{
+    QVariantMap m;
+    if (row < 0 || row >= m_tags.size())
+        return m;
+    const Tag &t = m_tags.at(row);
+    m.insert(QStringLiteral("id"), t.id);
+    m.insert(QStringLiteral("name"), t.name);
+    m.insert(QStringLiteral("color"), t.color);
+    m.insert(QStringLiteral("count"), t.count);
+    return m;
+}
+
+void TagModel::clear()
+{
+    if (m_tags.isEmpty())
+        return;
+    beginResetModel();
+    m_tags.clear();
+    endResetModel();
+    emit countChanged();
 }
 
 } // namespace cv

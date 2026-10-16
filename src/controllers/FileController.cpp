@@ -524,6 +524,92 @@ void FileController::createFile(const QString &name)
     refresh();
 }
 
+QVariantList FileController::allFolders()
+{
+    QVariantList out;
+    // 根目录永远可选：把文件移回根是很常见的需求，少了它就等于没法"移出去"
+    {
+        QVariantMap m;
+        m.insert(QStringLiteral("id"), QStringLiteral("root"));
+        m.insert(QStringLiteral("label"), QStringLiteral("根目录"));
+        m.insert(QStringLiteral("depth"), 0);
+        out.append(m);
+    }
+    if (!m_backend)
+        return out;
+
+    const Result<QVector<FileItem>> r = m_backend->listUnderPath(QString());
+    if (!r.ok)
+        return out;
+
+    QStringList dirs;
+    for (const FileItem &f : r.value) {
+        if (f.isDir && !f.path.isEmpty())
+            dirs << f.path;
+    }
+    dirs.sort();   // 按路径排序即树形顺序（父目录一定排在子目录前）
+
+    for (const QString &d : dirs) {
+        QVariantMap m;
+        m.insert(QStringLiteral("id"), d);        // 目录用**路径**作 id
+        m.insert(QStringLiteral("label"), d);
+        m.insert(QStringLiteral("depth"), d.count(QLatin1Char('/')) + 1);
+        out.append(m);
+    }
+    return out;
+}
+
+void FileController::moveTo(const QString &id, const QString &targetParentId)
+{
+    if (!m_backend) {
+        emit errorOccurred(QStringLiteral("未配置数据源"));
+        return;
+    }
+    if (id.isEmpty()) {
+        emit errorOccurred(QStringLiteral("请先选择要移动的文件"));
+        return;
+    }
+
+    const Ok r = m_backend->moveFile(id, targetParentId);
+    if (!r.ok) {
+        emit errorOccurred(friendlyError(r.error));
+        emit logMessage(QStringLiteral("ERROR"), QStringLiteral("移动失败：%1").arg(r.error));
+        return;
+    }
+    emit statusMessage(QStringLiteral("✓ 已移动"), true);
+    emit storageChanged();
+    refresh();
+}
+
+void FileController::renameFolder(const QString &dirPath, const QString &newName)
+{
+    if (!m_backend) {
+        emit errorOccurred(QStringLiteral("未配置数据源"));
+        return;
+    }
+    if (dirPath.isEmpty()) {
+        emit errorOccurred(QStringLiteral("请先选择要重命名的文件夹"));
+        return;
+    }
+    const QString clean = newName.trimmed();
+    QString       why;
+    if (!validSegment(clean, &why)) {
+        emit errorOccurred(why);
+        return;
+    }
+
+    const Ok r = m_backend->renameDir(dirPath, clean);
+    if (!r.ok) {
+        emit errorOccurred(friendlyError(r.error));
+        emit logMessage(QStringLiteral("ERROR"),
+                        QStringLiteral("重命名文件夹失败：%1").arg(r.error));
+        return;
+    }
+    emit statusMessage(QStringLiteral("✓ 文件夹已重命名"), true);
+    emit storageChanged();
+    refresh();
+}
+
 void FileController::rename(const QString &id, const QString &name)
 {
     if (!m_backend) {
@@ -566,16 +652,25 @@ void FileController::remove(const QString &id)
         return;
     }
 
-    // 契约 §8.1：purge = 真实永久删除（服务端 DELETE /api/v1/files/{id}），无回收站
-    const Ok r = m_backend->purge(id);
+    // 软删除（移入回收站）：POST /api/v1/trash，body 二选一 —— {file_id} 或 {dir}。
+    // 语义变化说明（历史：此处曾走 purge 永久删除，因为当时服务端确实没有回收站）：
+    //   · 现在「删除」= 移入回收站，可恢复；真正的永久删除收敛到回收站页的「彻底删除」。
+    //   · 两个口径必须分开讲（实测于 harness A7/A8）：
+    //       磁盘 —— 一个字节都没少（分块引用与 blob 原样保留，内容库不 GC）；
+    //       「已用空间」—— sumSizeOfOwner 带 `WHERE deleted = 0`，进站后**立刻扣除**，
+    //                      所以设置页的用量数字会当场下降。
+    //     即"用量降了、磁盘没释放"。文案不能只说"仍占用空间"，那会和用量数字打架。
+    //   · 目录 id 形如 "dir:照片/2026"，由 net 层 trashTargetBody 翻译成 {dir:"照片/2026"}
+    //     （放 body 而不放路径：http_server 不做百分号解码，含冒号/中文的路径段永远比不中）。
+    const Ok r = m_backend->moveToTrash(id);
     if (!r.ok) {
         const QString msg = friendlyError(r.error);
         emit errorOccurred(msg);
-        emit logMessage(QStringLiteral("ERROR"), QStringLiteral("删除失败：%1").arg(r.error));
+        emit logMessage(QStringLiteral("ERROR"), QStringLiteral("移入回收站失败：%1").arg(r.error));
         return;
     }
 
-    emit statusMessage(QStringLiteral("✓ 已删除（不可恢复）"), true);
+    emit statusMessage(QStringLiteral("✓ 已移入回收站，可在回收站中恢复"), true);
     emit storageChanged();
     refresh();
 }

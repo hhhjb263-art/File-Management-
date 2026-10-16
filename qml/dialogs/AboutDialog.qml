@@ -27,10 +27,20 @@ Dialog {
             Layout.fillWidth: true
             spacing: Theme.spaceM
 
-            Text {
-                text: "☁"
-                font.pointSize: 34
+            // 应用标记（与主窗口 header 同一形态：强调色圆角方块 + 云图标）
+            Rectangle {
+                Layout.alignment: Qt.AlignTop
+                implicitWidth: 44
+                implicitHeight: 44
+                radius: 11
                 color: Theme.primary
+
+                CvIcon {
+                    anchors.centerIn: parent
+                    name: "cloud"
+                    size: 24
+                    color: Theme.textOnPrimary
+                }
             }
             ColumnLayout {
                 Layout.fillWidth: true

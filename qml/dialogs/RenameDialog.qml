@@ -12,6 +12,10 @@ Dialog {
     id: dlg
 
     property string fileId: ""
+    // 加法式：让同一个对话框也能用于"重命名文件夹"，不必再复制一份。
+    property string dialogTitle: qsTr("重命名")
+    property string hintText: qsTr("输入新的文件名称（不能包含 '/' 或 '\\'）")
+    property string okText: qsTr("重命名")
     signal submit(string id, string name)
 
     modal: true
@@ -19,7 +23,7 @@ Dialog {
     width: Math.min(420, (parent ? parent.width - Theme.spaceXl * 2 : 420))
     padding: Theme.spaceL
     closePolicy: Popup.CloseOnEscape
-    title: qsTr("重命名")
+    title: dlg.dialogTitle
     standardButtons: Dialog.NoButton
 
     function openFor(id, currentName) {
@@ -43,7 +47,7 @@ Dialog {
 
         Label {
             Layout.fillWidth: true
-            text: qsTr("输入新的文件名称（不能包含 '/' 或 '\\'）")
+            text: dlg.hintText
             color: Theme.textSecondary
             font.pointSize: Theme.fontSecondary
             wrapMode: Text.WordWrap
@@ -67,7 +71,7 @@ Dialog {
                 onClicked: dlg.close()
             }
             PrimaryButton {
-                text: qsTr("重命名")
+                text: dlg.okText
                 enabled: nameField.text.trim().length > 0
                 onClicked: dlg.trySubmit()
             }

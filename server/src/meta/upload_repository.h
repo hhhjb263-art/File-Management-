@@ -52,6 +52,10 @@ class UploadRepository {
   // 列出某会话全部分块（按 seq 升序）
   bool listChunks(std::int64_t id, std::vector<UploadChunkRow>& out, std::string& err);
 
+  // 列出**全部**会话 id（不限新旧）。启动期清扫"没有主的临时目录"时用它判定：
+  // 目录名 = 会话 id，凡是不在这个集合里的目录都是崩溃残骸。
+  bool listAllIds(std::vector<std::int64_t>& out, std::string& err);
+
   // 写入/覆盖分块（PRIMARY KEY 冲突即覆盖，幂等）
   bool putChunk(std::int64_t id, std::int64_t seq, std::int64_t size,
                 const std::string& sha256, std::string& err);

@@ -8,7 +8,10 @@ HEADERS += \
     $$PWD/SyncController.h \
     $$PWD/TransferController.h \
     $$PWD/ShareController.h \
-    $$PWD/StatsController.h
+    $$PWD/StatsController.h \
+    $$PWD/TrashController.h \
+    $$PWD/TagController.h \
+    $$PWD/VersionController.h
 
 SOURCES += \
     $$PWD/AppController.cpp \
@@ -17,4 +20,7 @@ SOURCES += \
     $$PWD/SyncController.cpp \
     $$PWD/TransferController.cpp \
     $$PWD/ShareController.cpp \
-    $$PWD/StatsController.cpp
+    $$PWD/StatsController.cpp \
+    $$PWD/TrashController.cpp \
+    $$PWD/TagController.cpp \
+    $$PWD/VersionController.cpp

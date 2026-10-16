@@ -36,12 +36,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -56,12 +58,25 @@
 #include "meta/file_repository.h"
 #include "meta/share_repository.h"
 #include "meta/schema_users.h"
+#include "meta/tag_repository.h"
 #include "meta/user_repository.h"
+#include "meta/version_repository.h"
 #include "app/auth_routes.h"
 #include "meta/upload_repository.h"
 #include "app/share_page.h"
 #include "net/http_server.h"
 #include "store/content_store.h"
+#include "store/blob_gc.h"   // 启动期孤儿 blob 回收
+#include "store/scrub.h"        // 主动巡检：发现已经损坏的块
+#include "store/blob_backup.h"  // 内容库副本：备份 + 从副本修复
+#include "core/quota.h"         // 用户空间配额判定（纯逻辑）
+#include "meta/schema_users.h"  // 已在下方用于 users.db
+#include <atomic>
+#include <thread>
+#include "app/db_backup.h"      // 数据库一致性热备
+#include "app/virus_scan.h"     // 恶意文件判定（策略+缓存+可注入远端查询）
+#include <ctime>               // std::strftime（备份目录时间戳）
+#include "store/durable_io.h"   // 落盘屏障（fsync 语义，见 writeAtomicFile / 秒传守卫）
 
 namespace fs = std::filesystem;
 
@@ -93,6 +108,131 @@ cv::json::Value fileToJson(const cv::FileRow& f) {
   v.set("chunks", static_cast<long long>(f.chunkCount));
   v.set("created_at", static_cast<long long>(f.createdAt));
   return v;
+}
+
+// ---- 回收站 / 版本 / 标签的 JSON 序列化 ----
+cv::json::Value versionToJson(const cv::VersionRow& v, bool current) {
+  cv::json::Value o = cv::json::Value::object();
+  o.set("id", static_cast<long long>(v.id));
+  o.set("file_id", static_cast<long long>(v.fileId));
+  o.set("version", static_cast<long long>(v.versionNo));
+  o.set("size", static_cast<long long>(v.size));
+  o.set("hash", v.contentHash);
+  o.set("chunks", static_cast<long long>(v.chunkCount));
+  o.set("device", v.device);
+  o.set("note", v.note);
+  o.set("created_at", static_cast<long long>(v.createdAt));
+  o.set("current", current);
+  return o;
+}
+
+cv::json::Value tagToJson(const cv::TagRow& t) {
+  cv::json::Value o = cv::json::Value::object();
+  o.set("id", static_cast<long long>(t.id));
+  o.set("name", t.name);
+  o.set("color", t.color);
+  o.set("count", static_cast<long long>(t.fileCount));
+  o.set("created_at", static_cast<long long>(t.createdAt));
+  return o;
+}
+
+// 回收站位点：数字文件 id 与目录相对路径**二选一**（同时给出时 dir 优先）。
+//
+// 为什么走 body 而不走 URL 路径参数：http_server::dispatch 把路径段原样塞进 params，
+// **不做百分号解码**，所以 `dir:照片/2026` 这类含冒号 + 中文的组合塞进路径只会得到
+// 一串未解码字节，与库里的路径永远比对不上。放 JSON body 里由解析器解码，干净。
+struct TrashTarget {
+  bool isDir = false;
+  std::int64_t fileId = 0;
+  std::string dir;
+};
+
+bool parseTrashTarget(const cv::json::Value& body, TrashTarget& out, std::string& err) {
+  out = TrashTarget{};
+  const cv::json::Value* pdir = body.find("dir");
+  if (pdir && pdir->type() == cv::json::Value::Type::String && !pdir->stringValue().empty()) {
+    std::string rel;
+    const cv::PathStatus st = cv::sanitizeRelPath(pdir->stringValue(), rel);
+    if (st != cv::PathStatus::Ok) {
+      err = std::string("invalid dir: ") + cv::pathStatusText(st);
+      return false;
+    }
+    out.isDir = true;
+    out.dir = rel;
+    return true;
+  }
+  const cv::json::Value* pid = body.find("file_id");
+  if (!pid || pid->type() != cv::json::Value::Type::Number) {
+    err = "missing file_id or dir";
+    return false;
+  }
+  out.fileId = static_cast<std::int64_t>(pid->numberValue());
+  if (out.fileId <= 0) {
+    err = "invalid file_id";
+    return false;
+  }
+  return true;
+}
+
+// 展开相对路径的全部前缀链："a/b/c" → ["a", "a/b", "a/b/c"]；根目录（空串）→ 空列表。
+// 用途：恢复/兜底登记时，"文件要回到 a/b/c"意味着 a、a/b、a/b/c 三层目录都得在。
+std::vector<std::string> pathPrefixChain(const std::string& path) {
+  std::vector<std::string> chain;
+  std::string cur;
+  std::size_t start = 0;
+  while (start <= path.size()) {
+    const std::size_t slash = path.find('/', start);
+    const std::string seg =
+        path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+    if (seg.empty()) break;
+    cur = cur.empty() ? seg : (cur + "/" + seg);
+    chain.push_back(cur);
+    if (slash == std::string::npos) break;
+    start = slash + 1;
+  }
+  return chain;
+}
+
+// ASCII 小写化（非 ASCII 字节原样保留 —— 必须走 unsigned char，否则中文字节上
+// 直接调 tolower 是 UB）。检索的关键词匹配用。
+std::string asciiLower(std::string s) {
+  for (char& c : s) {
+    const unsigned char u = static_cast<unsigned char>(c);
+    if (u >= 'A' && u <= 'Z') c = static_cast<char>(u - 'A' + 'a');
+  }
+  return s;
+}
+
+// 按扩展名归类，取值与客户端 core/Types.h 的 FileType 枚举顺序**严格一致**：
+// 0 文件夹 1 文档 2 图片 3 视频 4 音频 5 压缩包 6 代码 7 其它
+int fileTypeOf(const std::string& name) {
+  const std::size_t dot = name.find_last_of('.');
+  if (dot == std::string::npos || dot + 1 >= name.size()) return 7;
+  const std::string ext = asciiLower(name.substr(dot + 1));
+
+  static const char* kDoc[] = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+                               "txt", "md",   "rtf",  "odt", "ods",  "csv"};
+  static const char* kImg[] = {"jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico", "heic"};
+  static const char* kVideo[] = {"mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v"};
+  static const char* kAudio[] = {"mp3", "wav", "flac", "aac", "ogg", "m4a", "wma"};
+  static const char* kArchive[] = {"zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"};
+  static const char* kCode[] = {"c",    "h",   "cpp",  "hpp",  "cc",  "py",   "js",  "ts",
+                                "java", "go",  "rs",   "rb",   "php", "sh",   "bat", "ps1",
+                                "html", "css", "json", "xml",  "yaml", "yml", "toml", "sql"};
+
+  auto in = [&ext](const char* const* arr, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+      if (ext == arr[i]) return true;
+    }
+    return false;
+  };
+  if (in(kDoc, sizeof(kDoc) / sizeof(kDoc[0]))) return 1;
+  if (in(kImg, sizeof(kImg) / sizeof(kImg[0]))) return 2;
+  if (in(kVideo, sizeof(kVideo) / sizeof(kVideo[0]))) return 3;
+  if (in(kAudio, sizeof(kAudio) / sizeof(kAudio[0]))) return 4;
+  if (in(kArchive, sizeof(kArchive) / sizeof(kArchive[0]))) return 5;
+  if (in(kCode, sizeof(kCode) / sizeof(kCode[0]))) return 6;
+  return 7;
 }
 
 // 分块总数：size 为 0 时返回 0（空文件无分块）
@@ -228,35 +368,12 @@ std::string partPath(const cv::Config& cfg, std::int64_t id, std::int64_t seq) {
 // 原子写文件：先写 .tmp 再 rename，保证落盘一致性
 bool writeAtomicFile(const std::string& finalPath, const std::string& data,
                      std::string& err) {
-  // 父目录可能不存在：按 owner 隔离后镜像新增了 u<ownerId>/ 层级（真机实测：
-  // 每次上传都报 cannot open tmp for write: /files/u1/xxx.tmp —— 目录没建）。
-  // create_directories 对已存在目录是幂等空操作。
-  std::error_code dec;
-  fs::create_directories(fs::path(finalPath).parent_path(), dec);
-  std::string tmp = finalPath + ".tmp";
-  {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-      err = "cannot open tmp for write: " + tmp;
-      return false;
-    }
-    if (!data.empty()) {
-      out.write(data.data(), static_cast<std::streamsize>(data.size()));
-    }
-    out.flush();
-    if (!out.good()) {
-      err = "write failed: " + tmp;
-      return false;
-    }
-  }
-  std::error_code ec;
-  fs::rename(tmp, finalPath, ec);
-  if (ec) {
-    fs::remove(tmp, ec);
-    err = "rename failed: " + ec.message();
-    return false;
-  }
-  return true;
+  // 原子 + 持久的写盘已收敛到 store/durable_io.h。
+  // 原实现是 `ofstream::flush() + rename`：flush 只把数据推进**页缓存**，不是落盘屏障，
+  // 所以断电后可能出现"分块文件在、内容不在（长度 0 或截断）"。
+  // 现在由 durable::writeFileAtomic 负责：写临时文件 → fsync → rename → fsync 父目录。
+  // 它同样会按需创建父目录（历史真机踩过"cannot open tmp for write: /files/u1/xxx.tmp"）。
+  return cv::durable::writeFileAtomic(finalPath, data, err);
 }
 
 // 读整个文件到字符串（分块大小有限，内存占用只约一个分块）
@@ -351,6 +468,29 @@ std::string queryParam(const std::string& query, const std::string& key) {
   }
   return "";
 }
+
+// query 里是否**显式出现**了某键。与 queryParam 的区别：空值也算"出现"。
+// 为什么需要它：`?dir=` 表示"根目录"，必须与"根本没传 dir"区分开 ——
+// 否则根目录要么永远列不出文件，要么变成"不过滤"把整个库拉回来。
+bool queryHasKey(const std::string& query, const std::string& key) {
+  std::size_t start = 0;
+  while (start <= query.size()) {
+    std::size_t amp = query.find('&', start);
+    std::string item =
+        query.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
+    if (!item.empty()) {
+      std::size_t eq = item.find('=');
+      if ((eq == std::string::npos ? item : item.substr(0, eq)) == key) return true;
+    }
+    if (amp == std::string::npos) break;
+    start = amp + 1;
+  }
+  return false;
+}
+
+// 文件列表分页参数
+constexpr std::int64_t kDefaultFileListLimit = 1000;  // 不传 limit 时的每页条数
+constexpr std::int64_t kMaxFileListLimit = 5000;      // 防止 limit 被用来拉爆服务端内存
 
 // 目录/路径参数的统一入口：清洗 + 校验。
 // 空 = 根目录（放行，out 置空）；穿越/绝对路径 → 403 越界；
@@ -469,6 +609,29 @@ bool checkSpaceForUpload(const cv::Config& cfg, std::int64_t size,
   return true;
 }
 
+// 秒传 / 断点复用前的**磁盘完整性守卫**。
+//
+// 为什么必须有：内容哈希相同**不代表内容真的还在**。服务端没有任何 fsync 屏障时，
+// 掉电可能留下 0 字节或截断的 blob（名字在、数据没落盘），而
+//   · `ContentStore::exists()` 只看"文件在不在"，不看内容；
+//   · `ContentStore::get()` 读出来直接用，也不校验哈希。
+// 于是秒传一旦放行，坏内容就被**永久固化** —— 相同内容再传仍然命中，永远不会重传，
+// ref_count 还在、GC 也不会碰它。
+//
+// 代价：逐块只做 stat + 尺寸比对（N 次系统调用，相对网络传输可忽略），**不做全量哈希**，
+// 所以不会把秒传变成"每次都读一遍整文件"。尺寸不符是断电的典型表现（0 长度/截断），
+// 这一步足以把绝大多数损坏挡在门外；调用方据此退回正常上传以覆盖修复。
+bool chunksIntactOnDisk(const cv::ContentStore& store,
+                        const std::vector<std::string>& hashes,
+                        const std::vector<std::size_t>& sizes) {
+  for (std::size_t i = 0; i < hashes.size(); ++i) {
+    const std::int64_t expect =
+        i < sizes.size() ? static_cast<std::int64_t>(sizes[i]) : 0;
+    if (!store.sizeMatches(hashes[i], expect)) return false;
+  }
+  return true;
+}
+
 // 删除一批「引用计数归零」的 blob，返回实际释放的字节数（失败仅告警，不阻断主流程）
 std::int64_t dropOrphanBlobs(cv::ContentStore& store,
                              const std::vector<std::string>& orphanHashes) {
@@ -486,7 +649,86 @@ std::int64_t dropOrphanBlobs(cv::ContentStore& store,
   return freed;
 }
 
+// 版本保留策略（PRD FR-4-2）落地：每次产生新版本后按「条数 + 天数双限取先到者」清理，
+// 并把因此引用计数归零的 blob 真正删掉。
+//
+// 为什么必须接线：每次覆盖 / 回滚都会先 captureCurrent() 留一份快照，若不清理就是
+// **磁盘只涨不降**，而且用户完全看不到增长来源（版本占用没有单独展示）。
+// 之前 pruneVersions() 有实现却零调用，等于这条策略从未生效。
+//
+// 安全性：pruneVersions 内部只删「序号超出 keep」或「早于 cutoff」的版本；
+// 刚创建的那一版必然是最新且未过期 ⇒ 永远不会被自己刚生成的快照清掉。
+// 失败只告警、不阻断主流程 —— 版本多留几条远比让上传失败好。
+void pruneVersionsAndFree(cv::VersionRepository& ver, cv::ContentStore& store,
+                          const cv::Config& cfg, std::int64_t fileId) {
+  const std::int64_t keep = cfg.versionKeepCount;
+  const std::int64_t days = cfg.versionRetentionDays;
+  if (keep <= 0 && days <= 0) return;   // 两项都不限：按配置不清理
+
+  // created_at 是 Unix 毫秒（与 version_repository 写入口径一致）
+  std::int64_t cutoff = 0;   // 0 = 不限天数
+  if (days > 0) {
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    cutoff = static_cast<std::int64_t>(nowMs) - days * 86400000LL;
+  }
+
+  std::vector<std::string> orphans;
+  std::string perr;
+  if (!ver.pruneVersions(fileId, keep, cutoff, orphans, perr)) {
+    CV_LOG_WARN("版本清理失败 file_id=" << fileId << "：" << perr);
+    return;
+  }
+  if (orphans.empty()) return;
+  const std::int64_t freed = dropOrphanBlobs(store, orphans);
+  CV_LOG_INFO("版本清理 file_id=" << fileId << " 释放 blob " << orphans.size()
+                                  << " 个，" << freed << " 字节");
+}
+
 // 按文件行提供内容（整文件 / Range 分块复用）。调用方已完成鉴权与存在性检查。
+// 把 [rstart, rend] 这段内容以**流式**挂到响应上：每块 ≤ kMaxRangeSpan，内存占用有界。
+// 镜像可用时按文件顺序读（连续、对页缓存友好）；否则按分块拼装（静态加密库必然走这条）。
+//
+// ⚠️ lambda 是在 serveFileContent 返回之后、由 HTTP 层边写边调的，所以：
+//    · hashes 必须**按值**搬运（用 shared_ptr 持有），不能悬空引用局部变量；
+//    · store 是 main() 级对象，引用安全；
+//    · 中途读失败没法再改状态码（响应头已发出）——只结束，客户端会因长度不符判失败，
+//      这比静默回一份内容不对的数据要好。
+void attachStreamBody(cv::net::Response& resp, cv::ContentStore& store,
+                      const std::vector<std::string>& hashes, const std::string& mirrorPath,
+                      bool useMirror, std::int64_t rstart, std::int64_t rend,
+                      std::int64_t fileId) {
+  resp.streamLength = rend - rstart + 1;
+  auto cursor = std::make_shared<std::int64_t>(rstart);
+  auto mir    = std::make_shared<std::ifstream>();
+  if (useMirror) mir->open(mirrorPath, std::ios::binary);
+  const bool mirOk = mir->is_open();
+  auto       hs    = std::make_shared<std::vector<std::string>>(hashes);
+
+  resp.nextChunk = [&store, hs, cursor, mir, mirOk, rend, fileId](std::string& out) -> bool {
+    if (*cursor > rend) return false;
+    const std::int64_t n = std::min<std::int64_t>(kMaxRangeSpan, rend - *cursor + 1);
+    if (mirOk) {
+      mir->clear();   // 清掉上一轮 read 的 eof/fail 位，否则第二次 seek 之后读不出来
+      mir->seekg(*cursor);
+      out.assign(static_cast<std::size_t>(n), '\0');
+      mir->read(out.empty() ? nullptr : &out[0], n);
+      out.resize(static_cast<std::size_t>(mir->gcount()));
+      *cursor += static_cast<std::int64_t>(out.size());
+      return !out.empty();
+    }
+    std::string part, e;
+    if (!store.readRange(*hs, *cursor, n, part, e)) {
+      CV_LOG_WARN("流式下载读分块失败 id=" << fileId << " offset=" << *cursor << ": " << e);
+      return false;
+    }
+    *cursor += static_cast<std::int64_t>(part.size());
+    out = std::move(part);
+    return !out.empty();
+  };
+}
+
 void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const cv::Config& cfg,
                       const cv::FileRow& row,
                       const cv::net::Request& req, cv::net::Response& resp) {
@@ -544,10 +786,10 @@ void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const c
       resp.setError(416, "range not satisfiable");
       return;
     }
-    // 跨度保护：`bytes=0-` 这类开放区间也只回 kMaxRangeSpan 字节（客户端按段续拉）
-    if (rend - rstart + 1 > kMaxRangeSpan) {
-      rend = rstart + kMaxRangeSpan - 1;
-    }
+    // ⚠️ 这里**曾经**把跨度过大的区间截断到 kMaxRangeSpan，再按截断后的区间回 206。
+    //    那是给"我们自己的客户端"设计的（它会按段续拉），但**浏览器不会**：
+    //    浏览器收到长度短于它请求区间的 206，就判定响应异常 → 报"网络错误，无法下载"。
+    //    现在改成：小跨度照旧整份回；大跨度走**流式**（不截断，内存仍每块 ≤ kMaxRangeSpan）。
     std::int64_t len = rend - rstart + 1;
 
     // 快路径：文件树镜像存在且大小吻合 → 直接顺序读该文件。
@@ -555,6 +797,23 @@ void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const c
     // 也对操作系统预读 / 页缓存友好。镜像可能缺失（空间不足被跳过 / 旧版本上传），
     // 此时回退到按分块拼装，行为不变。
     // 静态加密开启时镜像落盘已被自动关闭，故强制走「分块拼装 + 解密」（日志显示 [分块拼装]）。
+    // ---- 大跨度：流式回（既不截断，也不把整份拼进内存）----
+    if (len > kMaxSingleShotDownload) {
+      const std::string mirrorPath = mirrorPathFor(cfg, row.ownerId, row.dir, row.name);
+      std::error_code   mec;
+      const bool useMirror =
+          !store.encryptionEnabled() &&
+          fs::file_size(mirrorPath, mec) == static_cast<std::uintmax_t>(total) && !mec;
+      resp.extraHeaders["Accept-Ranges"] = "bytes";
+      resp.extraHeaders["Content-Range"] = "bytes " + std::to_string(rstart) + "-" +
+                                          std::to_string(rend) + "/" + std::to_string(total);
+      resp.contentType = "application/octet-stream";
+      attachStreamBody(resp, store, hashes, mirrorPath, useMirror, rstart, rend, row.id);
+      CV_LOG_INFO("下载(流式 206) id=" << row.id << " range=" << rstart << "-" << rend
+                                      << (useMirror ? " [镜像直读]" : " [分块拼装]"));
+      return;
+    }
+
     std::string slice;
     bool servedFromMirror = false;
     {
@@ -596,11 +855,17 @@ void serveFileContent(cv::FileRepository& repo, cv::ContentStore& store, const c
   // 无 Range：整文件下载。大文件拒绝一次性回发，要求客户端用 Range 分段拉取，
   // 否则服务端 getChunked 会把整个文件拼进内存（内存占用 ~ 文件大小）。
   if (total > kMaxSingleShotDownload) {
-    cv::json::Value v = cv::json::Value::object();
-    v.set("error", "file too large for single-shot download; use Range requests");
-    v.set("size", static_cast<long long>(total));
-    v.set("max_single_shot", static_cast<long long>(kMaxSingleShotDownload));
-    resp.setJson(409, cv::json::dump(v));
+    // 这里**曾经**回 409，让客户端改用 Range。问题是浏览器根本不懂这个约定：
+    // 它点下载 → 拿到一坨 JSON → 报"网络错误，无法下载"。现在改为流式回整份。
+    const std::string mirrorPath = mirrorPathFor(cfg, row.ownerId, row.dir, row.name);
+    std::error_code   mec;
+    const bool        useMirror =
+        !store.encryptionEnabled() &&
+        fs::file_size(mirrorPath, mec) == static_cast<std::uintmax_t>(total) && !mec;
+    resp.contentType = "application/octet-stream";
+    attachStreamBody(resp, store, hashes, mirrorPath, useMirror, 0, total - 1, row.id);
+    CV_LOG_INFO("下载(流式 200) id=" << row.id << " size=" << total
+                                    << (useMirror ? " [镜像直读]" : " [分块拼装]"));
     return;
   }
   std::string content;
@@ -772,6 +1037,91 @@ std::vector<std::int64_t> buildUploaded(const cv::Config& cfg,
 
 }  // namespace
 
+// 取某个用户的空间配额（PRD FR-1-4）。
+//   · 未启用账号体系（userId < 1，静态 token 模式）⇒ 不限
+//   · users.quota_bytes 为 0 ⇒ 回落到 --user-quota 的默认值（0 也是不限）
+std::int64_t userQuotaBytes(cv::Db& usersDb, const cv::Config& cfg, std::int64_t userId) {
+  if (userId < 1) return 0;
+  std::vector<std::vector<std::string>> rows;
+  std::string                           err;
+  // userId 是 std::int64_t，由我们格式化进 SQL；不存在用户可控字符串注入
+  if (!usersDb.query("SELECT COALESCE(quota_bytes, 0) FROM users WHERE id = " +
+                         std::to_string(userId),
+                     rows, err))
+    return 0;
+  if (rows.empty() || rows[0].empty()) return 0;
+  std::int64_t q = 0;
+  try {
+    q = std::stoll(rows[0][0]);
+  } catch (...) {
+    return 0;
+  }
+  return q > 0 ? q : cfg.defaultUserQuotaBytes;
+}
+
+// 配额拦截（PRD FR-7-6：≥80% 提醒；≥95% 阻止新上传并明确原因）。
+// 返回 true = 放行；false = **已经写好响应**，调用方直接 return。
+bool enforceQuota(cv::Db& usersDb, cv::FileRepository& repo, const cv::Config& cfg,
+                  std::int64_t ownerId, std::int64_t incoming, cv::net::Response& resp) {
+  const std::int64_t quota = userQuotaBytes(usersDb, cfg, ownerId);
+  if (quota <= 0) return true;   // 不限
+
+  std::int64_t used = 0;
+  std::string  serr;
+  if (!repo.sumSizeOfOwner(ownerId, used, serr)) {
+    // 取不到用量时**放行 + 大声记日志**。这是个刻意的取舍：配额是防"把盘写满"的运维阈值，
+    // 不是安全边界；为一次数据库抖动就把所有人的上传全拒掉，代价比超一点配额大得多。
+    CV_LOG_WARN("配额检查跳过（读不到用量，按不限处理）: " << serr);
+    return true;
+  }
+
+  const cv::quota::Decision d = cv::quota::evaluate(used, quota, incoming);
+  if (d.verdict == cv::quota::Verdict::Reject) {
+    resp.setError(413, d.reason);   // 413 Payload Too Large
+    CV_LOG_WARN("拒绝上传（配额）: " << d.reason);
+    return false;
+  }
+  if (d.verdict == cv::quota::Verdict::Warn) CV_LOG_WARN("配额预警: " << d.reason);
+  return true;
+}
+
+// 恶意文件判定（清单 8.2 / 8.5）。返回 true = 放行；false = 已写好响应。
+// ⚠️ 定位：这是**尽力而为的闸门**，不是安全边界 —— 默认 fail-open，远端服务抖动不该让网盘不可用。
+bool enforceVirusScan(cv::Db& db, const cv::Config& cfg, const cv::scan::Fetcher& fetcher,
+                      const std::string& contentHash, const std::string& name,
+                      cv::net::Response& resp) {
+  if (!cfg.scanEnabled) return true;
+  // 非 64 位小写十六进制（空文件 / 异常路径）不查：查询键必须严格
+  if (contentHash.size() != 64) return true;
+
+  cv::scan::Policy policy;
+  policy.blockThreshold = cfg.scanBlockThreshold;
+  policy.failOpen       = cfg.scanFailOpen;
+
+  const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+  std::string            serr;
+  const cv::scan::Result r = cv::scan::scan(db, contentHash, fetcher, policy,
+                                            static_cast<std::int64_t>(nowMs),
+                                            /*cacheEnabled=*/true, serr);
+  if (!serr.empty()) CV_LOG_WARN("病毒扫描缓存读写异常: " << serr);
+
+  if (r.decision == cv::scan::Decision::Block) {
+    resp.setError(403, "文件未通过安全检测（" + cv::scan::verdictName(r.verdict) + "）：" +
+                           r.detail + "。如确认是误报，请联系管理员调整判定阈值。");
+    CV_LOG_WARN("拒绝上传（恶意文件判定）: " << name << " | " << cv::scan::verdictName(r.verdict)
+                                            << " | " << r.detail);
+    return false;
+  }
+  if (r.fetcherFailed)
+    CV_LOG_WARN("恶意文件判定未取得远端结论，按策略放行: " << name << " | " << r.detail);
+  else if (r.decision == cv::scan::Decision::AllowWithWarn)
+    CV_LOG_WARN("恶意文件判定提示: " << name << " | " << cv::scan::verdictName(r.verdict) << " | "
+                                    << r.detail);
+  return true;
+}
+
 int main(int argc, char** argv) {
   using namespace cv;
 
@@ -789,6 +1139,32 @@ int main(int argc, char** argv) {
     CV_LOG_ERROR("创建数据目录失败: " << ec.message());
     return 1;
   }
+
+  // ---- 备份模式：--backup-db=<dir> 只做一次一致性热备然后退出，不启动服务 ----
+  // 放在「目录已建、日志已就绪」之后、「打开任何库 / 监听端口」之前：
+  // 此时本进程没有任何在途写入，且用的是 VACUUM INTO（只读源库）⇒ 服务端在跑也能安全备份。
+  // 每次备份落到独立的 <dir>/<时间戳>/ 子目录：绝不覆盖上一份（备份最忌讳悄悄盖旧）。
+  if (!cfg.backupDbDir.empty()) {
+    char stamp[32] = {0};
+    const std::time_t nowT = std::time(nullptr);
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&nowT));
+    const std::string outDir = cfg.backupDbDir + "/" + stamp;
+
+    cv::dbbackup::Stats bst;
+    std::string         berr;
+    if (!cv::dbbackup::backupAll(cfg, outDir, bst, berr)) {
+      CV_LOG_ERROR("数据库备份失败: " << berr);
+      return 1;
+    }
+    for (const std::string& p : bst.written) CV_LOG_INFO("已备份 " << p);
+    for (const std::string& p : bst.skipped) CV_LOG_WARN("已跳过 " << p);
+    CV_LOG_INFO("数据库备份完成：文件 " << bst.written.size() << " 个，共 " << bst.bytes
+                                      << " 字节 → " << outDir);
+    CV_LOG_INFO("恢复方式：停服后用备份文件覆盖 <dataDir>/meta/ 下同名文件，"
+                "并删除残留的 -wal / -shm，再重启。");
+    return 0;
+  }
+
 
   ContentStore store(cfg.blobRoot());
   if (!store.init(err)) {
@@ -836,10 +1212,25 @@ int main(int argc, char** argv) {
 
   // ---- 账号数据库：**独立文件** users.db（与文件元数据分离，备份/权限策略互不影响）----
   Db usersDb;
-  const std::string usersDbPath = cfg.dataDir + "/meta/users.db";
+  const std::string usersDbPath = cfg.usersDbPath();   // 路径定义收敛到 Config，避免两处漂移
   if (!usersDb.open(usersDbPath, err)) {
     CV_LOG_ERROR("打开账号数据库失败: " << err);
     return 1;
+  }
+  // users.db 加列迁移（PRD FR-1-4）：老库的 users 表没有 quota_bytes，而
+  // `CREATE TABLE IF NOT EXISTS` 对已存在的表是**空操作**，不会补列 —— 必须显式 ALTER。
+  // 放在 exec(schema) **之前**：此刻新库的表还不存在，PRAGMA 返回 0 行 → 跳过 ALTER，
+  // 随后由 CREATE 直接带上该列；老库则在这里补列。两种情形都覆盖到。
+  {
+    std::vector<std::vector<std::string>> cols;
+    std::string                           merr;
+    if (usersDb.query("PRAGMA table_info(users)", cols, merr) && !cols.empty()) {
+      bool has = false;
+      for (const auto& r : cols)
+        if (r.size() > 1 && r[1] == "quota_bytes") has = true;
+      if (!has)
+        usersDb.exec("ALTER TABLE users ADD COLUMN quota_bytes INTEGER NOT NULL DEFAULT 0", merr);
+    }
   }
   if (!usersDb.exec(kUsersSchemaSql, err)) {
     CV_LOG_ERROR("账号库建表失败: " << err);
@@ -849,7 +1240,27 @@ int main(int argc, char** argv) {
 
   FileRepository repo(db);
   UploadRepository up(db);
+
+  // 恶意文件判定：建表（幂等，按**内容哈希**存判定 ⇒ 同一内容跨文件跨用户只查一次）+ 装配远端查询。
+  if (!cv::scan::initSchema(db, err)) CV_LOG_WARN("病毒扫描判定表创建失败: " << err);
+  // ⚠️ 远端查询实现**本仓库尚未提供**：服务端是零第三方依赖 + 自研 POSIX socket，
+  //    要发 HTTPS 必须自己写 HTTP 客户端并依赖 OpenSSL（本项目里 OpenSSL 是**可选**编译项）。
+  //    这里按能力装配：没有实现就留空 ⇒ scan() 走 fail-open 并记录原因，
+  //    功能退化为"只读本地缓存"，**不会发起任何外网请求、也不会让上传失败**。
+  cv::scan::Fetcher scanFetcher =
+      cv::scan::makeVirusTotalFetcher(cfg.scanApiKey, cfg.scanTimeoutMs);
+  if (cfg.scanEnabled && !scanFetcher)
+    CV_LOG_WARN("已启用恶意文件判定但未提供 API Key —— 只会使用本地缓存判定，不会发起外网请求。");
+  if (cfg.scanEnabled)
+    CV_LOG_INFO("远端查询：VirusTotal v3（www.virustotal.com，超时 " << cfg.scanTimeoutMs
+                                                                 << " ms，只发内容哈希）");
+  if (cfg.scanEnabled)
+    CV_LOG_INFO("恶意文件判定已启用：按内容哈希查询（文件本身不出服务器），"
+                "报毒引擎数 ≥ " << cfg.scanBlockThreshold << " 即拒绝，远端失败时"
+                << (cfg.scanFailOpen ? "放行" : "拒绝"));
   ShareRepository shr(db);
+  VersionRepository ver(db);
+  TagRepository tagRepo(db);
   net::HttpServer server;
 
   // 启用 API Bearer Token 鉴权（空 = 不启用，向后兼容）
@@ -910,6 +1321,33 @@ int main(int argc, char** argv) {
       }
     } else {
       CV_LOG_WARN("会话 GC 扫描失败: " << err);
+    }
+  }
+
+  // ---- 启动期：清扫**没有对应会话行**的临时目录（崩溃残骸）----
+  // 上面那个会话 GC 只能清"数据库里有的会话"，而崩溃可能死在建目录与插会话行之间，
+  // 留下一个无主目录 —— 会话 GC 永远碰不到它，也不在 blobRoot 里（blob_gc 不管 tmp）。
+  {
+    std::vector<std::int64_t> liveIds;
+    if (up.listAllIds(liveIds, err)) {
+      const std::set<std::int64_t> active(liveIds.begin(), liveIds.end());
+      cv::blobgc::TmpStats tst;
+      std::string         terr;
+      const auto          nowMs2 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+      if (cv::blobgc::collectOrphanTmpDirs(cfg.tmpRoot() + "/uploads", active,
+                                          /*graceMillis=*/3600LL * 1000LL,
+                                          static_cast<std::int64_t>(nowMs2), false, tst, terr)) {
+        if (tst.removed > 0)
+          CV_LOG_INFO("临时目录清扫：删除 " << tst.removed << " 个无主目录，释放 "
+                                            << tst.freedBytes << " 字节（保留：有主 "
+                                            << tst.keptActive << "，宽限期内 " << tst.keptFresh << "）");
+      } else {
+        CV_LOG_WARN("临时目录清扫失败（不影响启动）: " << terr);
+      }
+    } else {
+      CV_LOG_WARN("临时目录清扫跳过：无法取得会话清单 " << err);
     }
   }
 
@@ -986,10 +1424,25 @@ int main(int argc, char** argv) {
       return;
     }
 
+    // 配额拦截：单发上传也要拦（大文件走分块通道，但这条路径同样能写盘）
+    if (!enforceQuota(usersDb, repo, cfg, oid, static_cast<std::int64_t>(data.size()), resp))
+      return;
+    // 恶意文件判定：同样按内容哈希查
+    if (!enforceVirusScan(db, cfg, scanFetcher, contentHash, name, resp)) return;
+
     std::int64_t id = 0;
     if (nameTaken) {
       // 覆盖：保留原 id 与名称，替换内容与分块清单
       id = sameName.id;
+      // ★ 覆盖前先把旧内容存成一条历史版本 —— 否则"覆盖"就是变相的数据丢失，
+      //   而且用户在界面上会觉得"我只是传错了一版，居然找不回来了"。零拷贝，不额外占盘。
+      std::int64_t snapshotVid = 0;
+      err.clear();
+      if (!ver.captureCurrent(id, std::string(), "覆盖前备份", snapshotVid, err)) {
+        resp.setError(500, std::string("db failed: ") + err);
+        return;
+      }
+      pruneVersionsAndFree(ver, store, cfg, id);   // FR-4-2：覆盖后按策略清理旧版本
       std::vector<std::string> orphans;
       if (!repo.replaceContent(id, static_cast<std::int64_t>(data.size()), contentHash,
                                chunkHashes, chunkSizes, orphans, err)) {
@@ -1190,7 +1643,63 @@ int main(int argc, char** argv) {
                  CV_LOG_INFO("重命名 id=" << id << " " << row.name << " -> " << newName);
                });
 
-  // ---- DELETE /api/v1/files/:id （软删除 + 删镜像）----
+  // ---- DELETE /api/v1/files/:id （软删除 → 进回收站）----
+  // 语义变更（配合回收站落地）：本端点从"永久删除"改为"移入回收站"。
+  // 彻底删除改走 POST /api/v1/trash/purge。理由：界面上「删除」按钮的直觉就是
+  // 「先扔进回收站，后悔还来得及」，而不是当场灰飞烟灭。
+  // 进站**不释放**任何空间：不删镜像、不减引用计数 —— 否则恢复就成了空话。
+  // ---- POST /api/v1/files/:id/move （把文件移动到另一个目录）----
+  // body: { "dir": "<目标目录，空串 = 根>" }
+  // 元数据由仓储层改（纯元数据、单事务）；磁盘镜像用 fs::rename 同步搬移
+  // —— 是 O(1) 改名，**不遍历复制任何物理文件**。镜像失败只告警：DB 才是权威。
+  server.route("POST", "/api/v1/files/:id/move",
+               [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    const std::int64_t oid = scopeOwner(req.authUserId);
+    std::int64_t id = 0;
+    if (!parseId(req.param("id"), id)) {
+      resp.setError(404, "file not found");
+      return;
+    }
+    json::Value body = parseJsonBody(req.body, perr);
+    if (!perr.empty()) {
+      resp.setError(400, "invalid json: " + perr);
+      return;
+    }
+    const json::Value* pdir = body.find("dir");
+    if (!pdir || pdir->type() != json::Value::Type::String) {
+      resp.setError(400, "missing dir");
+      return;
+    }
+    std::string newDir;
+    if (!sanitizeDirParam(pdir->stringValue(), newDir, resp)) return;   // 空串 = 根，合法
+
+    cv::FileRow before;
+    // owner 不匹配一律按"查不到"处理，避免泄漏他人文件是否存在
+    if (!repo.findById(id, before, perr) || before.ownerId != oid) {
+      resp.setError(404, "file not found");
+      return;
+    }
+
+    if (!repo.moveFileToDir(oid, id, newDir, perr)) {
+      resp.setError(perr == "file not found" ? 404 : 409, perr);
+      return;
+    }
+
+    std::error_code rec;
+    if (before.dir != newDir) {
+      fs::rename(mirrorPathFor(cfg, oid, before.dir, before.name),
+                 mirrorPathFor(cfg, oid, newDir, before.name), rec);
+      if (rec) CV_LOG_WARN("移动文件镜像失败（元数据已更新）: " << rec.message());
+    }
+
+    json::Value v = json::Value::object();
+    v.set("id", static_cast<long long>(id));
+    v.set("dir", newDir);
+    resp.setJson(200, json::dump(v));
+    CV_LOG_INFO("移动文件 " << before.name << " → " << (newDir.empty() ? "(根)" : newDir));
+  });
+
   server.route("DELETE", "/api/v1/files/:id",
                [&](const net::Request& req, net::Response& resp) {
                  std::string perr;
@@ -1209,30 +1718,19 @@ int main(int argc, char** argv) {
                    resp.setError(404, "file not found");
                    return;
                  }
-                 std::vector<std::string> orphans;
-                 if (!repo.softDelete(id, orphans, perr)) {
+                 const std::int64_t nowMs = nowMillis();
+                 if (!repo.trashFile(id, nowMs, perr)) {
                    resp.setError(500, std::string("db failed: ") + perr);
                    return;
                  }
-                 // 释放磁盘空间：删镜像 + 删引用计数归零的 blob
-                 std::error_code rec;
-                 const auto mirrorSize = fs::file_size(mirrorPathFor(cfg, row.ownerId, row.dir, row.name), rec);
-                 fs::remove(mirrorPathFor(cfg, row.ownerId, row.dir, row.name), rec);
-                 const std::int64_t freedBlob = dropOrphanBlobs(store, orphans);
-                 const std::int64_t freedMirror = rec ? 0 : static_cast<std::int64_t>(mirrorSize);
                  json::Value v = json::Value::object();
-                 v.set("deleted", true);
+                 v.set("trashed", true);
                  v.set("file_id", static_cast<long long>(id));
                  v.set("name", row.name);
                  v.set("dir", row.dir);
-                 v.set("freed_bytes", static_cast<long long>(freedBlob + freedMirror));
-                 v.set("blobs_removed", static_cast<long long>(orphans.size()));
-                 v.set("disk_free_bytes",
-                       static_cast<long long>(diskFreeBytes(cfg.dataDir)));
+                 v.set("deleted_at", static_cast<long long>(nowMs));
                  resp.setJson(200, json::dump(v));
-                 CV_LOG_INFO("删除文件 id=" << id << " dir=" << row.dir << " name=" << row.name
-                                            << " 释放 " << (freedBlob + freedMirror)
-                                            << " 字节（blob " << orphans.size() << " 个）");
+                 CV_LOG_INFO("移入回收站 id=" << id << " dir=" << row.dir << " name=" << row.name);
                });
 
   // ---- GET /api/v1/storage （磁盘空间自查）----
@@ -1257,25 +1755,74 @@ int main(int argc, char** argv) {
       std::int64_t used = 0;
       if (repo.sumSizeOfOwner(req.authUserId, used, perr)) {
         v.set("used_bytes", static_cast<long long>(used));
+    // 配额（PRD FR-1-4 / FR-7-6）：客户端据此显示余量并在 ≥80% 时提醒。
+    // quota_bytes = 0 表示不限（前端不要拿它做除法）。
+    {
+      const std::int64_t quota = userQuotaBytes(usersDb, cfg, scopeOwner(req.authUserId));
+      v.set("quota_bytes", static_cast<long long>(quota));
+      v.set("quota_percent", static_cast<long long>(
+                                 quota > 0 ? cv::quota::percentOf(used, quota) : 0));
+      v.set("quota_unlimited", static_cast<bool>(quota <= 0));
+    }
       }
     }
     resp.setJson(200, json::dump(v));
   });
 
   // ---- GET /api/v1/files ----
+  // ---- GET /api/v1/files ----
+  // 可选过滤：dir=<目录>（**空值 = 根目录**）｜ under=<前缀>（含子目录，同步模块用）
+  // 可选分页：limit（默认 1000，上限 5000）｜ offset
+  // 返回 { items, total, limit, offset, hasMore }
+  //
+  // ⚠️ 此处**不再固定 LIMIT 500**：那会让"服务端截断 + 客户端拉全表后本地过滤"叠加成
+  //    正确性缺陷（>500 文件的账号里，排在 500 名之外的目录显示为空）。
+  //    现在 total 是**真实总数**，客户端必须按 hasMore 翻页。
   server.route("GET", "/api/v1/files",
                [&](const net::Request& req, net::Response& resp) {
     std::string err;
+    cv::FileRepository::FileListQuery q;
+
+    if (queryHasKey(req.query, "dir")) {
+      std::string norm;
+      if (!sanitizeDirParam(util::urlDecode(queryParam(req.query, "dir")), norm, resp)) return;
+      q.filterByDir = true;
+      q.dirExact    = norm;      // 可能为空串 = 根目录（故用 filterByDir 单独置位）
+    } else if (queryHasKey(req.query, "under")) {
+      std::string norm;
+      if (!sanitizeDirParam(util::urlDecode(queryParam(req.query, "under")), norm, resp)) return;
+      if (!norm.empty()) {
+        q.filterByUnder = true;
+        q.underPrefix   = norm;
+      }
+    }
+
+    q.limit  = kDefaultFileListLimit;
+    q.offset = 0;
+    if (queryHasKey(req.query, "limit")) {
+      const long long v = std::strtoll(queryParam(req.query, "limit").c_str(), nullptr, 10);
+      if (v > 0) q.limit = (v > kMaxFileListLimit) ? kMaxFileListLimit : v;
+    }
+    if (queryHasKey(req.query, "offset")) {
+      const long long v = std::strtoll(queryParam(req.query, "offset").c_str(), nullptr, 10);
+      if (v > 0) q.offset = v;
+    }
+
     std::vector<FileRow> rows;
+    std::int64_t total = 0;
     // 列表按 owner 过滤（SQL 层过滤，避免 C++ 侧泄漏他人元数据）
-    if (!repo.listFiles(scopeOwner(req.authUserId), rows, err)) {
+    if (!repo.listFiles(scopeOwner(req.authUserId), q, rows, total, err)) {
       resp.setError(500, std::string("db failed: ") + err);
       return;
     }
     json::Value arr = json::Value::array();
     for (const FileRow& f : rows) arr.push_back(fileToJson(f));
     json::Value v = json::Value::object();
-    v.set("total", static_cast<long long>(rows.size()));
+    v.set("total", static_cast<long long>(total));
+    v.set("limit", static_cast<long long>(q.limit));
+    v.set("offset", static_cast<long long>(q.offset));
+    v.set("hasMore",
+          static_cast<bool>(q.offset + static_cast<std::int64_t>(rows.size()) < total));
     v.set("items", arr);
     resp.setJson(200, json::dump(v));
   });
@@ -1437,6 +1984,54 @@ int main(int argc, char** argv) {
     resp.setJson(200, json::dump(v));
   });
 
+  // ---- POST /api/v1/dirs/move （目录重命名 / 移动）----
+  // body: { "from": "...", "to": "..." }（to 为完整目标相对路径）
+  // 同一份实现兼作重命名（同父换名）与移动（换父）。**纯元数据**：只改 dir_node.path 与
+  // file_dir.dir 的前缀，不遍历复制物理文件；磁盘镜像目录用一次 fs::rename 搬走。
+  server.route("POST", "/api/v1/dirs/move",
+               [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    const std::int64_t oid = scopeOwner(req.authUserId);
+    json::Value body = parseJsonBody(req.body, perr);
+    if (!perr.empty()) {
+      resp.setError(400, "invalid json: " + perr);
+      return;
+    }
+    const json::Value* pfrom = body.find("from");
+    const json::Value* pto   = body.find("to");
+    if (!pfrom || !pto || pfrom->type() != json::Value::Type::String ||
+        pto->type() != json::Value::Type::String) {
+      resp.setError(400, "missing from/to");
+      return;
+    }
+    std::string from, to;
+    if (!sanitizeDirParam(pfrom->stringValue(), from, resp)) return;
+    if (!sanitizeDirParam(pto->stringValue(), to, resp)) return;
+
+    if (!repo.moveDir(oid, from, to, perr)) {
+      resp.setError(409, perr);
+      return;
+    }
+
+    // 镜像目录同步搬移（同样是一次改名，不是逐个文件复制）
+    std::error_code rec;
+    const std::string oldMirror = userFilesRoot(cfg, oid) + "/" + from;
+    const std::string newMirror = userFilesRoot(cfg, oid) + "/" + to;
+    if (fs::exists(oldMirror, rec)) {
+      rec.clear();
+      fs::create_directories(fs::path(newMirror).parent_path(), rec);
+      rec.clear();
+      fs::rename(oldMirror, newMirror, rec);
+      if (rec) CV_LOG_WARN("移动目录镜像失败（元数据已更新）: " << rec.message());
+    }
+
+    json::Value v = json::Value::object();
+    v.set("from", from);
+    v.set("to", to);
+    resp.setJson(200, json::dump(v));
+    CV_LOG_INFO("移动/重命名目录 " << from << " → " << to);
+  });
+
   // ---- GET /api/v1/tree （嵌套文件树，供客户端文件树选择对话框）----
   // 受全局鉴权保护（白名单仅豁免 /healthz，本接口需有效 Bearer 令牌）；
   // 不分页；从 dir_node + file_node/file_dir 在内存按路径段建树，
@@ -1559,14 +2154,27 @@ int main(int argc, char** argv) {
                 // 与同名检测交互：目标目录下已有同名文件且声明 overwrite → 走既有"覆盖"语义。
                 if (!fileHash.empty()) {
                   FileRow existing;
-                  if (repo.findByContentHash(fileHash, existing, perr)) {
-                    std::vector<std::string> ch;
-                    std::vector<std::size_t> cs;
+                  // ---- 秒传前置守卫：先确认"命中"的元数据背后，磁盘上真的有完整内容 ----
+                  bool instantOk = repo.findByContentHash(fileHash, existing, perr);
+                  std::vector<std::string> ch;
+                  std::vector<std::size_t> cs;
+                  if (instantOk) {
                     if (!repo.chunkHashesOf(existing.id, ch, perr) ||
                         !repo.chunkSizesOf(ch, cs, perr)) {
                       resp.setError(500, std::string("db failed: ") + perr);
                       return;
                     }
+                    // 尺寸不符（断电留下的 0 字节/截断 blob）→ 不认这次秒传，
+                    // 退回下方正常上传路径：那里会真正重写分块，顺带覆盖修复坏 blob。
+                    if (!chunksIntactOnDisk(store, ch, cs)) {
+                      CV_LOG_WARN("秒传守卫：命中内容在磁盘上缺失或尺寸不符，退回正常上传以自愈"
+                                  " hash=" << fileHash << " file_id=" << existing.id);
+                      instantOk = false;
+                      ch.clear();
+                      cs.clear();
+                    }
+                  }
+                  if (instantOk) {
                     std::int64_t newFileId = 0;
                     if (nameTaken && overwrite) {
                       // 覆盖目标目录同名文件：保留其 id/名，替换内容（引用计数同步增减）
@@ -1844,12 +2452,17 @@ int main(int argc, char** argv) {
                      // （同盘 rename → 零拷贝，不再 tmp+blob 双份占盘）
                      std::error_code sec;
                      const auto fsize = fs::file_size(part, sec);
-                     if (!store.putFromFile(cr.sha256, part, perr)) {
+                     const std::int64_t plainSize =
+                         sec ? 0 : static_cast<std::int64_t>(fsize);
+                     // plainSize 用于去重时的尺寸校验；本函数内部还会 fsync 目标 blob ——
+                     // 必须在此完成，因为紧接着的 insertFile 会提交引用这些 blob 的 DB 事务，
+                     // 而 DB 是 synchronous=FULL（真落盘）。顺序颠倒即断电静默损坏。
+                     if (!store.putFromFile(cr.sha256, part, plainSize, perr)) {
                        resp.setError(500, std::string("store failed: ") + perr);
                        return;
                      }
                      chunkHashes.push_back(cr.sha256);
-                     chunkSizes.push_back(sec ? 0 : static_cast<std::size_t>(fsize));
+                     chunkSizes.push_back(static_cast<std::size_t>(plainSize));
                      continue;
                    }
                    // 异常兜底（库中无分块记录）：读出内容算哈希后入库
@@ -1873,12 +2486,27 @@ int main(int argc, char** argv) {
                  bool overwrite = false;
                  up.getOverwrite(id, overwrite, perr);
                  perr.clear();
+                 // 配额拦截（权威点）：这里才知道**真实**字节数。init 时拦的是客户端自报的 size，
+                 // 报小了就得靠这一道。⚠️ 覆盖场景按完整新尺寸计（保守），不做"减去旧尺寸"的净额计算。
+                 if (!enforceQuota(usersDb, repo, cfg, s.ownerId,
+                                   static_cast<std::int64_t>(s.size), resp))
+                   return;
+                 // 恶意文件判定：用**内容哈希**（计算结果 computed 此时已确定）
+                 if (!enforceVirusScan(db, cfg, scanFetcher, computed, s.name, resp)) return;
                  // 覆盖：同目录同名已存在（且归属本会话 owner）且会话声明了 overwrite → 替换原记录内容
                  FileRow sameName;
                  bool replace = overwrite && repo.findByPath(s.ownerId, dir, s.name, sameName, perr);
                  perr.clear();
                  if (replace) {
                    fileId = sameName.id;
+                   // ★ 覆盖前把旧内容存成历史版本（与整文件上传路径同一策略；
+                   //   分块上传是"大文件覆盖"的主通道，两条路径都必须挂上）
+                   std::int64_t snapshotVid = 0;
+                   if (!ver.captureCurrent(fileId, std::string(), "覆盖前备份", snapshotVid, perr)) {
+                     resp.setError(500, std::string("db failed: ") + perr);
+                     return;
+                   }
+                   pruneVersionsAndFree(ver, store, cfg, fileId);   // FR-4-2
                    std::vector<std::string> orphans;
                    if (!repo.replaceContent(fileId, s.size, computed, chunkHashes, chunkSizes,
                                             orphans, perr)) {
@@ -1947,6 +2575,861 @@ int main(int argc, char** argv) {
                  resp.status = 204;  // 无 body
                  CV_LOG_INFO("取消会话 upload_id=" << id);
                });
+
+  // ================= 回收站（软删除 → 恢复 → 彻底删除） =================
+  //
+  // 语义总纲（与 meta/schema.h 顶部「回收站语义」严格一致，改这里请同步改那边）：
+  //   · 进站   = deleted=1 + deleted_at=now，**保留** file_chunk / file_dir / ref_count
+  //   · 恢复   = deleted=0 + deleted_at=0（内容从未被碰过，"恢复"只是改个标志位）
+  //   · 彻底删 = 真删 file_chunk、递减 ref_count、清 file_dir / file_tag / 版本快照、删镜像
+  //   · 目录同样进回收站：否则"删掉一个文件夹"在回收站里会散成 N 个文件，反直觉。
+  //     目录进站时其下文件一并标记；恢复 / 彻底删除同理 —— 让"文件夹"始终是一件事。
+  //
+  // 计数与配额的取舍（**实测口径，勿凭直觉改**）：
+  //   · 磁盘：进站**不释放**任何东西 —— 分块引用计数原样保留、内容库不做 GC，
+  //     blob 一个都没少。所以回收站里的文件确实还占着磁盘。
+  //   · 「已用空间」：`sumSizeOfOwner` 带 `WHERE deleted = 0` ⇒ 进站后该文件立刻
+  //     从 /api/v1/storage 的 used_bytes 里**消失**，界面上的用量会当场下降。
+  //   两者会同时成立、且必然不一致 —— 这是"用量"被定义成"可见文件占用量"而非
+  //   "磁盘实际占用量"的结果。界面上必须把这两件事分开讲，不能混成一句
+  //   "仍然占用空间"（那会和用量数字当场打脸）。
+  //
+  // ⚠️ 为什么全部走 POST + JSON body，而不是 DELETE /files/dir%3Axxx：
+  //    http_server::dispatch 把路径段原样放进 params，**不做百分号解码**，
+  //    `dir:照片/2026` 这种含冒号 + 中文的标识塞进路径永远比不中。放 body 里才干净。
+
+  // 彻底清理单个文件的全部痕迹：内容分块 + 版本分块 + 镜像 + blob。返回释放字节数，失败 -1。
+  // 顺序不可颠簸：先 purgeFile（清 file_chunk，使当前内容的引用归零），
+  // 再 purgeFileVersions（此时只剩版本侧还持有引用，由它释放），最后才删 blob。
+  auto purgeOneFile = [&](const FileRow& f, std::string& err) -> std::int64_t {
+    std::vector<std::string> orphans;
+    if (!repo.purgeFile(f.id, orphans, err)) return -1;
+    std::vector<std::string> versionOrphans;
+    if (!ver.purgeFileVersions(f.id, versionOrphans, err)) return -1;
+    for (const std::string& h : versionOrphans) orphans.push_back(h);
+
+    std::error_code rec;
+    fs::remove(mirrorPathFor(cfg, f.ownerId, f.dir, f.name), rec);
+    return dropOrphanBlobs(store, orphans);
+  };
+
+  // 移入回收站。幂等：trashFile 自带 `AND deleted = 0` 守卫，重复进站不会刷新时间戳。
+  auto doTrash = [&](std::int64_t auth, const TrashTarget& t, json::Value& out,
+                     std::string& err) -> bool {
+    const std::int64_t oid = scopeOwner(auth);
+    const std::int64_t nowMs = nowMillis();
+
+    if (!t.isDir) {
+      FileRow row;
+      if (!repo.findById(t.fileId, row, err) || !ownerVisible(row, auth)) {
+        err = "file not found";
+        return false;
+      }
+      if (!repo.trashFile(t.fileId, nowMs, err)) return false;
+      out.set("file_id", static_cast<long long>(t.fileId));
+      out.set("name", row.name);
+      out.set("dir", row.dir);
+      out.set("deleted_at", static_cast<long long>(nowMs));
+      return true;
+    }
+
+    // 目录：自身 + 全部后代目录 + 其下全部未删除文件
+    std::vector<std::string> allDirs;
+    if (!repo.listDirPathsUnder(oid, t.dir, allDirs, err)) return false;
+    if (allDirs.empty()) {
+      err = "dir not found";
+      return false;
+    }
+    std::vector<std::int64_t> fileIds;
+    if (!repo.listFileIdsUnderDir(oid, t.dir, fileIds, err)) return false;
+    if (!repo.setDirsTrashed(oid, allDirs, true, nowMs, err)) return false;
+    for (std::int64_t fid : fileIds) {
+      if (!repo.trashFile(fid, nowMs, err)) return false;
+    }
+    out.set("dir", t.dir);
+    out.set("dir_count", static_cast<long long>(allDirs.size()));
+    out.set("file_count", static_cast<long long>(fileIds.size()));
+    out.set("deleted_at", static_cast<long long>(nowMs));
+    return true;
+  };
+
+  // 从回收站恢复。
+  // ⚠️ 关键边界：文件要回到原目录，而那个目录**可能自己也在回收站里**。此时如果只管
+  //    把文件置回未删除，结果就是"恢复成功了但列表里死活看不见"——最气人的那种成功。
+  //    故这里顺带把父目录链一并复位（不存在则补登记），并在响应里用 dir_restored 说明。
+  auto doRestore = [&](std::int64_t auth, const TrashTarget& t, json::Value& out,
+                       std::string& err) -> bool {
+    const std::int64_t oid = scopeOwner(auth);
+
+    // 确保目录链存在且处于未删除态（幂等）
+    auto ensureChain = [&](const std::string& dir) -> bool {
+      if (dir.empty()) return true;  // 根目录恒定存在
+      const std::vector<std::string> chain = pathPrefixChain(dir);
+      for (const std::string& p : chain) {
+        bool created = false;
+        if (!repo.createDir(oid, p, created, err)) return false;
+      }
+      return repo.setDirsTrashed(oid, chain, false, 0, err);
+    };
+
+    if (!t.isDir) {
+      std::string outDir;
+      if (!repo.restoreFile(t.fileId, outDir, err)) {
+        err = "file not found";
+        return false;
+      }
+      bool dirWasTrashed = false;
+      repo.isDirDeleted(oid, outDir, dirWasTrashed, err);
+      err.clear();
+      if (dirWasTrashed && !outDir.empty()) {
+        if (!ensureChain(outDir)) return false;
+      }
+      out.set("file_id", static_cast<long long>(t.fileId));
+      out.set("dir", outDir);
+      out.set("dir_restored", dirWasTrashed && !outDir.empty());
+      return true;
+    }
+
+    std::vector<std::string> allDirs;
+    if (!repo.listDirPathsUnder(oid, t.dir, allDirs, err)) return false;
+    if (allDirs.empty()) {
+      err = "dir not found";
+      return false;
+    }
+    // 先取该目录的进站时间（复位之后就查不到了）—— 用于精确圈定"随它一起进站"的文件
+    std::int64_t dirDeletedAt = 0;
+    {
+      std::vector<TrashDirRow> trashed;
+      if (!repo.listTrashDirs(oid, trashed, err)) return false;
+      for (const TrashDirRow& d : trashed) {
+        if (d.path == t.dir) {
+          dirDeletedAt = d.deletedAt;
+          break;
+        }
+      }
+    }
+    if (!ensureChain(t.dir)) return false;                              // 祖先 + 自身
+    if (!repo.setDirsTrashed(oid, allDirs, false, 0, err)) return false;  // 全部后代
+
+    std::vector<FileRow> kids;
+    if (!repo.listTrashedFilesUnderDir(oid, t.dir, dirDeletedAt, kids, err)) return false;
+    for (const FileRow& k : kids) {
+      std::string ignored;
+      if (!repo.restoreFile(k.id, ignored, err)) return false;
+    }
+    out.set("dir", t.dir);
+    out.set("dir_count", static_cast<long long>(allDirs.size()));
+    out.set("file_count", static_cast<long long>(kids.size()));
+    return true;
+  };
+
+  // 彻底删除（不可恢复）。文件先清内容与版本，目录先清其下文件再删目录行。
+  auto doPurge = [&](std::int64_t auth, const TrashTarget& t, json::Value& out,
+                     std::string& err) -> bool {
+    const std::int64_t oid = scopeOwner(auth);
+    std::int64_t freed = 0;
+    std::int64_t removed = 0;
+
+    if (!t.isDir) {
+      FileRow row;
+      // 回收站里的文件用 findById 查不到（它带 deleted=0 过滤），必须走 findByIdAny
+      if (!repo.findByIdAny(t.fileId, row, err) || !ownerVisible(row, auth)) {
+        err = "file not found";
+        return false;
+      }
+      const std::int64_t f = purgeOneFile(row, err);
+      if (f < 0) return false;
+      freed += f;
+      removed = 1;
+      out.set("file_id", static_cast<long long>(t.fileId));
+      out.set("name", row.name);
+    } else {
+      std::vector<std::string> allDirs;
+      if (!repo.listDirPathsUnder(oid, t.dir, allDirs, err)) return false;
+      if (allDirs.empty()) {
+        err = "dir not found";
+        return false;
+      }
+      // 目录下待清的文件 = 已进站的 + 万一还以未删除状态残留的（异常数据兜底，
+      // 反正目录都要没了，不能留一堆悬空文件）
+      std::vector<FileRow> kids;
+      if (!repo.listTrashedFilesUnderDir(oid, t.dir, 0, kids, err)) return false;
+      std::vector<std::int64_t> liveIds;
+      if (!repo.listFileIdsUnderDir(oid, t.dir, liveIds, err)) return false;
+      for (std::int64_t fid : liveIds) {
+        FileRow fr;
+        if (repo.findById(fid, fr, err)) kids.push_back(fr);
+        err.clear();
+      }
+      for (const FileRow& k : kids) {
+        const std::int64_t f = purgeOneFile(k, err);
+        if (f < 0) return false;
+        freed += f;
+        ++removed;
+      }
+      if (!repo.deleteDirRows(oid, allDirs, err)) return false;
+      out.set("dir", t.dir);
+      out.set("dir_count", static_cast<long long>(allDirs.size()));
+    }
+    out.set("file_count", static_cast<long long>(removed));
+    out.set("freed_bytes", static_cast<long long>(freed));
+    out.set("disk_free_bytes", static_cast<long long>(diskFreeBytes(cfg.dataDir)));
+    return true;
+  };
+
+  // 把重定向到的目标错误文本映射成 HTTP 状态码（"not found" → 404，其余 500）
+  auto statusForErr = [](const std::string& e) {
+    return (e == "file not found" || e == "dir not found") ? 404 : 500;
+  };
+
+  // ---- GET /api/v1/trash —— 回收站列表（顶层目录 + 顶层文件）----
+  server.route("GET", "/api/v1/trash", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    const std::int64_t oid = scopeOwner(req.authUserId);
+    std::vector<FileRow> files;
+    std::vector<TrashDirRow> dirs;
+    if (!repo.listTrash(oid, files, dirs, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    json::Value items = json::Value::array();
+    std::int64_t usedBytes = 0;
+    for (const FileRow& f : files) {
+      json::Value o = fileToJson(f);
+      o.set("deleted_at", static_cast<long long>(f.deletedAt));
+      items.push_back(o);
+      usedBytes += f.size;
+    }
+    json::Value dirArr = json::Value::array();
+    for (const TrashDirRow& d : dirs) {
+      // 目录占用 = 其下（含子目录）全部已进站文件之和。一次查询搞定，别按文件数 N+1。
+      std::vector<FileRow> kids;
+      if (!repo.listTrashedFilesUnderDir(oid, d.path, 0, kids, perr)) {
+        resp.setError(500, std::string("db failed: ") + perr);
+        return;
+      }
+      std::int64_t dirBytes = 0;
+      for (const FileRow& k : kids) dirBytes += k.size;
+
+      json::Value o = json::Value::object();
+      o.set("path", d.path);
+      o.set("name", treeLastSegment(d.path));
+      o.set("size", static_cast<long long>(dirBytes));
+      o.set("file_count", static_cast<long long>(kids.size()));
+      o.set("deleted_at", static_cast<long long>(d.deletedAt));
+      dirArr.push_back(o);
+      usedBytes += dirBytes;
+    }
+    json::Value v = json::Value::object();
+    v.set("items", items);
+    v.set("dirs", dirArr);
+    v.set("total", static_cast<long long>(files.size() + dirs.size()));
+    v.set("file_count", static_cast<long long>(files.size()));
+    v.set("dir_count", static_cast<long long>(dirs.size()));
+    v.set("used_bytes", static_cast<long long>(usedBytes));
+    resp.setJson(200, json::dump(v));
+  });
+
+  // ---- POST /api/v1/trash —— 移入回收站（body: {"file_id":<id>} 或 {"dir":"a/b"}）----
+  server.route("POST", "/api/v1/trash", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    json::Value body = parseJsonBody(req.body, perr);
+    if (!perr.empty()) {
+      resp.setError(400, "invalid json: " + perr);
+      return;
+    }
+    TrashTarget t;
+    if (!parseTrashTarget(body, t, perr)) {
+      resp.setError(400, perr);
+      return;
+    }
+    json::Value v = json::Value::object();
+    if (!doTrash(req.authUserId, t, v, perr)) {
+      resp.setError(statusForErr(perr), perr);
+      return;
+    }
+    v.set("trashed", true);
+    resp.setJson(200, json::dump(v));
+  });
+
+  // ---- POST /api/v1/trash/restore —— 恢复（body 同上）----
+  server.route("POST", "/api/v1/trash/restore",
+               [&](const net::Request& req, net::Response& resp) {
+                 std::string perr;
+                 json::Value body = parseJsonBody(req.body, perr);
+                 if (!perr.empty()) {
+                   resp.setError(400, "invalid json: " + perr);
+                   return;
+                 }
+                 TrashTarget t;
+                 if (!parseTrashTarget(body, t, perr)) {
+                   resp.setError(400, perr);
+                   return;
+                 }
+                 json::Value v = json::Value::object();
+                 if (!doRestore(req.authUserId, t, v, perr)) {
+                   resp.setError(statusForErr(perr), perr);
+                   return;
+                 }
+                 v.set("restored", true);
+                 resp.setJson(200, json::dump(v));
+                 CV_LOG_INFO("恢复 "
+                             << (t.isDir ? std::string("目录 ") + t.dir
+                                         : std::string("文件 id=") + std::to_string(t.fileId)));
+               });
+
+  // ---- POST /api/v1/trash/purge —— 彻底删除（不可恢复；body 同上）----
+  server.route("POST", "/api/v1/trash/purge", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    json::Value body = parseJsonBody(req.body, perr);
+    if (!perr.empty()) {
+      resp.setError(400, "invalid json: " + perr);
+      return;
+    }
+    TrashTarget t;
+    if (!parseTrashTarget(body, t, perr)) {
+      resp.setError(400, perr);
+      return;
+    }
+    json::Value v = json::Value::object();
+    if (!doPurge(req.authUserId, t, v, perr)) {
+      resp.setError(statusForErr(perr), perr);
+      return;
+    }
+    v.set("purged", true);
+    resp.setJson(200, json::dump(v));
+    CV_LOG_INFO("彻底删除 "
+                << (t.isDir ? std::string("目录 ") + t.dir
+                            : std::string("文件 id=") + std::to_string(t.fileId))
+                << "，释放 " << v.find("freed_bytes")->numberValue() << " 字节");
+  });
+
+  // ---- POST /api/v1/trash/empty —— 清空回收站（不可恢复）----
+  // ⚠️ 路由注册顺序：本行与 /trash/cleanup 段数（4）与 /trash（3）不同，不冲突；
+  //    但若将来新增 /trash/:id 形式的通配路由，**必须**排在本行之后，否则会被吃掉。
+  server.route("POST", "/api/v1/trash/empty", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    const std::int64_t oid = scopeOwner(req.authUserId);
+    std::vector<std::int64_t> ids;
+    if (!repo.listAllTrashedIds(oid, ids, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    std::vector<TrashDirRow> trashedDirs;
+    if (!repo.listTrashDirs(oid, trashedDirs, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    std::int64_t freed = 0;
+    std::int64_t removed = 0;
+    for (std::int64_t id : ids) {
+      FileRow row;
+      if (!repo.findByIdAny(id, row, perr)) {
+        perr.clear();
+        continue;
+      }
+      const std::int64_t f = purgeOneFile(row, perr);
+      if (f < 0) {
+        resp.setError(500, perr);
+        return;
+      }
+      freed += f;
+      ++removed;
+    }
+    std::vector<std::string> dirPaths;
+    for (const TrashDirRow& d : trashedDirs) dirPaths.push_back(d.path);
+    if (!repo.deleteDirRows(oid, dirPaths, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    json::Value v = json::Value::object();
+    v.set("removed", static_cast<long long>(removed));
+    v.set("dirs_removed", static_cast<long long>(dirPaths.size()));
+    v.set("freed_bytes", static_cast<long long>(freed));
+    v.set("disk_free_bytes", static_cast<long long>(diskFreeBytes(cfg.dataDir)));
+    resp.setJson(200, json::dump(v));
+    CV_LOG_INFO("清空回收站 owner=" << oid << " 文件 " << removed << " 个 / 目录 "
+                                    << dirPaths.size() << " 个，释放 " << freed << " 字节");
+  });
+
+  // ---- POST /api/v1/trash/cleanup —— 清理已过保留期的条目（body 可选 {"retention_days":30}）----
+  server.route("POST", "/api/v1/trash/cleanup",
+               [&](const net::Request& req, net::Response& resp) {
+                 std::string perr;
+                 json::Value body = parseJsonBody(req.body, perr);
+                 perr.clear();  // body 可空：空 body 一律按默认保留期处理，不报错
+                 std::int64_t days = 30;
+                 const json::Value* pd = body.find("retention_days");
+                 if (pd && pd->type() == json::Value::Type::Number) {
+                   const double dv = pd->numberValue();
+                   if (dv > 0 && dv <= 3650) days = static_cast<std::int64_t>(dv);
+                 }
+                 const std::int64_t oid = scopeOwner(req.authUserId);
+                 const std::int64_t deadline = nowMillis() - days * 24LL * 3600 * 1000;
+
+                 std::vector<std::int64_t> ids;
+                 if (!repo.listExpiredTrashIds(oid, deadline, ids, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 std::int64_t freed = 0;
+                 std::int64_t removed = 0;
+                 for (std::int64_t id : ids) {
+                   FileRow row;
+                   if (!repo.findByIdAny(id, row, perr)) {
+                     perr.clear();
+                     continue;
+                   }
+                   const std::int64_t f = purgeOneFile(row, perr);
+                   if (f < 0) {
+                     resp.setError(500, perr);
+                     return;
+                   }
+                   freed += f;
+                   ++removed;
+                 }
+                 std::vector<TrashDirRow> trashedDirs;
+                 if (!repo.listTrashDirs(oid, trashedDirs, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 std::vector<std::string> dirPaths;
+                 for (const TrashDirRow& d : trashedDirs) {
+                   if (d.deletedAt > 0 && d.deletedAt < deadline) dirPaths.push_back(d.path);
+                 }
+                 if (!repo.deleteDirRows(oid, dirPaths, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 json::Value v = json::Value::object();
+                 v.set("removed", static_cast<long long>(removed));
+                 v.set("dirs_removed", static_cast<long long>(dirPaths.size()));
+                 v.set("freed_bytes", static_cast<long long>(freed));
+                 v.set("retention_days", static_cast<long long>(days));
+                 resp.setJson(200, json::dump(v));
+               });
+
+  // ================= 文件版本（快照 / 回滚 / 删除） =================
+  //
+  // 语义：file_version 只存**历史快照**；文件"当前内容"始终在 file_node 里。
+  //   · 列表 = 一条合成的"当前版本" + 全部历史快照（version 号降序）
+  //   · 内容被覆盖 / 回滚之前，都会先 captureCurrent() 把旧内容存档 —— 所以"回滚"永远
+  //     不会把当下这版弄丢（它会被自动备份成一条"恢复前备份"）
+  //   · 回滚 = 把目标版本的分块清单写回 file_node，**零拷贝**（blob 一直在内容库里）
+
+  // ---- GET /api/v1/files/:id/versions ----
+  server.route("GET", "/api/v1/files/:id/versions",
+               [&](const net::Request& req, net::Response& resp) {
+                 std::string perr;
+                 const std::int64_t auth = req.authUserId;
+                 std::int64_t id = 0;
+                 if (!parseId(req.param("id"), id)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 FileRow row;
+                 if (!repo.findById(id, row, perr) || !ownerVisible(row, auth)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 std::vector<VersionRow> vers;
+                 if (!ver.listVersions(id, vers, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 std::int64_t curNo = 1;
+                 if (!ver.currentVersionNo(id, curNo, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+
+                 json::Value arr = json::Value::array();
+                 {
+                   // 合成的"当前版本"：内容取自 file_node，不是快照表
+                   VersionRow cur;
+                   cur.id = 0;
+                   cur.fileId = id;
+                   cur.versionNo = curNo;
+                   cur.contentHash = row.contentHash;
+                   cur.size = row.size;
+                   cur.chunkCount = row.chunkCount;
+                   cur.createdAt = row.createdAt;
+                   cur.note = "当前版本";
+                   arr.push_back(versionToJson(cur, true));
+                 }
+                 for (const VersionRow& v : vers) arr.push_back(versionToJson(v, false));
+
+                 json::Value out = json::Value::object();
+                 out.set("file_id", static_cast<long long>(id));
+                 out.set("name", row.name);
+                 out.set("dir", row.dir);
+                 out.set("items", arr);
+                 out.set("total", static_cast<long long>(vers.size() + 1));
+                 out.set("current_version", static_cast<long long>(curNo));
+                 out.set("history_count", static_cast<long long>(vers.size()));
+                 resp.setJson(200, json::dump(out));
+               });
+
+  // ---- POST /api/v1/files/:id/versions —— 手动打一个快照（body 可选 {"note":..,"device":..}）----
+  server.route("POST", "/api/v1/files/:id/versions",
+               [&](const net::Request& req, net::Response& resp) {
+                 std::string perr;
+                 const std::int64_t auth = req.authUserId;
+                 std::int64_t id = 0;
+                 if (!parseId(req.param("id"), id)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 FileRow row;
+                 if (!repo.findById(id, row, perr) || !ownerVisible(row, auth)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 json::Value body = parseJsonBody(req.body, perr);
+                 perr.clear();  // body 可空
+                 std::string note = "手动快照";
+                 std::string device;
+                 const json::Value* pn = body.find("note");
+                 if (pn && pn->type() == json::Value::Type::String && !pn->stringValue().empty()) {
+                   note = pn->stringValue();
+                 }
+                 const json::Value* pdev = body.find("device");
+                 if (pdev && pdev->type() == json::Value::Type::String) {
+                   device = pdev->stringValue();
+                 }
+
+                 std::int64_t vid = 0;
+                 if (!ver.captureCurrent(id, device, note, vid, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 pruneVersionsAndFree(ver, store, cfg, id);   // FR-4-2：手动快照后同样清理
+                 VersionRow vr;
+                 if (!ver.findVersion(vid, vr, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 resp.setJson(201, json::dump(versionToJson(vr, false)));
+                 CV_LOG_INFO("手动快照 file_id=" << id << " version_id=" << vid);
+               });
+
+  // ---- POST /api/v1/files/:id/versions/:vid/restore —— 回滚到某个历史版本 ----
+  server.route("POST", "/api/v1/files/:id/versions/:vid/restore",
+               [&](const net::Request& req, net::Response& resp) {
+                 std::string perr;
+                 const std::int64_t auth = req.authUserId;
+                 std::int64_t id = 0;
+                 std::int64_t vid = 0;
+                 if (!parseId(req.param("id"), id) || !parseId(req.param("vid"), vid)) {
+                   resp.setError(404, "file or version not found");
+                   return;
+                 }
+                 FileRow row;
+                 if (!repo.findById(id, row, perr) || !ownerVisible(row, auth)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 VersionRow vr;
+                 if (!ver.findVersion(vid, vr, perr) || vr.fileId != id) {
+                   resp.setError(404, "version not found");
+                   return;
+                 }
+                 // 取目标版本的分块清单（零拷贝：blob 早就在内容库里躺着）
+                 std::vector<std::string> hashes;
+                 std::vector<std::size_t> sizes;
+                 if (!ver.versionChunks(vid, hashes, sizes, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 if (hashes.empty() && vr.size > 0) {
+                   resp.setError(500, "version content missing");
+                   return;
+                 }
+                 // 先备份当前内容 —— 否则"回滚"就成了单向删除，回滚一次就永久丢掉刚才那版
+                 std::int64_t backupVid = 0;
+                 if (!ver.captureCurrent(id, std::string(), "恢复前备份", backupVid, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 pruneVersionsAndFree(ver, store, cfg, id);   // FR-4-2：回滚前备份后同样清理
+                 std::vector<std::string> orphans;
+                 if (!repo.replaceContent(id, vr.size, vr.contentHash, hashes, sizes, orphans,
+                                          perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 const std::int64_t freed = dropOrphanBlobs(store, orphans);
+                 // 镜像重建（尽力而为；blob + DB 才是权威）
+                 if (mirrorEnabled) {
+                   std::string mirrorErr;
+                   if (!store.materializeFromChunks(
+                           hashes, mirrorPathFor(cfg, row.ownerId, row.dir, row.name),
+                           mirrorErr)) {
+                     CV_LOG_WARN("回滚后重建镜像失败 id=" << id << ": " << mirrorErr);
+                   }
+                 }
+                 std::int64_t nowNo = 1;
+                 ver.currentVersionNo(id, nowNo, perr);
+
+                 json::Value v = json::Value::object();
+                 v.set("file_id", static_cast<long long>(id));
+                 v.set("restored_from", static_cast<long long>(vr.versionNo));
+                 v.set("backup_version_id", static_cast<long long>(backupVid));
+                 v.set("now_version", static_cast<long long>(nowNo));
+                 v.set("size", static_cast<long long>(vr.size));
+                 v.set("freed_bytes", static_cast<long long>(freed));
+                 resp.setJson(200, json::dump(v));
+                 CV_LOG_INFO("回滚 file_id=" << id << " → v" << vr.versionNo
+                                             << "（回滚前已自动备份为 version_id=" << backupVid
+                                             << "）");
+               });
+
+  // ---- DELETE /api/v1/files/:id/versions/:vid —— 删掉某个历史版本 ----
+  server.route("DELETE", "/api/v1/files/:id/versions/:vid",
+               [&](const net::Request& req, net::Response& resp) {
+                 std::string perr;
+                 const std::int64_t auth = req.authUserId;
+                 std::int64_t id = 0;
+                 std::int64_t vid = 0;
+                 if (!parseId(req.param("id"), id) || !parseId(req.param("vid"), vid)) {
+                   resp.setError(404, "file or version not found");
+                   return;
+                 }
+                 FileRow row;
+                 if (!repo.findById(id, row, perr) || !ownerVisible(row, auth)) {
+                   resp.setError(404, "file not found");
+                   return;
+                 }
+                 VersionRow vr;
+                 if (!ver.findVersion(vid, vr, perr) || vr.fileId != id) {
+                   resp.setError(404, "version not found");
+                   return;
+                 }
+                 std::vector<std::string> orphans;
+                 if (!ver.deleteVersion(vid, orphans, perr)) {
+                   resp.setError(500, std::string("db failed: ") + perr);
+                   return;
+                 }
+                 const std::int64_t freed = dropOrphanBlobs(store, orphans);
+                 json::Value v = json::Value::object();
+                 v.set("deleted", true);
+                 v.set("version_id", static_cast<long long>(vid));
+                 v.set("freed_bytes", static_cast<long long>(freed));
+                 resp.setJson(200, json::dump(v));
+               });
+
+  // ================= 标签（按 owner 隔离；同名 NOCASE 幂等） =================
+
+  // ---- GET /api/v1/tags —— 标签列表（带关联文件数）----
+  server.route("GET", "/api/v1/tags", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    std::vector<TagRow> tags;
+    if (!tagRepo.listTags(scopeOwner(req.authUserId), tags, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    json::Value arr = json::Value::array();
+    for (const TagRow& t : tags) arr.push_back(tagToJson(t));
+    json::Value v = json::Value::object();
+    v.set("items", arr);
+    v.set("total", static_cast<long long>(tags.size()));
+    resp.setJson(200, json::dump(v));
+  });
+
+  // ---- POST /api/v1/tags —— 新建标签（body {"name":..,"color":"#RRGGBB"}）----
+  // 同名（NOCASE）已存在 → 200 + created=false（幂等，不当错误报）
+  server.route("POST", "/api/v1/tags", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    json::Value body = parseJsonBody(req.body, perr);
+    if (!perr.empty()) {
+      resp.setError(400, "invalid json: " + perr);
+      return;
+    }
+    const json::Value* pname = body.find("name");
+    if (!pname || pname->type() != json::Value::Type::String || pname->stringValue().empty()) {
+      resp.setError(400, "missing name");
+      return;
+    }
+    std::string name = pname->stringValue();
+    if (name.size() > 64) {
+      resp.setError(400, "tag name too long (max 64 bytes)");
+      return;
+    }
+    // 颜色校验：#RGB 或 #RRGGBB，非法一律回退到默认强调色（不因配色不合法而拒绝建标签）
+    std::string color = "#4C6FFF";
+    const json::Value* pc = body.find("color");
+    if (pc && pc->type() == json::Value::Type::String) {
+      const std::string c = pc->stringValue();
+      const bool hexOk = (c.size() == 4 || c.size() == 7) && c[0] == '#';
+      bool allHex = hexOk;
+      for (std::size_t i = 1; allHex && i < c.size(); ++i) {
+        const char ch = c[i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))) {
+          allHex = false;
+        }
+      }
+      if (allHex) color = c;
+    }
+
+    TagRow out;
+    bool created = false;
+    if (!tagRepo.createTag(scopeOwner(req.authUserId), name, color, out, created, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    json::Value v = tagToJson(out);
+    v.set("created", created);
+    resp.setJson(created ? 201 : 200, json::dump(v));
+  });
+
+  // ---- DELETE /api/v1/tags/:id —— 删标签（级联清理文件关联）----
+  server.route("DELETE", "/api/v1/tags/:id", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    std::int64_t id = 0;
+    if (!parseId(req.param("id"), id)) {
+      resp.setError(404, "tag not found");
+      return;
+    }
+    if (!tagRepo.deleteTag(scopeOwner(req.authUserId), id, perr)) {
+      resp.setError(perr == "tag not found" ? 404 : 500, perr);
+      return;
+    }
+    json::Value v = json::Value::object();
+    v.set("deleted", true);
+    v.set("tag_id", static_cast<long long>(id));
+    resp.setJson(200, json::dump(v));
+  });
+
+  // ---- GET /api/v1/files/:id/tags —— 某文件的标签 ----
+  server.route("GET", "/api/v1/files/:id/tags", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    const std::int64_t auth = req.authUserId;
+    std::int64_t id = 0;
+    if (!parseId(req.param("id"), id)) {
+      resp.setError(404, "file not found");
+      return;
+    }
+    FileRow row;
+    if (!repo.findById(id, row, perr) || !ownerVisible(row, auth)) {
+      resp.setError(404, "file not found");
+      return;
+    }
+    std::vector<TagRow> tags;
+    if (!tagRepo.tagsOfFile(id, tags, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    json::Value arr = json::Value::array();
+    for (const TagRow& t : tags) arr.push_back(tagToJson(t));
+    json::Value v = json::Value::object();
+    v.set("file_id", static_cast<long long>(id));
+    v.set("items", arr);
+    v.set("total", static_cast<long long>(tags.size()));
+    resp.setJson(200, json::dump(v));
+  });
+
+  // ---- PUT /api/v1/files/:id/tags —— 全量设置某文件的标签（body {"tag_ids":[..]}）----
+  server.route("PUT", "/api/v1/files/:id/tags", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    const std::int64_t auth = req.authUserId;
+    std::int64_t id = 0;
+    if (!parseId(req.param("id"), id)) {
+      resp.setError(404, "file not found");
+      return;
+    }
+    FileRow row;
+    if (!repo.findById(id, row, perr) || !ownerVisible(row, auth)) {
+      resp.setError(404, "file not found");
+      return;
+    }
+    json::Value body = parseJsonBody(req.body, perr);
+    if (!perr.empty()) {
+      resp.setError(400, "invalid json: " + perr);
+      return;
+    }
+    std::vector<std::int64_t> tagIds;
+    const json::Value* ptags = body.find("tag_ids");
+    if (ptags && ptags->type() == json::Value::Type::Array) {
+      for (const json::Value& tv : ptags->items()) {
+        if (tv.type() == json::Value::Type::Number) {
+          const std::int64_t tid = static_cast<std::int64_t>(tv.numberValue());
+          if (tid > 0) tagIds.push_back(tid);
+        }
+      }
+    }
+    // 归属由仓储层兜底：只会关联属于该 owner 的 tag（跨 owner 的 id 静默忽略）
+    if (!tagRepo.setFileTags(scopeOwner(auth), id, tagIds, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    std::vector<TagRow> now;
+    tagRepo.tagsOfFile(id, now, perr);
+    json::Value arr = json::Value::array();
+    for (const TagRow& t : now) arr.push_back(tagToJson(t));
+    json::Value v = json::Value::object();
+    v.set("file_id", static_cast<long long>(id));
+    v.set("items", arr);
+    v.set("total", static_cast<long long>(now.size()));
+    resp.setJson(200, json::dump(v));
+  });
+
+  // ---- POST /api/v1/search —— 检索（body {"keyword":..,"tag_ids":[..],"type":-1|0..7}）----
+  // 朴素实现：服务端拉取本 owner 的列表（上限 500），在 C++ 侧做关键词 / 标签 / 类型过滤。
+  // 数据量大了要换成带索引的 SQL —— 但现在是个人网盘，够用且好懂优先。
+  server.route("POST", "/api/v1/search", [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    const std::int64_t oid = scopeOwner(req.authUserId);
+    json::Value body = parseJsonBody(req.body, perr);
+    perr.clear();  // body 可空 → 等价于"列出全部"
+
+    std::string keyword;
+    const json::Value* pk = body.find("keyword");
+    if (pk && pk->type() == json::Value::Type::String) keyword = asciiLower(pk->stringValue());
+
+    int typeFilter = -1;
+    const json::Value* pt = body.find("type");
+    if (pt && pt->type() == json::Value::Type::Number) {
+      typeFilter = static_cast<int>(pt->numberValue());
+    }
+
+    std::vector<std::int64_t> tagIds;
+    const json::Value* ptags = body.find("tag_ids");
+    if (ptags && ptags->type() == json::Value::Type::Array) {
+      for (const json::Value& tv : ptags->items()) {
+        if (tv.type() == json::Value::Type::Number) {
+          const std::int64_t tid = static_cast<std::int64_t>(tv.numberValue());
+          if (tid > 0) tagIds.push_back(tid);
+        }
+      }
+    }
+
+    // 标签过滤：先拿到"命中任一标签"的文件 id 白名单（空 tag_ids → 不启用该维度）
+    std::vector<std::int64_t> tagHit;
+    const bool useTagFilter = !tagIds.empty();
+    if (useTagFilter && !tagRepo.listFileIdsByTags(oid, tagIds, tagHit, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    std::set<std::int64_t> tagSet(tagHit.begin(), tagHit.end());
+
+    std::vector<FileRow> rows;
+    if (!repo.listFiles(oid, rows, perr)) {
+      resp.setError(500, std::string("db failed: ") + perr);
+      return;
+    }
+    json::Value arr = json::Value::array();
+    for (const FileRow& f : rows) {
+      if (!keyword.empty() && asciiLower(f.name).find(keyword) == std::string::npos) continue;
+      if (useTagFilter && tagSet.find(f.id) == tagSet.end()) continue;
+      if (typeFilter >= 0 && fileTypeOf(f.name) != typeFilter) continue;
+      arr.push_back(fileToJson(f));
+    }
+    json::Value v = json::Value::object();
+    v.set("items", arr);
+    v.set("total", static_cast<long long>(arr.items().size()));
+    v.set("keyword", keyword);
+    resp.setJson(200, json::dump(v));
+  });
 
   // ================= 分享链接（管理接口需鉴权；公开端点 /s/* 免鉴权） =================
 
@@ -2235,6 +3718,161 @@ int main(int argc, char** argv) {
     serveFileContent(repo, store, cfg, frow, req, resp);
   });
 
+  // ---- 启动期孤儿 blob 回收（store/blob_gc.h）----
+  // 放在**开始监听之前**：此刻本进程没有在途上传，不存在「blob 已落地、chunk 行未写」
+  // 的窗口，删除是安全的。宽限期再兜一层并发实例的风险。
+  if (cfg.blobGcEnabled) {
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    cv::blobgc::Stats gst;
+    std::string         gerr;
+    const std::int64_t  graceMs =
+        static_cast<std::int64_t>(cfg.blobGcGraceMinutes) * 60LL * 1000LL;
+    const bool ok = cv::blobgc::collectOrphans(
+        store,
+        [&repo](const std::string& h, bool& out, std::string& e) {
+          return repo.chunkExists(h, out, e);
+        },
+        graceMs, static_cast<std::int64_t>(nowMs), /*dryRun=*/false, gst, gerr);
+    if (!ok) {
+      CV_LOG_WARN("孤儿 blob 回收失败（不影响启动）: " << gerr);
+    } else {
+      CV_LOG_INFO("孤儿 blob 回收：扫描 " << gst.scanned << " 个，删除 " << gst.removed
+                                        << " 个，释放 " << gst.freedBytes << " 字节（保留：被引用 "
+                                        << gst.keptReferenced << "，宽限期内 " << gst.keptFresh
+                                        << "，判定失败 " << gst.keptOnError << "）");
+    }
+  }
+
+  // ---- 内容库副本：--backup-blobs / --restore-blobs（各自跑完即退出，不启动服务）----
+  // ⚠️ 与 --scrub 一样，必须在 setDataKey 之后：加密库要先能解密才能校验/复制。
+  if (!cfg.backupBlobsDir.empty()) {
+    cv::blobbackup::BackupStats bst;
+    std::string                berr;
+    if (!cv::blobbackup::mirrorBlobs(store, cfg.backupBlobsDir, /*dryRun=*/false, bst, berr)) {
+      CV_LOG_ERROR("内容库备份失败（不是「没问题」，是没跑完）: " << berr);
+      return 1;
+    }
+    CV_LOG_INFO("内容库备份完成 → " << cfg.backupBlobsDir << "：扫描 " << bst.scanned
+                                    << " 个块，新复制 " << bst.copied << " 个（" << bst.bytesCopied
+                                    << " 字节），已存在跳过 " << bst.skippedExisting
+                                    << "，源已损坏拒绝复制 " << bst.skippedBad);
+    if (bst.skippedBad > 0)
+      CV_LOG_ERROR("有 " << bst.skippedBad
+                         << " 个块在源侧就已损坏、已拒绝复制 —— 请先 --scrub 核对，别把坏数据也备一份。");
+    return bst.skippedBad > 0 ? 1 : 0;
+  }
+  if (!cfg.restoreBlobsDir.empty()) {
+    std::vector<std::string> expected;
+    if (!repo.listReferencedChunkHashes(expected, err)) {
+      CV_LOG_ERROR("恢复无法取得分块清单: " << err);
+      return 1;
+    }
+    cv::blobbackup::RestoreStats rst;
+    std::string                  rerr;
+    if (!cv::blobbackup::restoreBlobs(store, cfg.restoreBlobsDir, expected, /*dryRun=*/false, rst,
+                                      rerr)) {
+      CV_LOG_ERROR("从副本恢复失败: " << rerr);
+      return 1;
+    }
+    CV_LOG_INFO("从副本恢复完成（副本 " << cfg.restoreBlobsDir << "）：检查 " << rst.checked
+                                      << " 个块，本来就正常 " << rst.alreadyOk << "，修复 "
+                                      << rst.restored << " 个（" << rst.bytesRestored << " 字节）");
+    if (rst.missingInReplica > 0 || rst.badReplica > 0) {
+      CV_LOG_ERROR("仍有 " << rst.missingInReplica << " 个块副本里没有、" << rst.badReplica
+                           << " 个块副本自身也损坏 ⇒ 这些内容无法自动还原，需从客户端重新上传。");
+      return 1;
+    }
+    return 0;
+  }
+
+  // ---- 数据校验模式：--scrub 全量巡检一遍然后退出，不启动服务 ----
+  // ⚠️ 必须放在 setDataKey 之后：加密库要能解密才能校验（否则会把每个加密块都误报成损坏）。
+  if (cfg.scrubNow) {
+    std::vector<std::string> expected;
+    if (!repo.listReferencedChunkHashes(expected, err)) {
+      CV_LOG_ERROR("巡检无法取得分块清单: " << err);
+      return 1;
+    }
+    cv::scrub::Stats sst;
+    std::string      serr;
+    if (!cv::scrub::scanHashes(store, expected, /*stopOnFirstBad=*/false, sst, serr)) {
+      CV_LOG_ERROR("内容库巡检失败（不是「没问题」，是没能跑完）: " << serr);
+      return 1;
+    }
+    CV_LOG_INFO("内容库巡检完成：校验 " << sst.checked << " 个块，读取 " << sst.bytes
+                                      << " 字节；正常 " << sst.ok << "，内容损坏 " << sst.corrupt
+                                      << "，读取/解密失败 " << sst.readErrors << "，磁盘缺失 "
+                                      << sst.missing);
+    if (!sst.badHashes.empty()) {
+      const std::size_t show = sst.badHashes.size() < 20 ? sst.badHashes.size() : 20;
+      for (std::size_t i = 0; i < show; ++i)
+        CV_LOG_ERROR("  受损分块 " << sst.badHashes[i]);
+      if (sst.badHashes.size() > show)
+        CV_LOG_ERROR("  …另有 " << (sst.badHashes.size() - show) << " 个受损分块未列出");
+      // 把"哪些块坏了"翻译成"哪些文件打不开了" —— 前者是给程序看的，后者才是给运维/用户看的
+      for (std::size_t i = 0; i < show; ++i) {
+        std::vector<std::string> files;
+        std::string              ferr;
+        if (repo.filesUsingChunk(sst.badHashes[i], 5, files, ferr) && !files.empty()) {
+          std::string joined;
+          for (std::size_t k = 0; k < files.size(); ++k)
+            joined += (k ? "、" : "") + files[k];
+          CV_LOG_ERROR("    受影响文件：" << joined);
+        }
+      }
+      CV_LOG_ERROR("受损块合计 " << sst.badHashes.size()
+                                 << " 个 —— 这些内容已无法还原，需要从客户端重新上传（重传即自愈）。");
+      return 1;
+    }
+    return 0;
+  }
+
+  // ---- 后台周期性巡检（--scrub-interval-hours > 0）----
+  // 只操作 ContentStore（纯文件 IO；加密上下文按调用新建），**不碰数据库句柄** ——
+  // 因此不需要跟服务端的工作线程争 Db，也就不存在 sqlite3 跨线程使用的风险。
+  std::atomic<bool> scrubStop{false};
+  std::thread       scrubThread;
+  if (cfg.scrubIntervalHours > 0) {
+    const int hours = cfg.scrubIntervalHours;
+    // 后台线程**自建一条数据库连接**：Db 句柄有线程归属，绝不能与服务端工作线程共用。
+    // 这正是把"该有哪些块"的查询放在此处、而不是复用主线程 repo 的原因。
+    const std::string scrubDbPath = cfg.dbPath();
+    scrubThread     = std::thread([&store, &scrubStop, hours, scrubDbPath]() {
+      while (!scrubStop.load()) {
+        // 分片睡眠：退出时不用等满一整个周期
+        for (int i = 0; i < hours * 60 && !scrubStop.load(); ++i)
+          std::this_thread::sleep_for(std::chrono::minutes(1));
+        if (scrubStop.load())
+          break;
+        cv::Db sdb;
+        std::string e;
+        if (!sdb.open(scrubDbPath, e)) {
+          CV_LOG_WARN("后台巡检无法打开元数据库: " << e);
+          continue;
+        }
+        cv::FileRepository       srepo(sdb);
+        std::vector<std::string> expected;
+        if (!srepo.listReferencedChunkHashes(expected, e)) {
+          CV_LOG_WARN("后台巡检无法取得分块清单: " << e);
+          continue;
+        }
+        cv::scrub::Stats sst;
+        std::string      serr;
+        if (!cv::scrub::scanHashes(store, expected, false, sst, serr)) {
+          CV_LOG_WARN("后台巡检未能跑完: " << serr);
+          continue;
+        }
+        CV_LOG_INFO("后台巡检：校验 " << sst.checked << " 个块；损坏 " << sst.corrupt
+                                     << "，读取失败 " << sst.readErrors << "，缺失 " << sst.missing);
+        if (!sst.badHashes.empty())
+          CV_LOG_ERROR("后台巡检发现受损分块 " << sst.badHashes.size() << " 个（详见 --scrub 输出）");
+      }
+    });
+    CV_LOG_INFO("后台巡检已启动：每 " << hours << " 小时全量校验一次内容库");
+  }
+
   // 明文 HTTP 监听（可经 --http=off 关闭，仅保留 HTTPS）
   if (cfg.httpEnabled) {
     if (!server.listen(cfg.listenAddr, cfg.port, cfg.workers, err)) {
@@ -2283,6 +3921,10 @@ int main(int argc, char** argv) {
   }
   CV_LOG_INFO("接口就绪：GET /healthz · POST /api/v1/files · 分块上传 /api/v1/uploads/* · GET /api/v1/storage");
   server.runForever();
+
+  // 正常情况下 runForever 不返回；真返回了就干净收掉后台巡检线程
+  scrubStop = true;
+  if (scrubThread.joinable()) scrubThread.join();
 
   CV_LOG_INFO("服务端已停止");
   return 0;

@@ -168,12 +168,23 @@ Rectangle {
                 spacing: Theme.spaceS
                 visible: panel.pState === "idle"
 
-                Text {
+                // 圆形图标井（与 EmptyState 同构，保证"空态家族"观感一致）
+                Rectangle {
                     Layout.alignment: Qt.AlignHCenter
-                    text: "🗂"
-                    font.pointSize: 34
-                    color: Theme.textSecondary
-                    opacity: 0.8
+                    implicitWidth: 56
+                    implicitHeight: 56
+                    radius: width / 2
+                    color: Theme.surfaceSunken
+                    border.width: 1
+                    border.color: Theme.border
+
+                    CvIcon {
+                        anchors.centerIn: parent
+                        name: "grid"
+                        size: 22
+                        color: Theme.textTertiary
+                        strokeWidth: 1.6
+                    }
                 }
                 Label {
                     Layout.fillWidth: true

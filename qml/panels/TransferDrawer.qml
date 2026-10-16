@@ -102,6 +102,24 @@ Rectangle {
                         color: Theme.textSecondary
                         font.pointSize: Theme.fontSecondary
                     }
+                    // 「文件地址」：下载给**落地位置**，上传给**云端目标**。
+                    // 路径为空时不占位（老任务/异常行拿不到路径，别留一条空行）。
+                    Label {
+                        id: addrLabel
+                        Layout.fillWidth: true
+                        readonly property string addr: (model.kind === "download"
+                                                        ? model.localPath
+                                                        : model.remotePath)
+                        visible: addr.length > 0
+                        text: (model.kind === "download" ? qsTr("落到：") : qsTr("传至：")) + addr
+                        color: Theme.textTertiary
+                        font.pointSize: Theme.fontMicro
+                        // 中间省略：两头分别是盘符/根与文件名，都比中间段有信息量
+                        elide: Text.ElideMiddle
+                        HoverHandler { id: addrHover }
+                        ToolTip.visible: addrHover.hovered
+                        ToolTip.text: addrLabel.addr
+                    }
                 }
 
                 Label {

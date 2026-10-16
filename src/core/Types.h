@@ -131,6 +131,10 @@ struct SyncPair {
     QDateTime  lastSync;
     int        pendingCount = 0; // 上次同步处理的文件数
     int        conflictCount = 0;
+    // 选择性同步（FR-3-7）：这些**云端**目录不落地本地。
+    // 条目为相对 remotePath 的路径（'/' 分隔），如 "照片/原图"；
+    // 语义是"仅云端保留" ⇒ 只拦下载方向，且**不会**因为被排除就删掉本地副本。
+    QStringList excludeDirs;
 };
 
 // ============================ 传输 ============================

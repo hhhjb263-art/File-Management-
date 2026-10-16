@@ -193,7 +193,11 @@ void TransferManager::enqueueUpload(const QStringList &localPaths, const QString
         t.name      = QFileInfo(p).fileName(); // 基名（如 报告.pdf）
         m_pending.append(t);
         // 任务身份（基名 / 类型 / 总量）——上层据此在 TransferModel 建行；每任务仅一次
-        emit taskStarted(t.id, t.name, TransferKind::Upload, QFileInfo(p).size());
+        const QString upRemote =
+            t.dir.isEmpty() ? (QStringLiteral("/") + t.name)
+                            : (QStringLiteral("/") + t.dir + QLatin1Char('/') + t.name);
+        emit taskStarted(t.id, t.name, TransferKind::Upload, t.localPath, upRemote,
+                         QFileInfo(p).size());
     }
     emit logMessage(QStringLiteral("info"),
                     QStringLiteral("加入上传队列 %1 项 → 目录「%2」")
@@ -787,7 +791,11 @@ void TransferManager::onDownloadStat(qint64 gen, const Result<FileItem> &r)
     m_cur.total = f.size;
 
     // 任务身份（服务端文件名 / 类型 / 总量）——上层据此在 TransferModel 建行；每任务仅一次
-    emit taskStarted(m_cur.id, m_cur.name, TransferKind::Download, m_cur.total);
+    const QString downLocal = m_cur.finalPath.isEmpty()
+                                  ? (m_cur.destDir + QLatin1Char('/') + m_cur.name)
+                                  : m_cur.finalPath;
+    emit taskStarted(m_cur.id, m_cur.name, TransferKind::Download, downLocal, QString(),
+                     m_cur.total);
 
     const QString dest = resolveDownloadDir(m_cur.destDir);
     if (!QDir().mkpath(dest)) {

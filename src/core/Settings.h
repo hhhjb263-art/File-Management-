@@ -32,8 +32,20 @@ public:
     void    setSavedUser(const QString &user);
     QString savedPassword() const;          // 明文存于 settings.ini（桌面应用惯例；opt-in）
     void    setSavedPassword(const QString &pwd);
+    // ---- 登录门 ----
+    // 用户主动「跳过登录」（继续用访问令牌直连）。持久化：重启后不再自动弹登录门。
+    // 登录成功 / 切换服务器地址时由 AuthController 复位。
+    bool    skipLogin() const;
+    void    setSkipLogin(bool on);
 
     // ---- 外观 ----
+    // 主题模式："light" | "dark" | "system"（非法值读取时归一化为 "system"）。
+    // 旧键 ui/darkMode（布尔）在首次读取时自动迁移：true → "dark"，false → "light"。
+    QString themeMode() const;
+    void    setThemeMode(const QString &mode);
+
+    // 兼容垫片（保留既有签名，避免破坏调用方；全仓当前无调用方）。
+    // 语义收紧为「是否处于深色模式」，与 themeMode 双向映射，不再单独存键。
     bool darkMode() const;
     void setDarkMode(bool dark);
 
