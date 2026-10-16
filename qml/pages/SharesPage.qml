@@ -398,6 +398,9 @@ Item {
                             DangerButton {
                                 glyph: "🗑"
                                 implicitWidth: Theme.controlHeight
+                                // 与前面两个普通操作拉开一点距离：撤销是不可逆操作，
+                                // 挨着"复制/打开"太近容易误点。
+                                Layout.leftMargin: Theme.spaceM
                                 enabled: !page.sharesBusy
                                 onClicked: {
                                     revokeConfirm.shareId = page.sval(shareRow.info, "id", "")

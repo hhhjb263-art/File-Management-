@@ -19,10 +19,24 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QThreadPool>
+
+#include "transfer/TransferManager.h"
 #include <QTimer>
 
 namespace cv {
 namespace {
+// 云端删除的合批上限：一次请求最多删这么多个（再大就分批，避免单个请求过长）
+constexpr int kSyncDeleteBatch = 200;
+// 同步批量上传：一批最多多少个（TransferManager 内部还有 kFileConcurrency=4 的文件级并发）
+constexpr int kSyncUploadBatch = 32;
+
+// 这些动作走"上传"路径
+inline bool isUploadAction(SyncAction::Kind k)
+{
+    return k == SyncAction::UploadNew || k == SyncAction::UploadUpdate
+        || k == SyncAction::ConflictKeepLocal;
+}
+
 
 QString dirNameOf(const QString &relPath)
 {
@@ -507,8 +521,184 @@ void SyncEngine::planPhase()
                      .arg(m_run.local.items.size())
                      .arg(m_run.remote.items.size());
 
+    // ── 大规模删除护栏（2026-10-18 真实事故后加）──
+    // 事故经过：云端被重置为空目录，而本地索引仍记着"这些文件曾同步过"
+    // ⇒ 三方比较得出"云端已删除" ⇒ 计划变成"删本地 1479"，一次把本地文件夹搬空。
+    // （文件进了同步保险箱没丢，但用户看到的就是"我的文件不见了"。）
+    //
+    // 规则：要删的条目数 ≥ 20 **且** 超过该方向总数的一半 ⇒ 拒绝执行本次同步。
+    // 正常使用不会一次删掉自己一半以上的文件；真要清理就分几批做，或删掉同步对重建。
+    {
+      constexpr qint64 kMassDeleteMinCount = 20;
+      const qint64 localCount = m_run.local.items.size();
+      const qint64 remoteCount = m_run.remote.items.size();
+      const qint64 delLocal  = m_run.plan.counts.delLocal;
+      const qint64 delRemote = m_run.plan.counts.delRemote;
+      const bool massLocal  = delLocal  >= kMassDeleteMinCount && delLocal  * 2 > localCount;
+      const bool massRemote = delRemote >= kMassDeleteMinCount && delRemote * 2 > remoteCount;
+      if (massLocal || massRemote) {
+        const QString why = massLocal
+            ? QStringLiteral("计划删除本地 %1 项（本地共 %2 项）").arg(delLocal).arg(localCount)
+            : QStringLiteral("计划删除云端 %1 项（云端共 %2 项）").arg(delRemote).arg(remoteCount);
+        finishCurrent(QStringLiteral("已阻止本次同步：%1，超过一半。"
+                                     "这通常意味着云端被清空 / 换了服务器 / 本地目录被搬走。"
+                                     "文件没有删除（本地进同步保险箱、云端进回收站），"
+                                     "请确认后再处理：确认无误可删除该同步对重建。")
+                          .arg(why));
+        return;
+      }
+    }
+
     emit pairProgress(m_run.pairId, QStringLiteral("开始执行"), 0, m_run.plan.actions.size());
     executePhase();
+}
+
+void SyncEngine::setTransferManager(TransferManager *tm)
+{
+    if (m_tm == tm)
+        return;
+    m_tm = tm;
+    if (!m_tm)
+        return;
+
+    connect(m_tm, &TransferManager::taskStarted, this, &SyncEngine::onTransferStarted,
+            Qt::UniqueConnection);
+    connect(m_tm, &TransferManager::taskCompleted, this, &SyncEngine::onTransferCompleted,
+            Qt::UniqueConnection);
+    connect(m_tm, &TransferManager::taskFinished, this, &SyncEngine::onTransferFinished,
+            Qt::UniqueConnection);
+    // 同名冲突：同步的语义就是"以本地为准覆盖"，不需要弹窗问用户
+    connect(m_tm, &TransferManager::conflictDetected, this,
+            [this](const QString &taskId, const QString &, const QString &) {
+                if (m_tm && m_upTaskRel.contains(taskId))
+                    m_tm->resolveConflict(taskId, true);
+            });
+}
+
+// 攒一批「连续的、同一云端目录」的上传动作并整批 enqueue。
+// 返回 true = 已派出（调用方应直接 return，等回调推进）；
+// 返回 false = 这批不归我管（首个动作不适合批量），交给原来的逐条实现。
+bool SyncEngine::startUploadBatch()
+{
+    const auto  &acts  = m_run.plan.actions;
+    const int    first = m_run.actionIndex;
+    const QString rootAbs = QDir(m_run.pair.localPath).absolutePath();
+    const QString dirRel  = dirNameOf(acts.at(first).relPath);
+
+    QVector<int> idxs;
+    QStringList  paths;
+    for (int i = first; i < acts.size(); ++i) {
+        const SyncAction &x = acts.at(i);
+        if (!isUploadAction(x.kind))
+            break;                                   // 换类型 → 收手
+        if (dirNameOf(x.relPath) != dirRel)
+            break;                                   // 换目录 → 收手（一批一个目标目录）
+        if (x.kind == SyncAction::ConflictKeepLocal)
+            break;                                   // 冲突保本地要先下载云端旧内容，仍走原路径
+        const QString abs = absOf(rootAbs, x.relPath);
+        if (!QFileInfo(abs).isFile())
+            break;                                   // 异常项交给原路径报错
+        idxs << i;
+        paths << abs;
+        if (paths.size() >= kSyncUploadBatch)
+            break;
+    }
+    if (idxs.isEmpty())
+        return false;
+
+    // 目标目录：**一次** ensureFolderPath（本轮已缓存，同目录不会再问）
+    const QString remoteDir = normRemoteRoot(m_run.pair.remotePath) +
+                              (dirRel.isEmpty() ? QString() : (QLatin1Char('/') + dirRel));
+    if (!m_run.remoteDirIds.contains(remoteDir)) {
+        Result<FileItem> d = m_backend->ensureFolderPath(remoteDir);
+        if (!d.ok) {
+            // 目录都建不出来 → 交回原路径，由它逐条报错（信息更准）
+            return false;
+        }
+        m_run.remoteDirIds.insert(remoteDir, d.value.id);
+    }
+    // ⚠️ enqueueUpload 的第二个参数是**目录 id**（Backend::beginUpload 的契约，
+    //    见 TransferTask.remoteId「云端目录 ID」），不是路径。
+    //    HttpBackend 恰好能容忍路径（internal dirFromParentId 会解析），
+    //    MockBackend 直接按 id 查表 ⇒ 传路径会报"目标目录不存在"。
+    //    （这个坑正是 harness 的 A/B 对照抓出来的。）
+    const QString dirId = m_run.remoteDirIds.value(remoteDir);
+
+    m_upBatchActive    = true;
+    m_upBatchLastIndex = idxs.last();
+    m_upBatchRemaining = paths.size();
+    m_upByAbs.clear();
+    for (int k = 0; k < idxs.size(); ++k)
+        m_upByAbs.insert(paths.at(k), acts.at(idxs.at(k)).relPath);
+
+    m_upCollecting = true;
+    m_tm->enqueueUpload(paths, dirId);
+    m_upCollecting = false;
+
+    m_run.log << QStringLiteral("[批量上传] %1 个文件 → %2")
+                     .arg(paths.size())
+                     .arg(remoteDir.isEmpty() ? QStringLiteral("(根)") : remoteDir);
+    if (m_upBatchRemaining <= 0) {   // 极端情况：全部被拒（不该发生）
+        m_upBatchActive = false;
+        return false;
+    }
+    return true;
+}
+
+void SyncEngine::onTransferStarted(const QString &taskId, const QString &, TransferKind kind,
+                                   const QString &localPath, const QString &, qint64)
+{
+    if (!m_upCollecting || kind != TransferKind::Upload)
+        return;
+    const auto it = m_upByAbs.constFind(localPath);
+    if (it == m_upByAbs.constEnd())
+        return;
+    m_upTaskRel.insert(taskId, it.value());
+}
+
+void SyncEngine::onTransferCompleted(const QString &taskId, const FileItem &item)
+{
+    if (m_upTaskRel.contains(taskId))
+        m_upItems.insert(taskId, item);
+}
+
+void SyncEngine::onTransferFinished(const QString &taskId, bool ok, const QString &message)
+{
+    if (!m_upTaskRel.contains(taskId))
+        return;   // 不是本批的任务（例如用户手动传的）
+
+    const QString rel = m_upTaskRel.take(taskId);
+    const FileItem item = m_upItems.take(taskId);
+
+    if (ok && m_index) {
+        // 与内联路径**完全一致**的索引入口：size/mtime 取本地，hash/rev 取服务端返回条目。
+        // rev 是云端权威信号，缺了会在下一轮对账里被当成"云端变了"。
+        const QString rootAbs = QDir(m_run.pair.localPath).absolutePath();
+        const QFileInfo fi(absOf(rootAbs, rel));
+        LocalIndex::Entry e;
+        e.pairId = m_run.pairId;
+        e.relPath = rel;
+        e.size    = fi.size();
+        e.mtime   = fi.lastModified().toUTC();
+        e.hash    = item.hash;
+        e.rev     = item.rev;
+        m_index->put(e);
+    } else if (!ok) {
+        m_run.failed = true;
+        m_run.error  = message;
+        m_run.log << QStringLiteral("[上传失败] %1 — %2").arg(rel, message);
+    }
+
+    if (--m_upBatchRemaining > 0)
+        return;
+
+    // 整批结束：推进到批尾的下一项，继续对账
+    m_upBatchActive = false;
+    m_upByAbs.clear();
+    m_run.actionIndex = m_upBatchLastIndex + 1;
+    emit pairProgress(m_run.pairId, QStringLiteral("批量上传完成"),
+                      m_run.actionIndex, m_run.plan.actions.size());
+    QTimer::singleShot(0, this, &SyncEngine::executePhase);
 }
 
 void SyncEngine::executePhase()
@@ -516,6 +706,17 @@ void SyncEngine::executePhase()
     if (m_run.actionIndex >= m_run.plan.actions.size()) {
         finishCurrent(QString());
         return;
+    }
+
+    // ── 批量上传（仅在注入 TransferManager 时启用）──
+    // 批次在飞：什么都不做，等 onTransferFinished 收尾推进。
+    if (m_upBatchActive)
+        return;
+    // 当前动作是上传 ⇒ 攒一批连续的、同目录的，整批交给 TransferManager
+    // （它自带 4 文件并发 + 3 块并发，且不阻塞主线程）。
+    if (m_tm && isUploadAction(m_run.plan.actions.at(m_run.actionIndex).kind)) {
+        if (startUploadBatch())
+            return;
     }
 
     const SyncAction a = m_run.plan.actions[m_run.actionIndex];
@@ -549,9 +750,49 @@ void SyncEngine::executePhase()
 
         // ---------------- 删除 -----------------
         if (a.kind == SyncAction::DeleteRemote) {
+            // ── 批量：把后面**连续**的 DeleteRemote 动作攒成一次请求 ──
+            // 原来每个都发一次 DELETE：删 500 个云端文件 = 500 次往返（且串行在主线程）。
+            // 批量删除是"进回收站"（可恢复），所以这里可以放心合批。
+            //
+            // 索引推进策略（保守）：**只有整批全成功才 remove 这些路径**。
+            // 部分失败时索引不推进 ⇒ 下一轮对账会把它们当"云端还在"重试一遍
+            // （最多多跑一轮，但不会出现"索引说删了、云端还在"的错位）。
+            QVector<int> idxs;
+            QStringList  ids;
+            for (int i = m_run.actionIndex; i < m_run.plan.actions.size(); ++i) {
+                const SyncAction &x = m_run.plan.actions.at(i);
+                if (x.kind != SyncAction::DeleteRemote) break;
+                const SyncSnapshot::Item *rem = m_run.remote.find(x.relPath);
+                if (!rem || rem->id.isEmpty()) break;   // 异常项交给通用路径报错
+                ids << rem->id;
+                idxs << i;
+                if (ids.size() >= kSyncDeleteBatch) break;
+            }
+
+            if (ids.size() >= 2) {
+                const Result<QPair<int, QString>> br = m_backend->moveToTrashBatch(ids);
+                if (!br.ok) {
+                    err = QStringLiteral("删除云端失败：") + br.error;
+                    return false;
+                }
+                if (br.value.first != ids.size()) {
+                    err = QStringLiteral("批量删除云端：成功 %1/%2 项").arg(br.value.first)
+                              .arg(ids.size());
+                    return false;   // 索引不推进，下一轮重试
+                }
+                if (m_index) {
+                    for (int i : idxs)
+                        m_index->remove(m_run.pairId, m_run.plan.actions.at(i).relPath);
+                }
+                // 已处理到 idxs.last()，外层会 ++ ⇒ 正好落到下一个动作
+                m_run.actionIndex = idxs.last();
+                m_run.log << QStringLiteral("[批量删云端] %1 项").arg(ids.size());
+                return true;
+            }
+
+            // 单个：沿用原路径（最保守）
             const SyncSnapshot::Item *rem = m_run.remote.find(a.relPath);
             if (!rem) { err = QStringLiteral("云端条目已不存在"); return false; }
-            // 进云端回收站（可恢复），不是物理删除
             Ok o = m_backend->moveToTrash(rem->id);
             if (!o.ok) { err = QStringLiteral("删除云端失败：") + o.error; return false; }
             if (m_index) m_index->remove(m_run.pairId, a.relPath);
@@ -610,11 +851,20 @@ void SyncEngine::executePhase()
                                       (dirNameOf(a.relPath).isEmpty()
                                            ? QString()
                                            : (QLatin1Char('/') + dirNameOf(a.relPath)));
-            Result<FileItem> dirRes = m_backend->ensureFolderPath(remoteDir);
-            if (!dirRes.ok) { err = QStringLiteral("准备云端目录失败：") + dirRes.error; return false; }
+            // 云端目录 id 按轮缓存：同目录下的第 2..N 个文件不再发 ensureFolderPath。
+            QString remoteDirId = m_run.remoteDirIds.value(remoteDir);
+            if (remoteDirId.isEmpty()) {
+                Result<FileItem> dirRes = m_backend->ensureFolderPath(remoteDir);
+                if (!dirRes.ok) {
+                    err = QStringLiteral("准备云端目录失败：") + dirRes.error;
+                    return false;
+                }
+                remoteDirId = dirRes.value.id;
+                m_run.remoteDirIds.insert(remoteDir, remoteDirId);
+            }
 
             m_backend->setUploadOverwrite(true);
-            Result<UploadTicket> t = m_backend->beginUpload(dirRes.value.id,
+            Result<UploadTicket> t = m_backend->beginUpload(remoteDirId,
                                                             baseNameOf(a.relPath),
                                                             fi.size(), hash);
             if (!t.ok) {

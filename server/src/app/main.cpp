@@ -1700,6 +1700,111 @@ int main(int argc, char** argv) {
     CV_LOG_INFO("移动文件 " << before.name << " → " << (newDir.empty() ? "(根)" : newDir));
   });
 
+  // ---- POST /api/v1/files/move （**批量**移动到另一个目录）----
+  // 语义与单条 POST /files/:id/move 完全一致（同一套 moveFileToDir + 镜像 rename），
+  // 只是把 N 次往返压成 1 次。单个失败（不存在/越权/同名冲突）不影响其余。
+  server.route("POST", "/api/v1/files/move",
+               [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    const std::int64_t oid = scopeOwner(req.authUserId);
+    json::Value body = parseJsonBody(req.body, perr);
+    if (!perr.empty()) {
+      resp.setError(400, "invalid json: " + perr);
+      return;
+    }
+    const json::Value* idsV = body.find("ids");
+    const json::Value* pdir = body.find("dir");
+    if (!idsV || idsV->type() != json::Value::Type::Array) {
+      resp.setError(400, "ids must be an array");
+      return;
+    }
+    if (!pdir || pdir->type() != json::Value::Type::String) {
+      resp.setError(400, "missing dir");
+      return;
+    }
+    std::string newDir;
+    if (!sanitizeDirParam(pdir->stringValue(), newDir, resp)) return;   // 空串 = 根
+
+    json::Value okIds   = json::Value::array();
+    json::Value failIds = json::Value::array();
+    for (const json::Value& one : idsV->items()) {
+      const std::int64_t id = static_cast<std::int64_t>(one.numberValue(-1));
+      cv::FileRow before;
+      // owner 不匹配一律按"查不到"处理，避免泄漏他人文件是否存在
+      if (id <= 0 || !repo.findById(id, before, perr) || before.ownerId != oid
+          || !repo.moveFileToDir(oid, id, newDir, perr)) {
+        failIds.push_back(json::Value(static_cast<long long>(id)));
+        continue;
+      }
+      std::error_code rec;
+      if (before.dir != newDir) {
+        fs::rename(mirrorPathFor(cfg, oid, before.dir, before.name),
+                   mirrorPathFor(cfg, oid, newDir, before.name), rec);
+        if (rec) CV_LOG_WARN("批量移动：镜像 rename 失败（元数据已更新）: " << rec.message());
+      }
+      okIds.push_back(json::Value(static_cast<long long>(id)));
+    }
+
+    json::Value out = json::Value::object();
+    out.set("ok_ids", okIds);
+    out.set("failed_ids", failIds);
+    out.set("ok_count", static_cast<long long>(okIds.items().size()));
+    out.set("failed_count", static_cast<long long>(failIds.items().size()));
+    out.set("dir", newDir);
+    resp.setJson(200, json::dump(out));
+    CV_LOG_INFO("批量移动 → " << (newDir.empty() ? "(根)" : newDir) << "：成功 "
+                            << okIds.items().size() << " 项，失败 "
+                            << failIds.items().size() << " 项");
+  });
+
+  // ---- POST /api/v1/files/:id/scan （对**已存在**的文件做一次恶意文件判定）----
+  // 与上传时的判定**同源**：都按内容哈希查、共用 file_scan 缓存 ⇒ 同一个内容查过一次就不会再打远端。
+  // 文件本身不出服务器（只发哈希）。
+  server.route("POST", "/api/v1/files/:id/scan",
+               [&](const net::Request& req, net::Response& resp) {
+    std::string perr;
+    const std::int64_t oid = scopeOwner(req.authUserId);
+    std::int64_t id = 0;
+    if (!parseId(req.param("id"), id)) {
+      resp.setError(404, "file not found");
+      return;
+    }
+    cv::FileRow row;
+    if (!repo.findById(id, row, perr) || row.ownerId != oid) {
+      resp.setError(404, "file not found");   // 越权一律按"查不到"，不泄漏存在性
+      return;
+    }
+    if (!cfg.scanEnabled) {
+      // 503 而不是 200：让客户端能把"服务端没开这个功能"和"查了但没结论"区分开
+      resp.setError(503, "服务端未启用病毒查杀（需 --scan 与 --scan-api-key）");
+      return;
+    }
+
+    cv::scan::Policy policy;
+    policy.blockThreshold = cfg.scanBlockThreshold;
+    policy.failOpen       = cfg.scanFailOpen;
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    std::string            serr;
+    const cv::scan::Result r = cv::scan::scan(db, row.contentHash, scanFetcher, policy,
+                                              static_cast<std::int64_t>(nowMs),
+                                              /*cacheEnabled=*/true, serr);
+
+    cv::json::Value v = cv::json::Value::object();
+    v.set("verdict", cv::scan::verdictName(r.verdict));
+    v.set("detail", r.detail);
+    v.set("engines_malicious", static_cast<long long>(r.enginesMalicious));
+    v.set("engines_suspicious", static_cast<long long>(r.enginesSuspicious));
+    v.set("engines_total", static_cast<long long>(r.enginesTotal));
+    v.set("from_cache", r.fromCache);
+    v.set("remote_failed", r.fetcherFailed);
+    v.set("blocked", r.decision == cv::scan::Decision::Block);
+    resp.setJson(200, cv::json::dump(v));
+    CV_LOG_INFO("病毒查杀 id=" << id << " 「" << row.name << "」 → " << cv::scan::verdictName(r.verdict)
+                              << "（" << r.detail << "）" << (r.fromCache ? " [缓存]" : ""));
+  });
+
   server.route("DELETE", "/api/v1/files/:id",
                [&](const net::Request& req, net::Response& resp) {
                  std::string perr;
@@ -1733,6 +1838,56 @@ int main(int argc, char** argv) {
                  CV_LOG_INFO("移入回收站 id=" << id << " dir=" << row.dir << " name=" << row.name);
                });
 
+  // ---- POST /api/v1/files/trash （**批量**移入回收站）----
+  // 为什么需要：客户端多选删除原先对每个文件发一次 DELETE，N 个文件 = N 次往返，
+  // 中途没有任何反馈 ⇒ 用户体感"卡住/很慢"。这里一次请求处理 N 个 id。
+  // 单个失败不影响其余：逐个记录，响应里返回成功/失败明细（客户端据 failed_ids 报告）。
+  server.route("POST", "/api/v1/files/trash",
+               [&](const net::Request& req, net::Response& resp) {
+    json::Value in;
+    std::string jerr;
+    if (!json::parse(req.body, in, jerr) || in.type() != json::Value::Type::Object) {
+      resp.setError(400, "bad request body");
+      return;
+    }
+    const json::Value* idsV = in.find("ids");
+    if (!idsV || idsV->type() != json::Value::Type::Array) {
+      resp.setError(400, "ids must be an array");
+      return;
+    }
+
+    std::string      perr;
+    const std::int64_t auth  = req.authUserId;
+    const std::int64_t nowMs = nowMillis();
+    json::Value okIds   = json::Value::array();
+    json::Value failIds = json::Value::array();
+
+    for (const json::Value& one : idsV->items()) {
+      const std::int64_t id = static_cast<std::int64_t>(one.numberValue(-1));
+      if (id <= 0) {
+        failIds.push_back(json::Value(static_cast<long long>(id)));
+        continue;
+      }
+      FileRow row;
+      if (!repo.findById(id, row, perr) || !ownerVisible(row, auth)
+          || !repo.trashFile(id, nowMs, perr)) {
+        failIds.push_back(json::Value(static_cast<long long>(id)));
+        continue;
+      }
+      okIds.push_back(json::Value(static_cast<long long>(id)));
+    }
+
+    json::Value out = json::Value::object();
+    out.set("ok_ids", okIds);
+    out.set("failed_ids", failIds);
+    out.set("ok_count", static_cast<long long>(okIds.items().size()));
+    out.set("failed_count", static_cast<long long>(failIds.items().size()));
+    resp.setJson(200, json::dump(out));
+    CV_LOG_INFO("批量移入回收站：成功 " << okIds.items().size() << " 项，失败 "
+                                      << failIds.items().size() << " 项（请求 "
+                                      << idsV->items().size() << " 项）");
+  });
+
   // ---- GET /api/v1/storage （磁盘空间自查）----
   server.route("GET", "/api/v1/storage",
                [&](const net::Request& req, net::Response& resp) {
@@ -1749,22 +1904,28 @@ int main(int argc, char** argv) {
     v.set("free_bytes", static_cast<long long>(freeBytes));
     v.set("total_bytes", static_cast<long long>(totalBytes));
     v.set("upload_safety_factor", static_cast<long long>(kSpaceSafetyFactor));
-    // 归属统计：登录用户只回传"自己已用字节"，避免泄漏他人占用。
-    if (req.authUserId != -1) {
-      std::string perr;
-      std::int64_t used = 0;
-      if (repo.sumSizeOfOwner(req.authUserId, used, perr)) {
-        v.set("used_bytes", static_cast<long long>(used));
-    // 配额（PRD FR-1-4 / FR-7-6）：客户端据此显示余量并在 ≥80% 时提醒。
-    // quota_bytes = 0 表示不限（前端不要拿它做除法）。
+    // 归属统计：
+    //   · 登录用户（authUserId >= 1）→ 只回传"自己已用"，避免泄漏他人占用；
+    //   · legacy（authUserId == -1）→ **同样要回传**：那时不存在"他人"，谈不上泄漏；
+    //     客户端拿不到 used_bytes 时只能显示「服务器未返回容量信息」。
+    //   ⚠️ 这段原先被 `if (req.authUserId != -1)` 整段包住 —— 静态 token 下**一个字都不发**，
+    //      这才是"服务器剩余空间一直不显示"的直接原因（不是客户端不解析）。
     {
+      std::string  perr;
+      std::int64_t used = 0;
+      if (!repo.sumSizeOfOwner(scopeOwner(req.authUserId), used, perr)) {
+        CV_LOG_WARN("统计已用空间失败（used_bytes 按 0 上报）: " << perr);
+        used = 0;
+      }
+      v.set("used_bytes", static_cast<long long>(used));
+
+      // 配额（PRD FR-1-4 / FR-7-6）：客户端据此显示余量并在 ≥80% 时提醒。
+      // quota_bytes = 0 表示不限（前端不要拿它做除法）。
       const std::int64_t quota = userQuotaBytes(usersDb, cfg, scopeOwner(req.authUserId));
       v.set("quota_bytes", static_cast<long long>(quota));
       v.set("quota_percent", static_cast<long long>(
                                  quota > 0 ? cv::quota::percentOf(used, quota) : 0));
       v.set("quota_unlimited", static_cast<bool>(quota <= 0));
-    }
-      }
     }
     resp.setJson(200, json::dump(v));
   });

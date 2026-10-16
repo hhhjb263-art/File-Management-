@@ -37,10 +37,12 @@
 #include <QTimer>
 
 #include <cstdio>
+#include <memory>
 
 #include "core/AppPaths.h"
 #include "net/MockBackend.h"
 #include "sync/LocalIndex.h"
+#include "transfer/TransferManager.h"
 #include "sync/SyncEngine.h"
 
 using namespace cv;
@@ -140,6 +142,18 @@ int main(int argc, char **argv)
     pair.enabled    = true;
 
     SyncEngine engine(&backend, &index);
+
+    // ── A/B：批量上传路径 vs 原内联路径 ──
+    // 设 CV_SYNC_USE_TM=1 时注入 TransferManager ⇒ 上传动作走"批量派发 + 事件驱动"分支
+    // （与生产一致）；不设则走原来的逐条内联实现。两种模式的结果必须完全一致。
+    std::unique_ptr<TransferManager> tm;
+    if (qEnvironmentVariableIsSet("CV_SYNC_USE_TM")) {
+        tm.reset(new TransferManager(&backend));
+        engine.setTransferManager(tm.get());
+        std::printf("[MODE] 批量上传路径（注入 TransferManager）\n");
+    } else {
+        std::printf("[MODE] 原内联路径（未注入 TransferManager）\n");
+    }
     engine.setDeviceName(QStringLiteral("E2E"));
     engine.setDebounceMs(100);   // 测试里不等 5 秒
     QObject::connect(&engine, &SyncEngine::logAppended,

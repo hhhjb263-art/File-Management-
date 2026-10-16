@@ -582,13 +582,31 @@ Item {
                         }
                     }
 
-                    Label {
+                    // 已登录时令牌框是禁用的（readOnly + enabled:false）—— 原来这里只有一句
+                    // "退出登录后可手动指定"的提示，**却没有任何退出入口**，用户点输入框毫无反应、
+                    // 也不知道该去哪操作（退出按钮只在主界面右上角账户菜单里）。
+                    // 这里直接把按钮放在提示旁边，把这个死胡同堵上。
+                    RowLayout {
                         Layout.fillWidth: true
                         visible: page.tokenManaged
-                        text: qsTr("已通过登录会话托管访问令牌，无需手动填写。退出登录后可在此手动指定。")
-                        color: Theme.success
-                        font.pointSize: Theme.fontSecondary
-                        wrapMode: Text.WordWrap
+                        spacing: Theme.spaceS
+
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr("令牌由登录会话托管。要手动填写，请先退出登录：")
+                            color: Theme.success
+                            font.pointSize: Theme.fontSecondary
+                            wrapMode: Text.WordWrap
+                        }
+                        SecondaryButton {
+                            text: qsTr("退出登录")
+                            onClicked: {
+                                if (typeof Auth !== "undefined")
+                                    Auth.logout()
+                            }
+                            ToolTip.visible: hovered
+                            ToolTip.text: qsTr("退出后此输入框即可编辑")
+                        }
                     }
                     Label {
                         Layout.fillWidth: true

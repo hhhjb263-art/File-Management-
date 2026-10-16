@@ -424,6 +424,12 @@ void SyncController::clearLog()
     emit logChanged();
 }
 
+void SyncController::setTransferManager(TransferManager *tm)
+{
+    if (m_engine)
+        m_engine->setTransferManager(tm);
+}
+
 void SyncController::appendLog(const QString &line)
 {
     const QString stamped =

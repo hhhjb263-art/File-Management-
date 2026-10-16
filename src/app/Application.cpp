@@ -82,6 +82,14 @@ void Application::start()
     m_syncIndex = new cv::LocalIndex(this);
     m_syncIndex->open(cv::AppPaths::indexDbFile());
     m_sync = new cv::SyncController(m_backend, m_syncIndex, m_syncPairs, this);
+    // ⚠️ 暂**不**把 TransferManager 注入同步引擎。
+    // 批量上传路径已实现（SyncEngine::setTransferManager / startUploadBatch），
+    // 但 harness 的 A/B 对照仍有 1 条语义差异未对齐：
+    //   B1「本地改过的文件应识别为『上传修改』而非『新增』」
+    // 差值集中在"覆盖/版本"语义（内联路径对每次上传都 setUploadOverwrite(true)，
+    // 走 TransferManager 时则先 409 再 resolveConflict 覆盖）。
+    // 在把这个差异抹平并让 A/B 双模式都 17/0 之前，生产走已验证的内联路径。
+    // m_sync->setTransferManager(m_transfer);
     m_transfers = new cv::TransferController(m_transfer, this);
     // 把队列进度镜像到 QML 数据模型（否则传输页/侧栏永远空白）
     m_transfers->setTaskModel(m_transferModel);

@@ -230,10 +230,12 @@ ApplicationWindow {
             anchors.leftMargin: Theme.spaceM
             anchors.rightMargin: Theme.spaceM
             spacing: Theme.spaceM
-            visible: !window.compact
 
             Label {
                 Layout.fillWidth: true
+                // 窄窗口只隐藏这行状态文字；空间指示**始终显示**（原来整行 hidden，
+                // 于是窗口一窄用户就完全看不到服务器容量了）。
+                visible: !window.compact
                 text: App.statusText
                 color: App.statusText.indexOf("✗") === 0 ? Theme.danger : Theme.textSecondary
                 font.pointSize: Theme.fontMicro
@@ -252,9 +254,22 @@ ApplicationWindow {
                     color: Theme.textTertiary
                 }
                 Label {
-                    text: qsTr("空间 %1").arg(Stats.freeText)
-                    color: Theme.textTertiary
+                    // 已用百分比：快满时变黄/红，比纯文字数字更快看出"要不要清理"
+                    readonly property int usedPct: (Stats.totalBytes > 0 && Stats.freeBytes >= 0)
+                        ? Math.round((Stats.totalBytes - Stats.freeBytes) * 100 / Stats.totalBytes)
+                        : -1
+                    // 明确写"磁盘"：total/free 是**整块盘**的数字（含系统占用），
+                    // 不是"网盘里你的文件占了多少"。少了这两个字，网盘空着却显示"已用 80%"
+                    // 会让人以为数据丢了。
+                    text: usedPct >= 0
+                          ? qsTr("磁盘已用 %1% · %2").arg(usedPct).arg(Stats.freeText)
+                          : qsTr("空间 %1").arg(Stats.freeText)
+                    color: usedPct >= 95 ? Theme.danger
+                           : (usedPct >= 80 ? Theme.warning : Theme.textTertiary)
                     font.pointSize: Theme.fontMicro
+                    ToolTip.visible: hoverTool.hovered
+                    ToolTip.text: Stats.freeText
+                    HoverHandler { id: hoverTool }
                 }
             }
 

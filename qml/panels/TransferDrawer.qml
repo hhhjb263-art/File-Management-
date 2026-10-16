@@ -41,6 +41,22 @@ Rectangle {
                 font.bold: true
                 elide: Text.ElideRight
             }
+            // 暂停 / 继续：引擎一次只跑一个任务，暂停它会同时挡住后面的队列
+            // （"暂停传输"就该是这个语义）。只在进行中或已暂停时出现。
+            GhostButton {
+                visible: (typeof Transfers !== "undefined")
+                         && (Transfers.activeCount > 0 || Transfers.paused)
+                glyph: Transfers.paused ? "▶" : "⏸"
+                text: Transfers.paused ? qsTr("继续") : qsTr("暂停")
+                onClicked: {
+                    if (Transfers.paused)
+                        Transfers.resume()
+                    else
+                        Transfers.pause()
+                }
+                ToolTip.visible: hovered
+                ToolTip.text: Transfers.paused ? qsTr("继续当前传输") : qsTr("暂停当前传输（含后续排队）")
+            }
             GhostButton {
                 text: qsTr("查看全部")
                 onClicked: root.openFullPageRequested()

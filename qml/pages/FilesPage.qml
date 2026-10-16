@@ -202,6 +202,16 @@ Item {
     }
 
     // 由 id 反查名称（右键菜单「分享…」需要把「唯一选中项」的 name 传给对话框）
+    // 空白处右键：清掉"右键目标"，于是 ctxMenu 里依赖 ctxId 的项全部自动置灰，
+    // 只剩「刷新 / 新建 / 上传到此目录 / 排序」可用（这正是空白处的合理菜单）。
+    function openBlankMenu() {
+        page.ctxId    = ""
+        page.ctxName  = ""
+        page.ctxDir   = ""
+        page.ctxIsDir = false
+        ctxMenu.popup()
+    }
+
     function nameForId(id) {
         const n = proxyModel.count
         for (let i = 0; i < n; ++i) {
@@ -351,6 +361,19 @@ Item {
                 text: qsTr("下载")
                 enabled: page.selectedIds.length > 0
                 onClicked: Files.downloadSelected()
+            }
+            // 「操作」下拉：把右键菜单里**针对选中项**的动作搬到文件操作区。
+            // 未选中任何文件 → 整颗按钮置灰（"没有选择文件，文件相关功能不可用"）。
+            SecondaryButton {
+                id: opsBtn
+                glyph: "⋯"
+                text: qsTr("操作")
+                enabled: page.selectedIds.length > 0
+                onClicked: opsMenu.popup(opsBtn, 0, opsBtn.height)
+                ToolTip.visible: hovered
+                ToolTip.text: page.selectedIds.length > 0
+                              ? qsTr("对选中的 %1 项执行操作").arg(page.selectedIds.length)
+                              : qsTr("先选中文件再操作")
             }
         }
 
@@ -505,6 +528,15 @@ Item {
 
                 // 列表
                 ListView {
+                    // 空白处右键：列表里没有命中任何行时才处理，
+                    // 命中行时由行自己的 MouseArea 弹"针对该行"的菜单（互不打架）。
+                    TapHandler {
+                        acceptedButtons: Qt.RightButton
+                        onTapped: (ev) => {
+                            if (listView.indexAt(ev.position.x, ev.position.y) < 0)
+                                page.openBlankMenu()
+                        }
+                    }
                     id: listView
                     Layout.fillWidth: true
                     Layout.fillHeight: true
@@ -697,6 +729,92 @@ Item {
         · 删除为 danger 色，且目录行置灰（服务端目录无删除语义）
         · 排序为嵌套 Menu（Qt6：Menu 嵌 Menu 自动成为子菜单；MenuItem.menu 只读）
     */
+    // 工具栏「操作」下拉的内容：与右键菜单同源，但**以选中项为目标**
+    // （工具栏没有"右键目标"这回事）。未选中/多选时逐项自己判定可用性。
+    // 新建/重命名/移动成功后稍等再刷新：这些请求是异步的，立刻刷新会拿不到新条目
+    Timer {
+        id: createdRefreshTimer
+        interval: 400
+        onTriggered: page.refreshNow()
+    }
+
+    Menu {
+        id: opsMenu
+        width: 224
+        MenuItem {
+            text: qsTr("分享…")
+            enabled: page.selectedIds.length === 1
+            onTriggered: {
+                const id = page.selectedIds[0]
+                shareDialog.openFor(id, page.nameForId(id))
+            }
+        }
+        MenuItem {
+            text: qsTr("标签…")
+            enabled: page.selectedIds.length === 1 && !page.isDirId(page.selectedIds[0])
+            onTriggered: {
+                const id = page.selectedIds[0]
+                tagAssignDialog.openFor(id, page.nameForId(id))
+            }
+        }
+        MenuItem {
+            text: qsTr("版本历史…")
+            enabled: page.selectedIds.length === 1 && !page.isDirId(page.selectedIds[0])
+            onTriggered: {
+                const id = page.selectedIds[0]
+                page.requestVersions(id, page.nameForId(id))
+            }
+        }
+        MenuItem {
+            text: qsTr("病毒查杀…")
+            enabled: page.selectedIds.length === 1 && !page.isDirId(page.selectedIds[0])
+            onTriggered: Files.scanFile(page.selectedIds[0])
+        }
+        MenuSeparator { }
+        MenuItem {
+            text: qsTr("重命名…")
+            enabled: page.selectedIds.length === 1
+            onTriggered: {
+                const id = page.selectedIds[0]
+                const nm = page.nameForId(id)
+                // 文件夹改的是**路径**（两个数据源的目录 id 口径不同）
+                if (page.isDirId(id))
+                    folderRenameDialog.openFor(page.dirPathOf(id), nm)
+                else
+                    renameDialog.openFor(id, nm)
+            }
+        }
+        MenuItem {
+            text: page.selectedIds.length > 1
+                  ? qsTr("移动到…（%1 项）").arg(page.selectedIds.length)
+                  : qsTr("移动到…")
+            enabled: page.selectedIds.length > 0
+            onTriggered: {
+                // 对话框只需要一个"名字"做展示；真正搬多少个由 onSubmit 里按选中数分派。
+                const n = page.selectedIds.length
+                const label = n > 1 ? qsTr("选中的 %1 项").arg(n)
+                                    : page.nameForId(page.selectedIds[0])
+                moveToDialog.openFor(page.selectedIds[0], label)
+            }
+        }
+        MenuItem {
+            text: page.selectedIds.length > 1
+                  ? qsTr("移入回收站（%1 项）").arg(page.selectedIds.length)
+                  : qsTr("移入回收站")
+            enabled: page.selectedIds.length > 0
+            onTriggered: {
+                if (page.selectedIds.length > 1) {
+                    // 批量：直接进回收站（**可恢复**，所以这里不弹确认；
+                    // 真正的永久删除收敛在回收站页且带二次确认）
+                    Files.removeSelected()
+                } else {
+                    const id = page.selectedIds[0]
+                    deleteDialog.openFor(id, page.nameForId(id))
+                }
+            }
+        }
+    }
+
     Menu {
         id: ctxMenu
         width: 224
@@ -748,6 +866,12 @@ Item {
             enabled: page.ctxId.length > 0 && !page.ctxIsDir
             onTriggered: page.requestVersions(page.ctxId, page.ctxName)
         }
+        MenuItem {
+            // 病毒查杀：服务端按**内容哈希**查（文件本身不出服务器），与上传时的判定共用缓存
+            text: qsTr("病毒查杀…")
+            enabled: page.ctxId.length > 0 && !page.ctxIsDir
+            onTriggered: Files.scanFile(page.ctxId)
+        }
 
         MenuSeparator { }
 
@@ -779,9 +903,16 @@ Item {
             //    真正的永久删除收敛到回收站页的「彻底删除」，入口唯一且带二次确认。
             //    目录也可删除：服务端支持整个目录进站，其下文件一并标记，
             //    回收站里看到的是那个文件夹，而不是散开的 N 个文件。
-            text: qsTr("移入回收站")
-            enabled: page.ctxId.length > 0
-            onTriggered: deleteDialog.openFor(page.ctxId, page.ctxName)
+            text: page.selectedIds.length > 1
+                  ? qsTr("移入回收站（选中 %1 项）").arg(page.selectedIds.length)
+                  : qsTr("移入回收站")
+            enabled: page.ctxId.length > 0 || page.selectedIds.length > 1
+            onTriggered: {
+                if (page.selectedIds.length > 1)
+                    Files.removeSelected()
+                else
+                    deleteDialog.openFor(page.ctxId, page.ctxName)
+            }
             contentItem: Text {
                 text: miDelete.text
                 font: miDelete.font
@@ -844,9 +975,80 @@ Item {
         id: newFileDialog
         onSubmit: (name, kind) => {
             if (kind === "folder")
+                // 新建是异步请求：立刻刷新会拿不到新条目，所以要等它落地再刷。
+                // （宁可多刷一次，也不要让用户以为"新建没生效"。）
                 Files.createFolder(name)
             else
                 Files.createFile(name)
+            createdRefreshTimer.restart()
+        }
+    }
+
+    // 病毒查杀结果（内联 Dialog：不新增文件、不动 qrc）
+    Dialog {
+        id: scanDialog
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(440, (parent ? parent.width - Theme.spaceXl * 2 : 440))
+        padding: Theme.spaceL
+        title: qsTr("病毒查杀结果")
+        standardButtons: Dialog.NoButton
+
+        property string verdictText: ""
+        property string detailText: ""
+        property bool   blocked: false
+        property bool   remoteFailed: false
+        property bool   failed: false
+
+        contentItem: ColumnLayout {
+            spacing: Theme.spaceS
+
+            Label {
+                Layout.fillWidth: true
+                text: scanDialog.failed
+                      ? qsTr("查杀未完成")
+                      : qsTr("判定：%1").arg(scanDialog.verdictText)
+                color: (scanDialog.failed || scanDialog.blocked) ? Theme.danger : Theme.textPrimary
+                font.pointSize: Theme.fontBody
+                font.bold: true
+                wrapMode: Text.WordWrap
+            }
+            Label {
+                Layout.fillWidth: true
+                text: scanDialog.detailText
+                color: Theme.textSecondary
+                font.pointSize: Theme.fontSecondary
+                wrapMode: Text.WordWrap
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: scanDialog.remoteFailed && !scanDialog.failed
+                text: qsTr("服务器这次没能从远端拿到结论（网络或未配置 API Key）。"
+                           + "这不代表文件安全，只是这次没查成。")
+                color: Theme.textTertiary
+                font.pointSize: Theme.fontMicro
+                wrapMode: Text.WordWrap
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                PrimaryButton {
+                    text: qsTr("知道了")
+                    onClicked: scanDialog.close()
+                }
+            }
+        }
+    }
+
+    Connections {
+        target: Files
+        function onScanFinished(fileId, verdictText, detail, blocked, remoteFailed, ok, error) {
+            scanDialog.failed       = !ok
+            scanDialog.verdictText  = verdictText
+            scanDialog.detailText   = ok ? detail : error
+            scanDialog.blocked      = blocked
+            scanDialog.remoteFailed = remoteFailed
+            scanDialog.open()
         }
     }
 
@@ -873,7 +1075,13 @@ Item {
 
     MoveToDialog {
         id: moveToDialog
-        onSubmit: (id, targetId) => Files.moveTo(id, targetId)
+        // 多选时走批量（一次请求搬 N 个）；单选保持原路径
+        onSubmit: (id, targetId) => {
+            if (page.selectedIds.length > 1)
+                Files.moveSelectedTo(targetId)
+            else
+                Files.moveTo(id, targetId)
+        }
     }
 
     /*!

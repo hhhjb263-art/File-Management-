@@ -1213,6 +1213,76 @@ Ok HttpBackend::moveDir(const QString &from, const QString &to)
     return r.ok() ? ok() : err(r.error);
 }
 
+Result<QPair<int, QString>> HttpBackend::moveToTrashBatch(const QStringList &ids)
+{
+    // 一次 POST 处理 N 个 id：N 次往返压成 1 次（多选删除慢的根因就是 N 次串行 DELETE）。
+    QJsonArray arr;
+    for (const QString &id : ids)
+        arr.append(id.toDouble());
+    QJsonObject body;
+    body.insert(QStringLiteral("ids"), arr);
+
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/files/trash"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    if (!r.ok())
+        return Result<QPair<int, QString>>::fail(r.error);
+
+    const QJsonObject o   = QJsonDocument::fromJson(r.body).object();
+    const int         ok  = o.value(QStringLiteral("ok_count")).toInt();
+    const int         bad = o.value(QStringLiteral("failed_count")).toInt();
+    QString           err;
+    if (bad > 0)
+        err = QStringLiteral("%1 项失败（可能已被删除或无权限）").arg(bad);
+    return Result<QPair<int, QString>>::success(qMakePair(ok, err));
+}
+
+Result<QPair<int, QString>> HttpBackend::moveFileBatch(const QStringList &ids,
+                                                       const QString &targetDir)
+{
+    QJsonArray arr;
+    for (const QString &id : ids)
+        arr.append(id.toDouble());
+    QJsonObject body;
+    body.insert(QStringLiteral("ids"), arr);
+    // 目标目录用**相对路径**（与单条接口一致；空串 = 根）
+    body.insert(QStringLiteral("dir"), targetDir);
+
+    const Response r = request(Method::Post, QStringLiteral("/api/v1/files/move"),
+                               QJsonDocument(body).toJson(QJsonDocument::Compact));
+    if (!r.ok())
+        return Result<QPair<int, QString>>::fail(r.error);
+
+    const QJsonObject o  = QJsonDocument::fromJson(r.body).object();
+    const int         ok = o.value(QStringLiteral("ok_count")).toInt();
+    const int         bad = o.value(QStringLiteral("failed_count")).toInt();
+    QString           err;
+    if (bad > 0)
+        err = QStringLiteral("%1 项失败（可能是同名冲突或已被移走）").arg(bad);
+    return Result<QPair<int, QString>>::success(qMakePair(ok, err));
+}
+
+Result<ScanVerdict> HttpBackend::scanFile(const QString &id)
+{
+    // 服务端是**同步**查远端（VT 每次最多等 scan-timeout-ms），所以这个请求可能比普通请求慢；
+    // 走同一个 request()（60s 超时）即可，调用方已用异步壳包起来，不会卡界面。
+    const Response r = request(Method::Post,
+                               QStringLiteral("/api/v1/files/") + id + QStringLiteral("/scan"),
+                               QByteArray("{}"));
+    if (!r.ok())
+        return Result<ScanVerdict>::fail(r.error);
+
+    const QJsonObject o = QJsonDocument::fromJson(r.body).object();
+    ScanVerdict       v;
+    v.verdict           = o.value(QStringLiteral("verdict")).toString();
+    v.detail            = o.value(QStringLiteral("detail")).toString();
+    v.enginesMalicious  = int(o.value(QStringLiteral("engines_malicious")).toDouble());
+    v.enginesTotal      = int(o.value(QStringLiteral("engines_total")).toDouble());
+    v.fromCache         = o.value(QStringLiteral("from_cache")).toBool();
+    v.remoteFailed      = o.value(QStringLiteral("remote_failed")).toBool();
+    v.blocked           = o.value(QStringLiteral("blocked")).toBool();
+    return Result<ScanVerdict>::success(v);
+}
+
 Ok HttpBackend::moveToTrash(const QString &id)
 {
     // 软删除（进回收站）：POST /api/v1/trash，body 二选一 —— {file_id} 或 {dir}

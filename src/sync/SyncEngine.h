@@ -45,6 +45,8 @@ class QTimer;
 
 namespace cv {
 
+class TransferManager;   // 同步的上传动作可交给它执行（文件级并发）
+
 class Backend;
 class FileWatcher;
 class LocalIndex;
@@ -53,6 +55,10 @@ class SyncEngine : public QObject
 {
     Q_OBJECT
 public:
+    // 注入传输管理器：注入后，**上传动作**走 TransferManager（4 文件并发 + 3 块并发），
+    // 引擎不再自己 hash/init/putChunk/finish（那条路会阻塞主线程且完全串行）。
+    // 传 nullptr 则退回原来的内联实现（harness / 旧路径可对照）。
+    void setTransferManager(TransferManager *tm);
     SyncEngine(Backend *backend, LocalIndex *index, QObject *parent = nullptr);
     ~SyncEngine() override;
 
@@ -123,10 +129,33 @@ private:
         SyncSnapshot lastSynced;
         SyncPlanResult plan;
         int          actionIndex = 0;
+        // 本轮内「云端目录路径 → 目录 id」缓存。
+        // ⚠️ 原来**每个文件**上传前都调一次 ensureFolderPath（一次 HTTP 往返），
+        //    1482 个文件里绝大多数还在同几个目录下 ⇒ 白跑 1400+ 次请求。
+        //    这就是"同步很慢"里最容易被忽略的一大块（比并发度还狠）。
+        QHash<QString, QString> remoteDirIds;
         QVector<QString> log;
         bool         failed = false;
         QString      error;
     };
+    // ---- 批量上传（仅在注入 TransferManager 时启用）----
+    // 引擎把「连续的、同一云端目录」的上传动作一次性 enqueue 给 TransferManager，
+    // 然后**不阻塞**：每个任务结束时由回调推进计数，整批完成后再推进 actionIndex。
+    TransferManager *m_tm = nullptr;
+    bool     m_upBatchActive    = false;   // 批次在飞：executePhase 直接返回，不重复推进
+    bool     m_upCollecting     = false;   // 正在 enqueueUpload 里（用于认领 taskStarted 的 id）
+    int      m_upBatchLastIndex = 0;       // 本批最后一个动作的下标（收尾时 actionIndex = +1）
+    int      m_upBatchRemaining = 0;       // 还没结束的任务数
+    QHash<QString, QString>  m_upByAbs;    // 绝对路径 → relPath（enqueue 期间认领 taskId）
+    QHash<QString, QString>  m_upTaskRel;  // taskId → relPath
+    QHash<QString, FileItem> m_upItems;    // taskId → 完成后返回的远端条目（取 rev/hash）
+
+    bool startUploadBatch();
+    void onTransferStarted(const QString &taskId, const QString &fileName, TransferKind kind,
+                           const QString &localPath, const QString &remotePath, qint64 total);
+    void onTransferCompleted(const QString &taskId, const FileItem &item);
+    void onTransferFinished(const QString &taskId, bool ok, const QString &message);
+
     Run  m_run;
     QQueue<QString> m_queue;   // 待对账的 pairId
 };

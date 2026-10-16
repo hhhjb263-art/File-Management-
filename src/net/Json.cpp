@@ -208,8 +208,20 @@ QJsonObject toJson(const UsageStats &s)
 UsageStats usageFromJson(const QJsonObject &o)
 {
     UsageStats s;
-    s.total       = qint64(o.value(QStringLiteral("total")).toDouble());
-    s.used        = qint64(o.value(QStringLiteral("used")).toDouble());
+    // ⚠️ 服务端 /api/v1/storage 用的是 **total_bytes / used_bytes / free_bytes**，
+    //    而本地 Mock 与旧契约用 total / used。两套都认 ——
+    //    否则服务端明明返回了容量，客户端却显示"服务器未返回容量信息"（就是之前那个 bug）。
+    const auto numAny = [&o](std::initializer_list<const char *> keys) -> qint64 {
+        for (const char *k : keys) {
+            const QJsonValue v = o.value(QLatin1String(k));
+            if (v.isDouble())
+                return qint64(v.toDouble());
+        }
+        return 0;
+    };
+    s.total       = numAny({"total_bytes", "total"});
+    s.used        = numAny({"used_bytes", "used"});
+    s.free        = numAny({"free_bytes", "free"});
     s.versions    = qint64(o.value(QStringLiteral("versions")).toDouble());
     s.trash       = qint64(o.value(QStringLiteral("trash")).toDouble());
     s.fileCount   = qint64(o.value(QStringLiteral("fileCount")).toDouble());

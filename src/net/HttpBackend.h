@@ -174,6 +174,10 @@ public:
     Result<QVector<FileItem>> listFolder(const QString &parentId) override;
     Result<QVector<FileItem>> listUnderPath(const QString &remotePath) override;
     Ok                        moveFile(const QString &id, const QString &newParentId) override;
+    Result<ScanVerdict>       scanFile(const QString &id) override;
+    Result<QPair<int, QString>> moveToTrashBatch(const QStringList &ids) override;
+    Result<QPair<int, QString>> moveFileBatch(const QStringList &ids,
+                                              const QString &targetDir) override;
     Ok                        moveDir(const QString &from, const QString &to) override;
     Result<QVector<FileItem>> listTrash() override;
     Result<FileItem>          statById(const QString &id) override;

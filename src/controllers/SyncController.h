@@ -20,6 +20,7 @@
 
 namespace cv {
 
+class TransferManager;   // setTransferManager 只用到指针，前向声明足够
 class Backend;
 class LocalIndex;
 class SyncEngine;
@@ -68,6 +69,9 @@ public:
     // 传 QString 而不是 QStringList：QML 侧是一个 TextArea，换行分隔最自然，
     // 也避免 JS 数组到 QStringList 的隐式转换歧义。
     Q_INVOKABLE void    setPairExcludes(const QString &pairId, const QString &text);
+
+    // 把 TransferManager 透传给引擎：注入后同步的上传动作走它的文件级并发
+    void setTransferManager(TransferManager *tm);
 
     Q_INVOKABLE void start();
     Q_INVOKABLE void stop();

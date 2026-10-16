@@ -98,6 +98,16 @@ TransferController::TransferController(TransferManager *manager, QObject *parent
                 });
 
         // 结束：置 完成/失败 + message（失败文案走 friendlyError，401 → 令牌无效）
+        // 暂停态：把行状态切成「已暂停 / 传输中」，并通知界面更新按钮文案
+        connect(m_manager, &TransferManager::taskPaused, this,
+                [this](const QString &taskId, bool paused) {
+                    if (m_taskModel)
+                        m_taskModel->updateState(taskId,
+                                                 paused ? TransferState::Paused
+                                                        : TransferState::Running, QString());
+                    emit pausedChanged();
+                });
+
         connect(m_manager, &TransferManager::taskFinished, this,
                 [this](const QString &taskId, bool ok, const QString &message) {
                     const QString shown = ok ? message : friendlyError(message);
@@ -209,6 +219,23 @@ void TransferController::cancel()
         pullState();
     }
 #endif
+}
+
+bool TransferController::paused() const
+{
+    return m_manager && m_manager->currentPaused();
+}
+
+void TransferController::pause()
+{
+    if (m_manager)
+        m_manager->pauseCurrent();
+}
+
+void TransferController::resume()
+{
+    if (m_manager)
+        m_manager->resumeCurrent();
 }
 
 void TransferController::resolveConflict(const QString &id, bool overwrite)

@@ -82,6 +82,12 @@ public:
     // 取消当前任务（并终止当前批次剩余的排队任务）
     Q_INVOKABLE void cancelCurrent();
 
+    // 暂停 / 继续**当前任务**。因为引擎一次只跑一个任务，暂停它会同时挡住后面的队列
+    // （这正是"暂停传输"该有的语义）。已在途的分块/区间会自然收尾，不再派发新的。
+    Q_INVOKABLE void pauseCurrent();
+    Q_INVOKABLE void resumeCurrent();
+    bool            currentPaused() const;
+
     // 默认下载目录（由 Application 从 Settings 注入）。
     // 回退链：enqueueDownload 的显式 destDir > 本默认目录 > AppPaths::downloadDir()。
     void    setDefaultDownloadDir(const QString &dir);
@@ -100,6 +106,11 @@ signals:
                      qint64 total);
     void taskProgress(const QString &taskId, qint64 done, qint64 total);
     void taskFinished(const QString &taskId, bool ok, const QString &message);
+    // 暂停态变化（上层据此把行状态切成「已暂停 / 传输中」，并更新按钮文案）
+    void taskPaused(const QString &taskId, bool paused);
+    // 上传**成功合并**后的远端条目（含 rev/content_hash）。
+    // 同步引擎要拿它写索引：rev 是云端权威信号，缺了会写出过期索引 ⇒ 下轮误判"云端变了"。
+    void taskCompleted(const QString &taskId, const FileItem &item);
     // 同名冲突：由 TransferController 弹「是否覆盖」，再回调解续
     void conflictDetected(const QString &taskId, const QString &dir, const QString &name);
     void logMessage(const QString &level, const QString &text);
@@ -133,6 +144,7 @@ private:
         int               totalChunks = 0;
         bool              overwrite     = false;
         bool              resumeHit     = false;
+        bool              paused        = false;   // 用户暂停：泵循环不再派发新分块/区间
         bool              completeSent  = false;
 
         // ---- 下载 ----
@@ -152,6 +164,12 @@ private:
         bool    cancelRequested  = false;
         bool    awaitingConflict = false;
     };
+
+    // 按 gen 找到在途任务（找不到 = 过期回调，调用方应直接 return）
+    Task *taskForGen(qint64 gen) const;
+    // 把 m_active 里的任务移到 m_graveyard（延迟回收，避免回调栈内 use-after-free）
+    void   retireTask(Task *t);
+    void   reapGraveyard();
 
     // ---- 队列推进 ----
     void    refresh();      // 重算 activeCount / statusText / busy 并择机 emit changed
@@ -203,9 +221,20 @@ private:
     Backend     *m_backend = nullptr;
     QThreadPool *m_pool    = nullptr;
 
-    QList<Task> m_pending; // 待处理队列（不含当前任务）
-    Task        m_cur;     // 当前任务
-    bool        m_hasCurrent = false;
+    QList<Task> m_pending; // 待处理队列（不含在途任务）
+
+    // ── 文件级并发（2026-10-18）──
+    // 原来只有一个 m_cur 任务在跑；现在最多 kFileConcurrency 个**同时**跑。
+    // 任务在堆上分配 ⇒ 指针稳定（QHash 扩容/rehash 不会让 m_cur 悬空）。
+    // 未完成的任务留在 m_active（key = gen，全局唯一，回调靠它定位任务）。
+    QHash<qint64, Task *> m_active;
+    // 正在被某条回调链处理的任务。**保留这个名字是为了让流水线函数体一字不改** ——
+    // 那些函数里的 m_cur.xxx 已机械替换成 m_cur->xxx。
+    // 约定：只在"处理某任务的回调"内有效；pump() 会 save/restore 它。
+    Task *m_cur = nullptr;
+    // finishTask 后不能立刻 delete（调用栈里可能还有人用 m_cur），
+    // 先挪进待回收列表，下次 pump() 开头统一回收。
+    QList<Task *> m_graveyard;
 
     int     m_activeCount = 0;
     QString m_statusText  = QStringLiteral("空闲");

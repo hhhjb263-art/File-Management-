@@ -151,6 +151,17 @@ enum class TransferState {
     Canceled    // 已取消
 };
 
+// 病毒查杀结果（服务端按内容哈希查；文件本身不出服务器）
+struct ScanVerdict {
+    QString verdict;        // 安全 / 可疑 / 恶意 / 未收录
+    QString detail;         // 引擎统计或失败原因
+    int     enginesMalicious = 0;
+    int     enginesTotal = 0;
+    bool    fromCache   = false;
+    bool    remoteFailed = false;   // 远端没给结论（网络/未配置）
+    bool    blocked     = false;    // 该内容达到"拒绝"阈值
+};
+
 struct TransferTask {
     QString       id;
     TransferKind  kind = TransferKind::Upload;
@@ -187,6 +198,7 @@ struct UploadTicket {
 struct UsageStats {
     qint64 total = 0;       // 总容量（字节）
     qint64 used = 0;        // 文件占用
+    qint64 free = 0;        // 磁盘剩余（服务端 free_bytes；0 = 服务端没给，回退 total-used）
     qint64 versions = 0;    // 历史版本占用
     qint64 trash = 0;       // 回收站占用
     qint64 fileCount = 0;

@@ -438,11 +438,29 @@ Item {
                                 }
                             }
 
-                            Label {
-                                Layout.preferredWidth: 74
-                                text: model.modeText
-                                color: Theme.textSecondary
-                                font.pointSize: Theme.fontMicro
+                            // 同步方向：**可随时切换**，包括"正在同步中"。
+                            // 后端逻辑本来就热生效（setPairMode → pushToEngine + 立即重新对账，
+                            // 索引记的是真实观察到的两端状态，换方向不会漏改动），此前只是界面没有入口。
+                            //
+                            // ⚠️ 外面套一层 Item 先把角色值抓出来：ComboBox 自己的 `model` 属性
+                            //    会遮蔽 delegate 的 `model`，届时 `model.mode` 会变成 undefined。
+                            Item {
+                                Layout.preferredWidth: 86
+                                Layout.preferredHeight: 24
+                                property int    pairMode: model.mode
+                                property string pairId:   String(model.id)
+                                ComboBox {
+                                    anchors.fill: parent
+                                    font.pointSize: Theme.fontMicro
+                                    model: [qsTr("双向同步"), qsTr("仅上传"), qsTr("仅下载")]
+                                    currentIndex: parent.pairMode
+                                    // 用 activated（用户主动选择）而不是 currentIndex 变化：
+                                    // 后者在模型刷新回填时也会触发，会和 setPairMode 互相改写。
+                                    onActivated: {
+                                        if (page.apiReady)
+                                            Sync.setPairMode(parent.pairId, index)
+                                    }
+                                }
                             }
 
                             StatusBadge {

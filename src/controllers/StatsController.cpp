@@ -85,8 +85,9 @@ void StatsController::refresh()
         const UsageStats u = r.value;
         m_totalBytes = u.total;
         if (u.total > 0) {
-            // used 由后端给出；free = total - used（下限 0，避免服务端越界数据出现负数）
-            m_freeBytes = qMax<qint64>(0, u.total - u.used);
+            // **优先用服务端给的 free_bytes**（那是真实的磁盘剩余）；没有才退回 total-used。
+            // 两者含义本来就不同：total-used 是"文件占用"的补数，free_bytes 是文件系统剩多少。
+            m_freeBytes = (u.free > 0) ? u.free : qMax<qint64>(0, u.total - u.used);
             m_freeText = QStringLiteral("剩余 %1 / 共 %2")
                              .arg(Util::humanSize(m_freeBytes), Util::humanSize(m_totalBytes));
         } else {

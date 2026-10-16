@@ -82,6 +82,8 @@ public:
     // 目录树 CRUD：目录重命名（dirPath 是目录的相对路径，不是 id —— 目录在两个数据源里
     // 的 id 口径不同，而 path 是共同的、稳定的标识）。
     Q_INVOKABLE void renameFolder(const QString &dirPath, const QString &newName);
+    // 病毒查杀（主页面右键菜单）。异步执行：服务端可能要等远端查询，不能卡界面。
+    Q_INVOKABLE void scanFile(const QString &fileId);
     // 目录树 CRUD：列出所有可选目标目录（供"移动到…"的选择器）。
     // 返回 [{id, label, depth}]：id 用**列表里的目录 id**（两个数据源各自的口径，
     // 调用方不需要知道差别）；label 是去掉前导斜杠的显示路径；depth 用于缩进成树形。
@@ -92,11 +94,19 @@ public:
     Q_INVOKABLE void createFolder(const QString &path);  // 相对路径，自动补齐中间目录
     Q_INVOKABLE void uploadHere();                       // 请求 QML 选择文件并上传到 currentDir
     Q_INVOKABLE void downloadSelected();                 // 下载 selectedIds
+    // 批量操作：对**当前选中的全部**生效（原来只有单目标 remove/moveTo，
+    // 菜单里取 selectedIds[0] ⇒ 多选时只动第一个，这是用户报的那个现象）。
+    Q_INVOKABLE void removeSelected();                   // 批量移入回收站
+    Q_INVOKABLE void moveSelectedTo(const QString &targetParentId);  // 批量移动
 
     // ---- 追加：导航辅助 ----
     Q_INVOKABLE void goUp();                             // 返回上一级（根目录时无操作）
 
 signals:
+    // 查杀结束：ok=false 时 error 说明原因（未启用/网络/不支持）
+    void scanFinished(const QString &fileId, const QString &verdictText,
+                      const QString &detail, bool blocked, bool remoteFailed, bool ok,
+                      const QString &error);
     void currentDirChanged();
     void loadingChanged();
     void emptyTextChanged();

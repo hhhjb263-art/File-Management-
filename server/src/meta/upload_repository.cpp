@@ -102,7 +102,9 @@ bool UploadRepository::findResumable(const std::string& fileHash, std::int64_t s
 
 bool UploadRepository::listAllIds(std::vector<std::int64_t>& out, std::string& err) {
   out.clear();
-  Stmt stmt(db_.handle(), "SELECT id FROM upload_session", err);
+  // ⚠️ 主键是 upload_id，不是 id。写错列名不会崩，只会让"清理无主临时目录"永久跳过
+  //    （日志里一句 WARN 就带过了），真机上才暴露。**这类 SQL 错误纯函数 harness 抓不到。**
+  Stmt stmt(db_.handle(), "SELECT upload_id FROM upload_session", err);
   if (!stmt.ok()) return false;
   while (true) {
     const int rc = stmt.step(err);

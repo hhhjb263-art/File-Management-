@@ -47,6 +47,48 @@ public:
     virtual Result<FileItem>          ensureFolderPath(const QString &remotePath) = 0;
     virtual Ok                        rename(const QString &id, const QString &newName) = 0;
 
+    // **批量**移入回收站：一次请求处理 N 个 id（HttpBackend 走服务端批量接口）。
+    // 默认实现逐个调用单条接口 —— 保证既有数据源（Mock）不用改。
+    // 返回 (成功数, 首个错误)；部分失败不算整体失败。
+    virtual Result<QPair<int, QString>> moveToTrashBatch(const QStringList &ids)
+    {
+        int     okCount = 0;
+        QString firstErr;
+        for (const QString &id : ids) {
+            const Ok r = moveToTrash(id);
+            if (r.ok)
+                ++okCount;
+            else if (firstErr.isEmpty())
+                firstErr = r.error;
+        }
+        return Result<QPair<int, QString>>::success(qMakePair(okCount, firstErr));
+    }
+
+    // **批量**移动到指定目录（dir 为空串 = 根目录）。默认逐个调单条接口。
+    // 返回 (成功数, 首个错误)；部分失败不算整体失败。
+    virtual Result<QPair<int, QString>> moveFileBatch(const QStringList &ids,
+                                                      const QString &targetDir)
+    {
+        int     okCount = 0;
+        QString firstErr;
+        for (const QString &id : ids) {
+            const Ok r = moveFile(id, targetDir);
+            if (r.ok)
+                ++okCount;
+            else if (firstErr.isEmpty())
+                firstErr = r.error;
+        }
+        return Result<QPair<int, QString>>::success(qMakePair(okCount, firstErr));
+    }
+
+    // 对已存在的文件做一次恶意文件判定（服务端按内容哈希查，文件不出服务器）。
+    // 加法式：默认不支持，避免破坏既有实现。
+    virtual Result<ScanVerdict> scanFile(const QString &id)
+    {
+        (void)id;
+        return Result<ScanVerdict>::fail(QStringLiteral("[unsupported] 该数据源不支持病毒查杀"));
+    }
+
     // ---------------- 目录树：移动 / 重命名（加法式，默认不支持）----------------
     // 为什么是加法式：抽象接口早已冻结，直接加纯虚会让既有实现（含测试替身）全部无法编译。
     // 两个真实数据源都已实现，默认实现只为"不破坏既有实现"而存在。

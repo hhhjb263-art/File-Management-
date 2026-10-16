@@ -9,6 +9,7 @@
 #include "FileController.h"
 
 #include "core/Util.h"          // Util::humanSize（预览元信息）
+#include "core/Async.h"        // 病毒查杀异步执行（服务端可能等远端结论）
 #include "data/FileListModel.h" // cv::FileListModel / cv::FileRow（契约 §4）
 #include "net/Backend.h"
 #include "net/HttpBackend.h"    // uploadWholeFile（新建空文件，POST /api/v1/files）
@@ -559,6 +560,31 @@ QVariantList FileController::allFolders()
     return out;
 }
 
+void FileController::scanFile(const QString &fileId)
+{
+    if (!m_backend) {
+        emit errorOccurred(QStringLiteral("未配置数据源"));
+        return;
+    }
+    if (fileId.isEmpty()) {
+        emit errorOccurred(QStringLiteral("请先选择要查杀的文件"));
+        return;
+    }
+    emit statusMessage(QStringLiteral("正在查杀…"), true);
+    // 异步：服务端可能要把哈希发给远端并等结论（默认 3s），同步调用会冻结界面
+    Async::run(
+        this, [this, fileId] { return m_backend->scanFile(fileId); },
+        [this, fileId](Result<ScanVerdict> r) {
+            if (!r.ok) {
+                emit scanFinished(fileId, QString(), QString(), false, false, false,
+                                  friendlyError(r.error));
+                return;
+            }
+            emit scanFinished(fileId, r.value.verdict, r.value.detail, r.value.blocked,
+                              r.value.remoteFailed, true, QString());
+        });
+}
+
 void FileController::moveTo(const QString &id, const QString &targetParentId)
 {
     if (!m_backend) {
@@ -718,6 +744,81 @@ void FileController::uploadHere()
 {
     // QML 监听 uploadRequested(dir) → 打开 FileDialog → Transfer.upload(paths, dir)
     emit uploadRequested(m_currentDir);
+}
+
+void FileController::removeSelected()
+{
+    if (!m_backend) {
+        emit errorOccurred(QStringLiteral("未配置数据源"));
+        return;
+    }
+    if (m_selectedIds.isEmpty()) {
+        emit errorOccurred(QStringLiteral("请先选择要移入回收站的项目"));
+        return;
+    }
+    const QStringList ids = m_selectedIds;
+    // 逐个调用（不并发）：批量删除不是吞吐场景，串行更可控，也不会一次开太多连接。
+    // 放到后台线程跑，避免 N 个同步请求卡住界面。
+    // 走**批量接口**：一次请求删 N 个（原来逐个调用 ⇒ N 次往返，多选删除慢）
+    Async::run(
+        this, [this, ids] {
+            const Result<QPair<int, QString>> r = m_backend->moveToTrashBatch(ids);
+            if (!r.ok)
+                return qMakePair(0, r.error);
+            return r.value;
+        },
+        [this, ids](QPair<int, QString> r) {
+            const int okCount = r.first;
+            if (okCount == ids.size()) {
+                emit statusMessage(QStringLiteral("已移入回收站 %1 项").arg(okCount), true);
+            } else {
+                emit errorOccurred(QStringLiteral("移入回收站：成功 %1 项，失败 %2 项%3")
+                                       .arg(okCount)
+                                       .arg(ids.size() - okCount)
+                                       .arg(r.second.isEmpty() ? QString()
+                                                               : QStringLiteral("（%1）").arg(r.second)));
+            }
+            m_selectedIds.clear();
+            emit selectedIdsChanged();
+            refresh();
+        });
+}
+
+void FileController::moveSelectedTo(const QString &targetParentId)
+{
+    if (!m_backend) {
+        emit errorOccurred(QStringLiteral("未配置数据源"));
+        return;
+    }
+    if (m_selectedIds.isEmpty()) {
+        emit errorOccurred(QStringLiteral("请先选择要移动的项目"));
+        return;
+    }
+    const QStringList ids = m_selectedIds;
+    const QString     target = targetParentId;
+    // 走**批量接口**：一次请求移动 N 个（原来逐个调用 ⇒ N 次往返）
+    Async::run(
+        this, [this, ids, target] {
+            const Result<QPair<int, QString>> r = m_backend->moveFileBatch(ids, target);
+            if (!r.ok)
+                return qMakePair(0, r.error);
+            return r.value;
+        },
+        [this, ids](QPair<int, QString> r) {
+            const int okCount = r.first;
+            if (okCount == ids.size()) {
+                emit statusMessage(QStringLiteral("已移动 %1 项").arg(okCount), true);
+            } else {
+                emit errorOccurred(QStringLiteral("移动：成功 %1 项，失败 %2 项%3")
+                                       .arg(okCount)
+                                       .arg(ids.size() - okCount)
+                                       .arg(r.second.isEmpty() ? QString()
+                                                               : QStringLiteral("（%1）").arg(r.second)));
+            }
+            m_selectedIds.clear();
+            emit selectedIdsChanged();
+            refresh();
+        });
 }
 
 void FileController::downloadSelected()

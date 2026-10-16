@@ -45,12 +45,19 @@ namespace {
 //    无效值（<=0），本轮上传 fail-fast 中止——绝不静默采用可能与服务端失配的本地值。
 constexpr qint64 kDownloadChunkSize    = 8 * 1024 * 1024;   // 下载每次 Range 拉 8 MiB
 constexpr int    kDownloadConcurrency  = 4;                 // 下载并发段数
-constexpr int    kMaxConcurrent        = 3;                 // 上传并发块数
+constexpr int    kMaxConcurrent        = 3;                 // 单文件内并发块数
+constexpr int    kFileConcurrency      = 4;                 // **同时进行的文件数**（文件级并发）
 constexpr int    kMaxRetries           = 3;                 // 单块最大重试次数
 constexpr qint64 kStreamUploadThreshold = 8 * 1024 * 1024;  // 大文件阈值（> 该值走分块日志提示）
 
 // IO / 网络线程池大小（哈希 + 读块 + 阻塞式请求）
-constexpr int kIoPoolThreads = 3;
+// ⚠️ IO 池要喂得饱「文件并发 × 单文件在途分块」：
+//    kFileConcurrency(4) × kMaxConcurrent(3) = 12 个在途请求，再加上每个任务
+//    的 scan / init 各占一个线程。原来只有 3 个线程 ⇒ 请求在池里排队，
+//    而每个请求都在 HttpBackend::request() 里**阻塞等网络**，
+//    于是 init 被挤到 20~50 秒后才发出去 —— 界面上就是"小文件一直 0%"。
+//    这些任务全是 I/O 阻塞型（不是 CPU 密集），线程给足才是对的。
+constexpr int kIoPoolThreads = 20;
 
 // 服务端「可识别失败」前缀（与 net/HttpBackend 的约定一致；此处仅按前缀判定，
 // 不 include HttpBackend，保持只依赖抽象接口）
@@ -143,22 +150,43 @@ TransferManager::~TransferManager()
 //  QML 属性
 // =========================================================================
 
+TransferManager::Task *TransferManager::taskForGen(qint64 gen) const
+{
+    return m_active.value(gen, nullptr);
+}
+
+void TransferManager::retireTask(Task *t)
+{
+    if (!t)
+        return;
+    m_active.remove(t->gen);
+    // **不能立刻 delete**：finishTask 常在一次回调栈中间被调用，
+    // 栈上可能还持有这个 Task* 并在 finishTask 之后读它。统一延后回收。
+    m_graveyard.append(t);
+}
+
+void TransferManager::reapGraveyard()
+{
+    qDeleteAll(m_graveyard);
+    m_graveyard.clear();
+}
+
 void TransferManager::refresh()
 {
-    const int  active = m_pending.size() + (m_hasCurrent ? 1 : 0);
+    const int  active = m_pending.size() + m_active.size();
     const bool busy   = (active > 0);
 
     QString text;
     if (!busy) {
         text = QStringLiteral("空闲");
     } else {
-        QString verb;
-        if (m_hasCurrent)
-            verb = (m_cur.kind == TransferKind::Upload) ? QStringLiteral("上传中")
-                                                        : QStringLiteral("下载中");
-        else
-            verb = (m_pending.first().kind == TransferKind::Upload) ? QStringLiteral("上传中")
-                                                                    : QStringLiteral("下载中");
+        TransferKind kind = TransferKind::Upload;
+        if (!m_active.isEmpty())
+            kind = m_active.begin().value()->kind;
+        else if (!m_pending.isEmpty())
+            kind = m_pending.first().kind;
+        const QString verb = (kind == TransferKind::Upload) ? QStringLiteral("上传中")
+                                                           : QStringLiteral("下载中");
         // 形如 "… 上传中 3/8"
         text = QStringLiteral("… %1 %2/%3").arg(verb).arg(m_batchDone).arg(m_batchDone + active);
     }
@@ -246,7 +274,7 @@ QString TransferManager::resolveDownloadDir(const QString &destDir) const
 
 void TransferManager::cancelCurrent()
 {
-    if (!m_hasCurrent) {
+    if (m_active.isEmpty()) {
         if (!m_pending.isEmpty()) {
             m_pending.clear();
             emit logMessage(QStringLiteral("warn"), QStringLiteral("已清空排队中的传输任务"));
@@ -255,24 +283,30 @@ void TransferManager::cancelCurrent()
         return;
     }
 
-    m_cur.cancelRequested = true;
-    emit logMessage(QStringLiteral("warn"),
-                    QStringLiteral("用户取消：%1")
-                        .arg(m_cur.kind == TransferKind::Upload ? m_cur.name : m_cur.fileId));
+    // 并发下"取消"= 取消**全部在途任务**（用户语义：别传了）
+    const QList<Task *> snapshot = m_active.values();
+    for (Task *t : snapshot) {
+        m_cur = t;
+        t->cancelRequested = true;
+        emit logMessage(QStringLiteral("warn"),
+                        QStringLiteral("用户取消：%1")
+                            .arg(t->kind == TransferKind::Upload ? t->name : t->fileId));
 
-    if (m_cur.kind == TransferKind::Upload && !m_cur.uploadId.isEmpty()) {
-        // 通知服务端丢弃会话；但保留本地 manifest，下次仍可续传
-        const QString uploadId = m_cur.uploadId;
-        Backend      *be       = m_backend;
-        QThreadPool  *pool     = m_pool;
-        pool->start([be, uploadId]() {
-            if (be)
-                be->cancelUpload(uploadId);
-        });
+        if (t->kind == TransferKind::Upload && !t->uploadId.isEmpty()) {
+            // 通知服务端丢弃会话；但保留本地 manifest，下次仍可续传
+            const QString uploadId = t->uploadId;
+            Backend      *be       = m_backend;
+            QThreadPool  *pool     = m_pool;
+            if (pool) {
+                pool->start([be, uploadId]() {
+                    if (be)
+                        be->cancelUpload(uploadId);
+                });
+            }
+        }
+        finishTask(false, QStringLiteral("已取消"));
     }
-    // 下载：保留 .part，断点续传语义不变
-
-    finishTask(false, QStringLiteral("已取消"));
+    m_cur = nullptr;
 }
 
 // =========================================================================
@@ -281,19 +315,90 @@ void TransferManager::cancelCurrent()
 
 void TransferManager::pump()
 {
-    if (m_hasCurrent)
-        return;
-    if (m_pending.isEmpty()) {
+    // 文件级并发：有空位就继续取任务，直到 kFileConcurrency 或队列空。
+    // ⚠️ 本函数会临时改写 m_cur（指向刚启动的任务），而它可能是在"正在处理另一个任务"
+    //    的回调里被调用的 ⇒ 必须保存/恢复，否则会把外层任务的 m_cur 打歪。
+    Task *const saved = m_cur;
+
+    reapGraveyard();
+
+    while (m_active.size() < kFileConcurrency && !m_pending.isEmpty()) {
+        Task *t = new Task(m_pending.takeFirst());
+        t->gen     = ++m_genSeq;
+        t->state   = TransferState::Queued;
+        m_active.insert(t->gen, t);
+        m_cur = t;
+        refresh();
+        startCurrent();
+        m_cur = nullptr;
+    }
+
+    if (m_active.isEmpty() && m_pending.isEmpty()) {
         m_batchDone = 0;
         refresh();
-        return;
     }
-    m_cur        = m_pending.takeFirst();
-    m_cur.gen    = ++m_genSeq;
-    m_hasCurrent = true;
-    m_cur.state  = TransferState::Queued;
-    refresh();
-    startCurrent();
+    m_cur = saved;
+}
+
+void TransferManager::pauseCurrent()
+{
+    // 并发下"暂停"= 暂停**全部在途任务**（只暂停一个会让其余继续跑，语义混乱）
+    bool any = false;
+    for (Task *t : m_active) {
+        if (!t || t->paused)
+            continue;
+        if (t->cancelRequested || t->state == TransferState::Completed
+            || t->state == TransferState::Failed || t->state == TransferState::Canceled)
+            continue;
+        t->paused = true;
+        t->state  = TransferState::Paused;
+        emit taskPaused(t->id, true);
+        any = true;
+    }
+    if (any) {
+        refresh();
+        emit logMessage(QStringLiteral("INFO"), QStringLiteral("已暂停全部在途传输"));
+    }
+}
+
+void TransferManager::resumeCurrent()
+{
+    const QList<Task *> snapshot = m_active.values();
+    bool any = false;
+    for (Task *t : snapshot) {
+        if (!t || !t->paused)
+            continue;
+        m_cur = t;
+        t->paused = false;
+        t->state  = TransferState::Running;
+        emit taskPaused(t->id, false);
+        any = true;
+
+        // 重新推进。边角：若在"最后一个分块已传完、complete 未发"时暂停，
+        // 恢复时没有分块可派发，必须补发 complete，否则任务永远卡住。
+        if (t->kind == TransferKind::Upload) {
+            if (t->totalChunks > 0 && t->doneSeq.size() >= t->totalChunks && !t->completeSent)
+                requestComplete();
+            else
+                pumpChunks();
+        } else {
+            pumpDownload();
+        }
+    }
+    m_cur = nullptr;
+    if (any) {
+        refresh();
+        emit logMessage(QStringLiteral("INFO"), QStringLiteral("已继续全部在途传输"));
+    }
+}
+
+bool TransferManager::currentPaused() const
+{
+    for (Task *t : m_active) {
+        if (t && t->paused)
+            return true;
+    }
+    return false;
 }
 
 void TransferManager::startCurrent()
@@ -302,7 +407,7 @@ void TransferManager::startCurrent()
         finishTask(false, QStringLiteral("未配置数据后端（Backend）"));
         return;
     }
-    if (m_cur.kind == TransferKind::Upload)
+    if (m_cur->kind == TransferKind::Upload)
         beginUpload();
     else
         beginDownload();
@@ -310,21 +415,23 @@ void TransferManager::startCurrent()
 
 void TransferManager::finishTask(bool ok, const QString &message)
 {
-    if (!m_hasCurrent)
+    if (!m_cur)
         return;
-    const QString id       = m_cur.id;
-    const bool    canceled = m_cur.cancelRequested;
+    Task *const t          = m_cur;
+    const QString id       = t->id;
+    const bool    canceled = t->cancelRequested;
 
-    m_cur.state = ok ? TransferState::Completed
-                     : (canceled ? TransferState::Canceled : TransferState::Failed);
-    m_cur.readySegments.clear();
-    m_cur.writeQueue.clear();
-    m_hasCurrent = false;
-    m_cur        = Task();
+    t->state = ok ? TransferState::Completed
+                  : (canceled ? TransferState::Canceled : TransferState::Failed);
+    t->readySegments.clear();
+    t->writeQueue.clear();
     ++m_batchDone;
 
     if (canceled)
-        m_pending.clear(); // 取消 = 终止整批
+        m_pending.clear();   // 取消 = 终止整批：排队中的也不再启动
+
+    retireTask(t);           // 从在途集合摘下（内存延迟回收，见 retireTask）
+    m_cur = nullptr;
 
     if (!message.isEmpty()) {
         emit logMessage(ok ? QStringLiteral("info")
@@ -342,12 +449,12 @@ void TransferManager::finishTask(bool ok, const QString &message)
 
 void TransferManager::beginUpload()
 {
-    m_cur.state = TransferState::Hashing;
+    m_cur->state = TransferState::Hashing;
     refresh();
-    emit logMessage(QStringLiteral("info"), QStringLiteral("开始扫描上传：%1").arg(m_cur.localPath));
+    emit logMessage(QStringLiteral("info"), QStringLiteral("开始扫描上传：%1").arg(m_cur->localPath));
 
-    const QString             path = m_cur.localPath;
-    const qint64              gen  = m_cur.gen;
+    const QString             path = m_cur->localPath;
+    const qint64              gen  = m_cur->gen;
     QThreadPool              *pool = m_pool;
     QPointer<TransferManager> self(this);
     pool->start([self, path, gen]() {
@@ -361,9 +468,14 @@ void TransferManager::beginUpload()
 
 void TransferManager::onUploadScanned(qint64 gen, const UploadScanResult &r)
 {
-    if (!m_hasCurrent || m_cur.kind != TransferKind::Upload || m_cur.gen != gen)
+    Task *const tp = taskForGen(gen);
+    if (!tp)
+        return;   // 过期回调：任务已完成/被取消
+    m_cur = tp;
+
+    if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Upload || m_cur->gen != gen)
         return; // 过期回调
-    if (m_cur.cancelRequested) {
+    if (m_cur->cancelRequested) {
         finishTask(false, QStringLiteral("已取消"));
         return;
     }
@@ -383,43 +495,43 @@ void TransferManager::onUploadScanned(qint64 gen, const UploadScanResult &r)
         return;
     }
 
-    m_cur.name        = r.name;
-    m_cur.mtime       = r.mtime;
-    m_cur.total       = r.size;
-    m_cur.fullHash    = r.hash;
-    m_cur.chunkSize   = chunkBytes;
-    m_cur.chunks      = makeChunkPlan(r.size, chunkBytes);
-    m_cur.totalChunks = m_cur.chunks.size();
-    m_cur.done        = 0;
-    m_cur.doneSeq.clear();
-    m_cur.inflightSeq.clear();
-    m_cur.retryWait.clear();
-    m_cur.retries.clear();
-    m_cur.resumeHit    = false;
-    m_cur.completeSent = false;
-    m_cur.uploadId.clear();
-    m_cur.state = TransferState::Running;
+    m_cur->name        = r.name;
+    m_cur->mtime       = r.mtime;
+    m_cur->total       = r.size;
+    m_cur->fullHash    = r.hash;
+    m_cur->chunkSize   = chunkBytes;
+    m_cur->chunks      = makeChunkPlan(r.size, chunkBytes);
+    m_cur->totalChunks = m_cur->chunks.size();
+    m_cur->done        = 0;
+    m_cur->doneSeq.clear();
+    m_cur->inflightSeq.clear();
+    m_cur->retryWait.clear();
+    m_cur->retries.clear();
+    m_cur->resumeHit    = false;
+    m_cur->completeSent = false;
+    m_cur->uploadId.clear();
+    m_cur->state = TransferState::Running;
     // 任务开始即发一次进度（done=0），让模型立刻显示 0%
-    emit taskProgress(m_cur.id, 0, m_cur.total);
+    emit taskProgress(m_cur->id, 0, m_cur->total);
 
-    if (m_cur.total > kStreamUploadThreshold)
+    if (m_cur->total > kStreamUploadThreshold)
         emit logMessage(QStringLiteral("info"),
                         QStringLiteral("大文件 %1（%2）走分块流式上传（逐块 seek 读，内存上界 %3）")
-                            .arg(m_cur.name, Util::humanSize(m_cur.total),
-                                 Util::humanSize(m_cur.chunkSize)));
+                            .arg(m_cur->name, Util::humanSize(m_cur->total),
+                                 Util::humanSize(m_cur->chunkSize)));
 
     // 本地 manifest 续传：size/mtime/chunk_size/full_hash 全一致才复用
     QString   manifestUploadId;
     QSet<int> manifestSeqs;
-    if (loadManifest(m_cur.localPath, m_cur.total, m_cur.mtime, m_cur.chunkSize, m_cur.fullHash,
+    if (loadManifest(m_cur->localPath, m_cur->total, m_cur->mtime, m_cur->chunkSize, m_cur->fullHash,
                      &manifestUploadId, &manifestSeqs)) {
-        m_cur.resumeHit = true;
-        m_cur.uploadId  = manifestUploadId;
-        m_cur.doneSeq   = manifestSeqs;
+        m_cur->resumeHit = true;
+        m_cur->uploadId  = manifestUploadId;
+        m_cur->doneSeq   = manifestSeqs;
         emit logMessage(QStringLiteral("info"),
                         QStringLiteral("命中本地断点：已确认 %1/%2 块，尝试复用 upload_id=%3")
                             .arg(manifestSeqs.size())
-                            .arg(m_cur.totalChunks)
+                            .arg(m_cur->totalChunks)
                             .arg(manifestUploadId));
     }
     refresh();
@@ -429,11 +541,11 @@ void TransferManager::onUploadScanned(qint64 gen, const UploadScanResult &r)
 void TransferManager::requestBeginUpload(bool overwrite)
 {
     // parentId 语义：'' → 根（用 kRootId，兼容 HttpBackend("root"→"") 与本地引擎）
-    const QString parentId = m_cur.dir.isEmpty() ? kRootId : m_cur.dir;
-    const QString name     = m_cur.name;
-    const qint64  size     = m_cur.total;
-    const QString hash     = m_cur.fullHash;
-    const qint64  gen      = m_cur.gen;
+    const QString parentId = m_cur->dir.isEmpty() ? kRootId : m_cur->dir;
+    const QString name     = m_cur->name;
+    const qint64  size     = m_cur->total;
+    const QString hash     = m_cur->fullHash;
+    const qint64  gen      = m_cur->gen;
 
     Backend                  *be   = m_backend;
     QThreadPool              *pool = m_pool;
@@ -458,15 +570,20 @@ void TransferManager::requestBeginUpload(bool overwrite)
     emit logMessage(QStringLiteral("info"),
                     QStringLiteral("init 上传会话：%1（%2，目标=%3，hash=%4%5）")
                         .arg(name, Util::humanSize(size),
-                             m_cur.dir.isEmpty() ? QStringLiteral("根目录") : m_cur.dir, hash,
+                             m_cur->dir.isEmpty() ? QStringLiteral("根目录") : m_cur->dir, hash,
                              overwrite ? QStringLiteral("，覆盖同名") : QString()));
 }
 
 void TransferManager::onBeginUpload(qint64 gen, const Result<UploadTicket> &r)
 {
-    if (!m_hasCurrent || m_cur.kind != TransferKind::Upload || m_cur.gen != gen)
+    Task *const tp = taskForGen(gen);
+    if (!tp)
+        return;   // 过期回调：任务已完成/被取消
+    m_cur = tp;
+
+    if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Upload || m_cur->gen != gen)
         return;
-    if (m_cur.cancelRequested) {
+    if (m_cur->cancelRequested) {
         finishTask(false, QStringLiteral("已取消"));
         return;
     }
@@ -481,29 +598,29 @@ void TransferManager::onBeginUpload(qint64 gen, const Result<UploadTicket> &r)
 
     const UploadTicket &t = r.value;
     if (t.instant) {
-        m_cur.done = m_cur.total;
-        emit taskProgress(m_cur.id, m_cur.total, m_cur.total);
-        clearManifest(m_cur.localPath);
-        finishTask(true, QStringLiteral("秒传完成：%1（服务端已存在相同内容）").arg(m_cur.name));
+        m_cur->done = m_cur->total;
+        emit taskProgress(m_cur->id, m_cur->total, m_cur->total);
+        clearManifest(m_cur->localPath);
+        finishTask(true, QStringLiteral("秒传完成：%1（服务端已存在相同内容）").arg(m_cur->name));
         return;
     }
 
-    m_cur.uploadId = t.uploadId;
+    m_cur->uploadId = t.uploadId;
     // 服务端已收字节数 → 连续前缀；与本地 manifest 已确认集合求并（PUT 幂等，重复无害）
-    for (int seq = 0; seq < m_cur.totalChunks; ++seq) {
-        const ChunkRange &c = m_cur.chunks.at(seq);
+    for (int seq = 0; seq < m_cur->totalChunks; ++seq) {
+        const ChunkRange &c = m_cur->chunks.at(seq);
         if (c.offset + c.length <= t.received)
-            m_cur.doneSeq.insert(seq);
+            m_cur->doneSeq.insert(seq);
     }
     saveManifest();
     updateUploadProgress();
     emit logMessage(QStringLiteral("info"),
                     QStringLiteral("会话就绪 upload_id=%1，已确认 %2/%3 块")
                         .arg(t.uploadId)
-                        .arg(m_cur.doneSeq.size())
-                        .arg(m_cur.totalChunks));
+                        .arg(m_cur->doneSeq.size())
+                        .arg(m_cur->totalChunks));
 
-    if (m_cur.totalChunks == 0) { // 空文件：直接合并
+    if (m_cur->totalChunks == 0) { // 空文件：直接合并
         requestComplete();
         return;
     }
@@ -512,79 +629,87 @@ void TransferManager::onBeginUpload(qint64 gen, const Result<UploadTicket> &r)
 
 void TransferManager::onUploadConflict(const QString &errorText)
 {
-    m_cur.awaitingConflict = true;
-    m_cur.state            = TransferState::Paused;
+    m_cur->awaitingConflict = true;
+    m_cur->state            = TransferState::Paused;
     refresh();
     emit logMessage(QStringLiteral("warn"), QStringLiteral("命中同名文件：%1").arg(errorText));
-    emit conflictDetected(m_cur.id, m_cur.dir, m_cur.name);
+    emit conflictDetected(m_cur->id, m_cur->dir, m_cur->name);
 }
 
 void TransferManager::resolveConflict(const QString &taskId, bool overwrite)
 {
-    if (!m_hasCurrent || m_cur.id != taskId || !m_cur.awaitingConflict) {
+    if (!(m_cur != nullptr) || m_cur->id != taskId || !m_cur->awaitingConflict) {
         emit logMessage(QStringLiteral("warn"),
                         QStringLiteral("忽略无对应冲突的应答（taskId=%1）").arg(taskId));
         return;
     }
-    m_cur.awaitingConflict = false;
+    m_cur->awaitingConflict = false;
 
     if (!overwrite) {
-        finishTask(false, QStringLiteral("已跳过同名文件「%1」").arg(m_cur.name));
+        finishTask(false, QStringLiteral("已跳过同名文件「%1」").arg(m_cur->name));
         return;
     }
 
     // 覆盖：走服务端**原子覆盖**语义（§8.4）——丢弃本地进度/manifest，重新 init 一次。
     // 绝不"先删旧文件再传"（服务端无回收站，中途失败会永久丢原文件）。
-    m_cur.overwrite = true;
-    m_cur.state     = TransferState::Running;
-    clearManifest(m_cur.localPath);
-    m_cur.doneSeq.clear();
-    m_cur.inflightSeq.clear();
-    m_cur.retryWait.clear();
-    m_cur.retries.clear();
-    m_cur.resumeHit    = false;
-    m_cur.completeSent = false;
+    m_cur->overwrite = true;
+    m_cur->state     = TransferState::Running;
+    clearManifest(m_cur->localPath);
+    m_cur->doneSeq.clear();
+    m_cur->inflightSeq.clear();
+    m_cur->retryWait.clear();
+    m_cur->retries.clear();
+    m_cur->resumeHit    = false;
+    m_cur->completeSent = false;
     refresh();
     requestBeginUpload(true); // 置真 → init → 复位 在同一工作线程内原子完成
 }
 
 void TransferManager::pumpChunks()
 {
-    if (!m_hasCurrent || m_cur.kind != TransferKind::Upload || m_cur.cancelRequested)
+    if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Upload || m_cur->cancelRequested
+        || m_cur->paused)
         return;
 
-    for (int seq = 0; seq < m_cur.totalChunks; ++seq) {
-        if (!m_hasCurrent || m_cur.kind != TransferKind::Upload || m_cur.cancelRequested)
+    for (int seq = 0; seq < m_cur->totalChunks; ++seq) {
+        if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Upload || m_cur->cancelRequested
+            || m_cur->paused)
             return;
-        if (m_cur.doneSeq.contains(seq) || m_cur.inflightSeq.contains(seq)
-            || m_cur.retryWait.contains(seq))
+        if (m_cur->doneSeq.contains(seq) || m_cur->inflightSeq.contains(seq)
+            || m_cur->retryWait.contains(seq))
             continue;
-        if (m_cur.inflightSeq.size() >= kMaxConcurrent)
+        if (m_cur->inflightSeq.size() >= kMaxConcurrent)
             break;
         launchChunkUpload(seq);
     }
 
+    // ⚠️ 不能把「totalChunks == 0」直接当成"全都传完了"：
+    //    任务刚启动、**还没 init 出会话**时它也是 0，此时 requestComplete() 会拿空
+    //    uploadId 去合并 → 服务端回"上传会话不存在"（并发/暂停继续时必现）。
+    //    正确的判据是「会话已建立」：uploadId 非空才说明分块表已经规划过。
+    //    会话建立后 totalChunks 仍可能为 0（空文件）——那种情况才该立刻合并。
     const bool allDone =
-        (m_cur.totalChunks == 0)
-        || (m_cur.doneSeq.size() >= m_cur.totalChunks && m_cur.inflightSeq.isEmpty()
-            && m_cur.retryWait.isEmpty());
-    if (allDone && !m_cur.completeSent) {
-        m_cur.completeSent = true;
+        !m_cur->uploadId.isEmpty()
+        && (m_cur->totalChunks == 0
+            || (m_cur->doneSeq.size() >= m_cur->totalChunks && m_cur->inflightSeq.isEmpty()
+                && m_cur->retryWait.isEmpty()));
+    if (allDone && !m_cur->completeSent) {
+        m_cur->completeSent = true;
         requestComplete();
     }
 }
 
 void TransferManager::launchChunkUpload(int seq)
 {
-    if (seq < 0 || seq >= m_cur.chunks.size())
+    if (seq < 0 || seq >= m_cur->chunks.size())
         return;
 
-    m_cur.inflightSeq.insert(seq);
+    m_cur->inflightSeq.insert(seq);
 
-    const QString    path     = m_cur.localPath;
-    const ChunkRange plan     = m_cur.chunks.at(seq);
-    const QString    uploadId = m_cur.uploadId;
-    const qint64     gen      = m_cur.gen;
+    const QString    path     = m_cur->localPath;
+    const ChunkRange plan     = m_cur->chunks.at(seq);
+    const QString    uploadId = m_cur->uploadId;
+    const qint64     gen      = m_cur->gen;
 
     Backend                  *be   = m_backend;
     QThreadPool              *pool = m_pool;
@@ -619,20 +744,25 @@ void TransferManager::launchChunkUpload(int seq)
 
 void TransferManager::onChunkUploaded(qint64 gen, int seq, const Ok &r)
 {
-    if (!m_hasCurrent || m_cur.kind != TransferKind::Upload || m_cur.gen != gen)
+    Task *const tp = taskForGen(gen);
+    if (!tp)
+        return;   // 过期回调：任务已完成/被取消
+    m_cur = tp;
+
+    if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Upload || m_cur->gen != gen)
         return;
-    if (m_cur.cancelRequested) {
-        m_cur.inflightSeq.remove(seq);
-        m_cur.retryWait.remove(seq);
+    if (m_cur->cancelRequested) {
+        m_cur->inflightSeq.remove(seq);
+        m_cur->retryWait.remove(seq);
         return;
     }
-    m_cur.inflightSeq.remove(seq);
+    m_cur->inflightSeq.remove(seq);
 
     if (!r.ok) {
-        const int tries = m_cur.retries.value(seq, 0);
+        const int tries = m_cur->retries.value(seq, 0);
         if (tries < kMaxRetries) {
-            m_cur.retries.insert(seq, tries + 1);
-            m_cur.retryWait.insert(seq); // 退避期间不参与补位（避免与定时器重复派发）
+            m_cur->retries.insert(seq, tries + 1);
+            m_cur->retryWait.insert(seq); // 退避期间不参与补位（避免与定时器重复派发）
             const int delay = (tries == 0) ? 500 : (tries == 1 ? 1000 : 2000);
             emit logMessage(QStringLiteral("warn"),
                             QStringLiteral("分块 %1 失败（第 %2 次重试，%3 ms 后再试）：%4")
@@ -641,11 +771,11 @@ void TransferManager::onChunkUploaded(qint64 gen, int seq, const Ok &r)
                                 .arg(delay)
                                 .arg(r.error));
             QTimer::singleShot(delay, this, [this, gen, seq]() {
-                if (!m_hasCurrent || m_cur.kind != TransferKind::Upload || m_cur.gen != gen
-                    || m_cur.cancelRequested)
+                if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Upload || m_cur->gen != gen
+                    || m_cur->cancelRequested)
                     return;
-                m_cur.retryWait.remove(seq);
-                if (m_cur.doneSeq.contains(seq))
+                m_cur->retryWait.remove(seq);
+                if (m_cur->doneSeq.contains(seq))
                     return;
                 launchChunkUpload(seq);
                 pumpChunks();
@@ -656,9 +786,9 @@ void TransferManager::onChunkUploaded(qint64 gen, int seq, const Ok &r)
         return;
     }
 
-    m_cur.doneSeq.insert(seq);
-    m_cur.retries.remove(seq);
-    m_cur.retryWait.remove(seq);
+    m_cur->doneSeq.insert(seq);
+    m_cur->retries.remove(seq);
+    m_cur->retryWait.remove(seq);
     saveManifest();
     updateUploadProgress();
     pumpChunks();
@@ -666,21 +796,21 @@ void TransferManager::onChunkUploaded(qint64 gen, int seq, const Ok &r)
 
 void TransferManager::updateUploadProgress()
 {
-    if (!m_hasCurrent)
+    if (!(m_cur != nullptr))
         return;
     qint64 doneBytes = 0;
-    for (int seq : m_cur.doneSeq) {
-        if (seq >= 0 && seq < m_cur.chunks.size())
-            doneBytes += m_cur.chunks.at(seq).length;
+    for (int seq : m_cur->doneSeq) {
+        if (seq >= 0 && seq < m_cur->chunks.size())
+            doneBytes += m_cur->chunks.at(seq).length;
     }
-    m_cur.done = qMin(doneBytes, m_cur.total);
-    emit taskProgress(m_cur.id, m_cur.done, m_cur.total);
+    m_cur->done = qMin(doneBytes, m_cur->total);
+    emit taskProgress(m_cur->id, m_cur->done, m_cur->total);
 }
 
 void TransferManager::requestComplete()
 {
-    const QString uploadId = m_cur.uploadId;
-    const qint64  gen      = m_cur.gen;
+    const QString uploadId = m_cur->uploadId;
+    const qint64  gen      = m_cur->gen;
 
     Backend                  *be   = m_backend;
     QThreadPool              *pool = m_pool;
@@ -698,18 +828,25 @@ void TransferManager::requestComplete()
 
 void TransferManager::onComplete(qint64 gen, const Result<FileItem> &r)
 {
-    if (!m_hasCurrent || m_cur.kind != TransferKind::Upload || m_cur.gen != gen)
+    Task *const tp = taskForGen(gen);
+    if (!tp)
+        return;   // 过期回调：任务已完成/被取消
+    m_cur = tp;
+
+    if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Upload || m_cur->gen != gen)
         return;
-    if (m_cur.cancelRequested) {
+    if (m_cur->cancelRequested) {
         finishTask(false, QStringLiteral("已取消"));
         return;
     }
 
     if (r.ok) {
-        clearManifest(m_cur.localPath);
+        clearManifest(m_cur->localPath);
         emit logMessage(QStringLiteral("info"),
-                        QStringLiteral("上传完成：%1（file_id=%2）").arg(m_cur.name, r.value.id));
-        finishTask(true, QStringLiteral("上传完成：%1").arg(m_cur.name));
+                        QStringLiteral("上传完成：%1（file_id=%2）").arg(m_cur->name, r.value.id));
+        // 先发完成条目（同步引擎据此写索引），再收尾任务
+        emit taskCompleted(m_cur->id, r.value);
+        finishTask(true, QStringLiteral("上传完成：%1").arg(m_cur->name));
         return;
     }
 
@@ -717,10 +854,10 @@ void TransferManager::onComplete(qint64 gen, const Result<FileItem> &r)
         const QVector<int> seqs = parseSeqList(r.error);
         bool               any  = false;
         for (int s : seqs) {
-            if (s >= 0 && s < m_cur.totalChunks) {
-                m_cur.doneSeq.remove(s);
-                m_cur.retries.remove(s);
-                m_cur.retryWait.remove(s);
+            if (s >= 0 && s < m_cur->totalChunks) {
+                m_cur->doneSeq.remove(s);
+                m_cur->retries.remove(s);
+                m_cur->retryWait.remove(s);
                 any = true;
             }
         }
@@ -729,7 +866,7 @@ void TransferManager::onComplete(qint64 gen, const Result<FileItem> &r)
             finishTask(false, QStringLiteral("合并上传失败：%1").arg(r.error));
             return;
         }
-        m_cur.completeSent = false;
+        m_cur->completeSent = false;
         emit logMessage(QStringLiteral("warn"),
                         QStringLiteral("服务端报告缺块/坏块，正在补传：%1").arg(r.error));
         pumpChunks();
@@ -745,11 +882,11 @@ void TransferManager::onComplete(qint64 gen, const Result<FileItem> &r)
 
 void TransferManager::beginDownload()
 {
-    m_cur.state = TransferState::Hashing; // 查询元数据阶段
+    m_cur->state = TransferState::Hashing; // 查询元数据阶段
     refresh();
 
-    const QString fileId = m_cur.fileId;
-    const qint64  gen    = m_cur.gen;
+    const QString fileId = m_cur->fileId;
+    const qint64  gen    = m_cur->gen;
 
     Backend                  *be   = m_backend;
     QThreadPool              *pool = m_pool;
@@ -766,9 +903,14 @@ void TransferManager::beginDownload()
 
 void TransferManager::onDownloadStat(qint64 gen, const Result<FileItem> &r)
 {
-    if (!m_hasCurrent || m_cur.kind != TransferKind::Download || m_cur.gen != gen)
+    Task *const tp = taskForGen(gen);
+    if (!tp)
+        return;   // 过期回调：任务已完成/被取消
+    m_cur = tp;
+
+    if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Download || m_cur->gen != gen)
         return;
-    if (m_cur.cancelRequested) {
+    if (m_cur->cancelRequested) {
         finishTask(false, QStringLiteral("已取消"));
         return;
     }
@@ -786,54 +928,54 @@ void TransferManager::onDownloadStat(qint64 gen, const Result<FileItem> &r)
     // 文件名取末段并清洗，杜绝路径穿越写盘
     QString nm = QFileInfo(f.name).fileName();
     if (nm.isEmpty())
-        nm = m_cur.fileId;
-    m_cur.name  = nm;
-    m_cur.total = f.size;
+        nm = m_cur->fileId;
+    m_cur->name  = nm;
+    m_cur->total = f.size;
 
     // 任务身份（服务端文件名 / 类型 / 总量）——上层据此在 TransferModel 建行；每任务仅一次
-    const QString downLocal = m_cur.finalPath.isEmpty()
-                                  ? (m_cur.destDir + QLatin1Char('/') + m_cur.name)
-                                  : m_cur.finalPath;
-    emit taskStarted(m_cur.id, m_cur.name, TransferKind::Download, downLocal, QString(),
-                     m_cur.total);
+    const QString downLocal = m_cur->finalPath.isEmpty()
+                                  ? (m_cur->destDir + QLatin1Char('/') + m_cur->name)
+                                  : m_cur->finalPath;
+    emit taskStarted(m_cur->id, m_cur->name, TransferKind::Download, downLocal, QString(),
+                     m_cur->total);
 
-    const QString dest = resolveDownloadDir(m_cur.destDir);
+    const QString dest = resolveDownloadDir(m_cur->destDir);
     if (!QDir().mkpath(dest)) {
         finishTask(false, QStringLiteral("无法创建保存目录：%1").arg(dest));
         return;
     }
-    m_cur.finalPath = Util::joinPath(dest, m_cur.name);
-    m_cur.partPath  = m_cur.finalPath + QStringLiteral(".part");
+    m_cur->finalPath = Util::joinPath(dest, m_cur->name);
+    m_cur->partPath  = m_cur->finalPath + QStringLiteral(".part");
 
     qint64 offset = 0;
-    if (QFile::exists(m_cur.partPath))
-        offset = QFileInfo(m_cur.partPath).size(); // 断点：.part 当前大小
-    if (offset > m_cur.total) {                    // .part 异常（比目标还大）→ 丢弃重来
-        QFile::remove(m_cur.partPath);
+    if (QFile::exists(m_cur->partPath))
+        offset = QFileInfo(m_cur->partPath).size(); // 断点：.part 当前大小
+    if (offset > m_cur->total) {                    // .part 异常（比目标还大）→ 丢弃重来
+        QFile::remove(m_cur->partPath);
         offset = 0;
     }
 
-    m_cur.done             = offset;
-    m_cur.nextReqOffset    = offset;
-    m_cur.inflightSegments = 0;
-    m_cur.writing          = false;
-    m_cur.readySegments.clear();
-    m_cur.writeQueue.clear();
-    m_cur.state = TransferState::Running;
-    emit taskProgress(m_cur.id, m_cur.done, m_cur.total);
+    m_cur->done             = offset;
+    m_cur->nextReqOffset    = offset;
+    m_cur->inflightSegments = 0;
+    m_cur->writing          = false;
+    m_cur->readySegments.clear();
+    m_cur->writeQueue.clear();
+    m_cur->state = TransferState::Running;
+    emit taskProgress(m_cur->id, m_cur->done, m_cur->total);
 
-    if (m_cur.total <= 0) { // 空文件
+    if (m_cur->total <= 0) { // 空文件
         finalizeDownload();
         return;
     }
-    if (offset >= m_cur.total) { // 已下完，直接收尾
+    if (offset >= m_cur->total) { // 已下完，直接收尾
         finalizeDownload();
         return;
     }
 
     emit logMessage(QStringLiteral("info"),
                     QStringLiteral("下载 %1（%2）→ %3%4")
-                        .arg(m_cur.name, Util::humanSize(m_cur.total), m_cur.finalPath,
+                        .arg(m_cur->name, Util::humanSize(m_cur->total), m_cur->finalPath,
                              offset > 0 ? QStringLiteral("，从 offset=%1 续传").arg(offset)
                                         : QString()));
     pumpDownload();
@@ -841,20 +983,21 @@ void TransferManager::onDownloadStat(qint64 gen, const Result<FileItem> &r)
 
 void TransferManager::pumpDownload()
 {
-    while (m_hasCurrent && m_cur.kind == TransferKind::Download && !m_cur.cancelRequested
-           && m_cur.inflightSegments < kDownloadConcurrency && m_cur.nextReqOffset < m_cur.total) {
-        const qint64 off = m_cur.nextReqOffset;
-        const qint64 len = qMin<qint64>(kDownloadChunkSize, m_cur.total - off);
-        ++m_cur.inflightSegments;
-        m_cur.nextReqOffset += len;
+    while ((m_cur != nullptr) && m_cur->kind == TransferKind::Download && !m_cur->cancelRequested
+           && !m_cur->paused && m_cur->inflightSegments < kDownloadConcurrency
+           && m_cur->nextReqOffset < m_cur->total) {
+        const qint64 off = m_cur->nextReqOffset;
+        const qint64 len = qMin<qint64>(kDownloadChunkSize, m_cur->total - off);
+        ++m_cur->inflightSegments;
+        m_cur->nextReqOffset += len;
         launchRangeRead(off, len);
     }
 }
 
 void TransferManager::launchRangeRead(qint64 offset, qint64 length)
 {
-    const QString fileId = m_cur.fileId;
-    const qint64  gen    = m_cur.gen;
+    const QString fileId = m_cur->fileId;
+    const qint64  gen    = m_cur->gen;
 
     Backend                  *be   = m_backend;
     QThreadPool              *pool = m_pool;
@@ -871,12 +1014,17 @@ void TransferManager::launchRangeRead(qint64 offset, qint64 length)
 
 void TransferManager::onRangeData(qint64 gen, qint64 offset, const Result<QByteArray> &r)
 {
-    if (!m_hasCurrent || m_cur.kind != TransferKind::Download || m_cur.gen != gen)
+    Task *const tp = taskForGen(gen);
+    if (!tp)
+        return;   // 过期回调：任务已完成/被取消
+    m_cur = tp;
+
+    if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Download || m_cur->gen != gen)
         return;
-    if (m_cur.cancelRequested)
+    if (m_cur->cancelRequested)
         return;
-    if (m_cur.inflightSegments > 0)
-        --m_cur.inflightSegments;
+    if (m_cur->inflightSegments > 0)
+        --m_cur->inflightSegments;
 
     if (!r.ok) {
         finishTask(false, QStringLiteral("分段下载失败（offset=%1）：%2").arg(offset).arg(r.error));
@@ -884,7 +1032,7 @@ void TransferManager::onRangeData(qint64 gen, qint64 offset, const Result<QByteA
     }
 
     const QByteArray data = r.value;
-    const qint64     expected = qMin<qint64>(kDownloadChunkSize, m_cur.total - offset);
+    const qint64     expected = qMin<qint64>(kDownloadChunkSize, m_cur->total - offset);
     if (data.size() != expected) {
         finishTask(false,
                    QStringLiteral("数据段长度不符（offset=%1，期望 %2 字节，实得 %3）")
@@ -895,8 +1043,8 @@ void TransferManager::onRangeData(qint64 gen, qint64 offset, const Result<QByteA
     }
 
     // 乱序到达先缓存（起点低于已写位置的重复段直接丢弃），按序推进写盘
-    if (offset >= m_cur.done && !m_cur.readySegments.contains(offset))
-        m_cur.readySegments.insert(offset, data);
+    if (offset >= m_cur->done && !m_cur->readySegments.contains(offset))
+        m_cur->readySegments.insert(offset, data);
 
     drainReady();
     maybeWrite();
@@ -906,29 +1054,29 @@ void TransferManager::onRangeData(qint64 gen, qint64 offset, const Result<QByteA
 
 void TransferManager::drainReady()
 {
-    for (auto it = m_cur.readySegments.begin(); it != m_cur.readySegments.end();) {
-        if (it.key() != m_cur.done)
+    for (auto it = m_cur->readySegments.begin(); it != m_cur->readySegments.end();) {
+        if (it.key() != m_cur->done)
             break; // 段序尚未接上
-        m_cur.writeQueue.append(qMakePair(it.key(), it.value()));
-        it = m_cur.readySegments.erase(it);
+        m_cur->writeQueue.append(qMakePair(it.key(), it.value()));
+        it = m_cur->readySegments.erase(it);
     }
 }
 
 void TransferManager::maybeWrite()
 {
-    if (!m_hasCurrent || m_cur.kind != TransferKind::Download)
+    if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Download)
         return;
-    if (m_cur.writing || m_cur.writeQueue.isEmpty() || m_cur.cancelRequested)
+    if (m_cur->writing || m_cur->writeQueue.isEmpty() || m_cur->cancelRequested)
         return;
-    const QPair<qint64, QByteArray> seg = m_cur.writeQueue.takeFirst();
-    m_cur.writing                       = true;
+    const QPair<qint64, QByteArray> seg = m_cur->writeQueue.takeFirst();
+    m_cur->writing                       = true;
     launchWrite(seg.first, seg.second);
 }
 
 void TransferManager::launchWrite(qint64 offset, const QByteArray &data)
 {
-    const QString partPath = m_cur.partPath;
-    const qint64  gen      = m_cur.gen;
+    const QString partPath = m_cur->partPath;
+    const qint64  gen      = m_cur->gen;
 
     QThreadPool              *pool = m_pool;
     QPointer<TransferManager> self(this);
@@ -957,20 +1105,25 @@ void TransferManager::launchWrite(qint64 offset, const QByteArray &data)
 
 void TransferManager::onSegmentWritten(qint64 gen, bool ok, const QString &err)
 {
-    if (!m_hasCurrent || m_cur.kind != TransferKind::Download || m_cur.gen != gen)
+    Task *const tp = taskForGen(gen);
+    if (!tp)
+        return;   // 过期回调：任务已完成/被取消
+    m_cur = tp;
+
+    if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Download || m_cur->gen != gen)
         return;
-    m_cur.writing = false;
-    if (m_cur.cancelRequested)
+    m_cur->writing = false;
+    if (m_cur->cancelRequested)
         return;
     if (!ok) {
         finishTask(false, QStringLiteral("写入下载文件失败：%1").arg(err));
         return;
     }
 
-    m_cur.done = QFileInfo(m_cur.partPath).size(); // 实际落盘字节 = .part 当前大小
-    emit taskProgress(m_cur.id, m_cur.done, m_cur.total);
+    m_cur->done = QFileInfo(m_cur->partPath).size(); // 实际落盘字节 = .part 当前大小
+    emit taskProgress(m_cur->id, m_cur->done, m_cur->total);
 
-    if (m_cur.total > 0 && m_cur.done >= m_cur.total) {
+    if (m_cur->total > 0 && m_cur->done >= m_cur->total) {
         finalizeDownload();
         return;
     }
@@ -982,29 +1135,29 @@ void TransferManager::onSegmentWritten(qint64 gen, bool ok, const QString &err)
 
 void TransferManager::checkDownloadDone()
 {
-    if (!m_hasCurrent || m_cur.kind != TransferKind::Download)
+    if (!(m_cur != nullptr) || m_cur->kind != TransferKind::Download)
         return;
-    if (m_cur.writing || m_cur.inflightSegments > 0 || !m_cur.readySegments.isEmpty()
-        || !m_cur.writeQueue.isEmpty())
+    if (m_cur->writing || m_cur->inflightSegments > 0 || !m_cur->readySegments.isEmpty()
+        || !m_cur->writeQueue.isEmpty())
         return;
-    if (m_cur.total > 0 && m_cur.done >= m_cur.total)
+    if (m_cur->total > 0 && m_cur->done >= m_cur->total)
         finalizeDownload();
 }
 
 void TransferManager::finalizeDownload()
 {
-    if (m_cur.total > 0) {
-        const qint64 partSize = QFileInfo(m_cur.partPath).size();
-        if (partSize != m_cur.total) {
+    if (m_cur->total > 0) {
+        const qint64 partSize = QFileInfo(m_cur->partPath).size();
+        if (partSize != m_cur->total) {
             emit logMessage(QStringLiteral("warn"),
                             QStringLiteral("下载大小不符（.part=%1，期望=%2），仍按现状落盘")
                                 .arg(partSize)
-                                .arg(m_cur.total));
+                                .arg(m_cur->total));
         }
     } else {
         // 空文件：确保存在一个空的 .part 以便改名落盘
-        if (!QFile::exists(m_cur.partPath)) {
-            QFile empty(m_cur.partPath);
+        if (!QFile::exists(m_cur->partPath)) {
+            QFile empty(m_cur->partPath);
             if (!empty.open(QIODevice::WriteOnly)) {
                 finishTask(false, QStringLiteral("创建空文件失败：%1").arg(empty.errorString()));
                 return;
@@ -1013,17 +1166,17 @@ void TransferManager::finalizeDownload()
         }
     }
 
-    if (QFile::exists(m_cur.finalPath) && !QFile::remove(m_cur.finalPath))
+    if (QFile::exists(m_cur->finalPath) && !QFile::remove(m_cur->finalPath))
         emit logMessage(QStringLiteral("warn"),
-                        QStringLiteral("无法删除已存在的目标文件：%1").arg(m_cur.finalPath));
+                        QStringLiteral("无法删除已存在的目标文件：%1").arg(m_cur->finalPath));
 
-    if (!QFile::rename(m_cur.partPath, m_cur.finalPath)) {
+    if (!QFile::rename(m_cur->partPath, m_cur->finalPath)) {
         finishTask(false,
-                   QStringLiteral("重命名落盘失败：%1 → %2").arg(m_cur.partPath, m_cur.finalPath));
+                   QStringLiteral("重命名落盘失败：%1 → %2").arg(m_cur->partPath, m_cur->finalPath));
         return;
     }
 
-    const QString saved = m_cur.finalPath;
+    const QString saved = m_cur->finalPath;
     emit logMessage(QStringLiteral("info"), QStringLiteral("下载完成：%1").arg(saved));
     finishTask(true, QStringLiteral("已保存到 %1").arg(saved));
 }
@@ -1083,7 +1236,7 @@ bool TransferManager::loadManifest(const QString &path, qint64 size, qint64 mtim
 
 void TransferManager::saveManifest() const
 {
-    if (!m_hasCurrent)
+    if (!(m_cur != nullptr))
         return;
     QDir().mkpath(AppPaths::configDir());
 
@@ -1099,18 +1252,18 @@ void TransferManager::saveManifest() const
     }
 
     QJsonObject entry;
-    entry.insert(QStringLiteral("abs_path"), m_cur.localPath);
-    entry.insert(QStringLiteral("name"), m_cur.name);
-    entry.insert(QStringLiteral("size"), double(m_cur.total));
-    entry.insert(QStringLiteral("mtime"), double(m_cur.mtime));
-    entry.insert(QStringLiteral("full_hash"), m_cur.fullHash);
-    entry.insert(QStringLiteral("upload_id"), m_cur.uploadId);
-    entry.insert(QStringLiteral("chunk_size"), double(m_cur.chunkSize)); // 单一来源（§8.5）
+    entry.insert(QStringLiteral("abs_path"), m_cur->localPath);
+    entry.insert(QStringLiteral("name"), m_cur->name);
+    entry.insert(QStringLiteral("size"), double(m_cur->total));
+    entry.insert(QStringLiteral("mtime"), double(m_cur->mtime));
+    entry.insert(QStringLiteral("full_hash"), m_cur->fullHash);
+    entry.insert(QStringLiteral("upload_id"), m_cur->uploadId);
+    entry.insert(QStringLiteral("chunk_size"), double(m_cur->chunkSize)); // 单一来源（§8.5）
     QJsonArray uploaded;
-    for (int s : m_cur.doneSeq)
+    for (int s : m_cur->doneSeq)
         uploaded.append(s);
     entry.insert(QStringLiteral("uploaded_seqs"), uploaded);
-    root.insert(m_cur.localPath, entry);
+    root.insert(m_cur->localPath, entry);
 
     QFile f(m_manifestFile);
     if (f.open(QIODevice::WriteOnly)) {

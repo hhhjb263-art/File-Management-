@@ -36,6 +36,7 @@ class TransferController : public QObject
     Q_PROPERTY(QString statusText  READ statusText  NOTIFY statusTextChanged)
     Q_PROPERTY(bool    busy        READ busy        NOTIFY busyChanged)
     Q_PROPERTY(bool    supported   READ supported   CONSTANT)
+    Q_PROPERTY(bool    paused      READ paused      NOTIFY pausedChanged)
 
 public:
     explicit TransferController(TransferManager *manager, QObject *parent = nullptr);
@@ -49,6 +50,9 @@ public:
     Q_INVOKABLE void upload(const QStringList &paths, const QString &dir);
     Q_INVOKABLE void download(const QStringList &ids, const QString &dest);
     Q_INVOKABLE void cancel();
+    Q_INVOKABLE void pause();
+    Q_INVOKABLE void resume();
+    bool paused() const;
     Q_INVOKABLE void resolveConflict(const QString &id, bool overwrite);
     Q_INVOKABLE void openLocalFolder(); // 打开本地下载目录（系统文件管理器）
 
@@ -59,6 +63,7 @@ public:
     void setTaskModel(TransferModel *model);
 
 signals:
+    void pausedChanged();
     void activeCountChanged();
     void statusTextChanged();
     void busyChanged();
