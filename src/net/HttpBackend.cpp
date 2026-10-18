@@ -87,6 +87,11 @@ namespace cv {
 namespace {
 
 constexpr int kTimeoutMs = 60000; // 单请求超时（含大分块 PUT / Range 下载）
+// **小控制请求**（init / complete / 冲突应答等 POST，body < 1MB）用更短的超时：
+// 服务器断电或不可达时，15 秒就报错重试，而不是让用户盯着不动的进度条干等 60 秒。
+// 大分块 PUT（5MB）与 Range 下载仍用 60 秒（慢链路需要余量）。
+constexpr int kSmallTimeoutMs = 15000;
+constexpr int kSmallBodyMax   = 1 << 20;   // 1MB
 constexpr int kPreviewTimeoutMs = 15000; // 预览取内容区间专用超时（短请求；不改 kTimeoutMs 语义）
 
 // 失败结果的可识别前缀（见 HttpBackend.h 的 static 判定函数）
@@ -416,6 +421,10 @@ void HttpBackend::requestAsyncOnce(Method method, const QString &path, const QBy
                                    std::function<void(Response)> done, int timeoutMs,
                                    int retriesLeft)
 {
+    // 小 POST（控制面请求）收紧超时：断电时快速失败，而不是卡满 60 秒。
+    if (method == Method::Post && body.size() < kSmallBodyMax && timeoutMs > kSmallTimeoutMs)
+        timeoutMs = kSmallTimeoutMs;
+
     QNetworkRequest req((QUrl(m_baseUrl + path)));
     req.setRawHeader("Accept", "application/json");
     if (!m_token.isEmpty())
@@ -430,6 +439,18 @@ void HttpBackend::requestAsyncOnce(Method method, const QString &path, const QBy
         req.setRawHeader("Content-Type", "application/json");
     for (auto it = headers.constBegin(); it != headers.constEnd(); ++it)
         req.setRawHeader(it.key(), it.value());
+
+    // ⚠️ **不复用 keep-alive 连接**（2026-10-18 实测定位后加）。
+    //    真因在服务端：`HttpServer::workerLoop()` 取出连接后调 `handleClient()`，
+    //    而 handleClient **为 keep-alive 全程循环**（最多 200 个请求 / 空闲 30s 才放手）
+    //    ⇒ 一个 worker 被**一条连接钉住**。`--workers=4` 意味着**同时最多只服务 4 条连接**。
+    //    客户端文件级并发（4 文件 × 3 块 + init/scan）会开出十几条连接 ⇒ 其余全排在
+    //    backlog 里，要等某条连接空闲 30 秒才轮得到。
+    //    实测证据：客户端 19:34:29 发出 init，服务端**完全没记录**；60s 后客户端超时；
+    //    19:35:43 服务端才处理到它（迟到 74 秒）。重试走新连接 3 秒就成功。
+    //    `Connection: close` ⇒ 每条连接只承载一个请求，worker 处理完立刻回池。
+    //    （代价：每请求一次 TCP 握手，局域网 ~1ms。）
+    req.setRawHeader("Connection", "close");
 
     QNetworkReply *reply = nullptr;
     switch (method) {
@@ -1215,12 +1236,20 @@ Ok HttpBackend::moveDir(const QString &from, const QString &to)
 
 Result<QPair<int, QString>> HttpBackend::moveToTrashBatch(const QStringList &ids)
 {
-    // 一次 POST 处理 N 个 id：N 次往返压成 1 次（多选删除慢的根因就是 N 次串行 DELETE）。
-    QJsonArray arr;
-    for (const QString &id : ids)
-        arr.append(id.toDouble());
+    // 一次 POST 处理 N 个目标：N 次往返压成 1 次。
+    // ⚠️ **目录与文件必须分开送**：目录 id 形如 "dir:<相对路径>"、在服务端没有数字 file_id，
+    //    直接 toDouble() 会变成 0 ⇒ 服务端判失败，界面上表现为"失败 / 权限不足"。
+    QJsonArray fileIds;
+    QJsonArray dirPaths;
+    for (const QString &id : ids) {
+        if (isDirId(id))
+            dirPaths.append(id.mid(kDirIdPrefix.size()));
+        else
+            fileIds.append(id.toLongLong());
+    }
     QJsonObject body;
-    body.insert(QStringLiteral("ids"), arr);
+    body.insert(QStringLiteral("ids"), fileIds);
+    body.insert(QStringLiteral("dirs"), dirPaths);
 
     const Response r = request(Method::Post, QStringLiteral("/api/v1/files/trash"),
                                QJsonDocument(body).toJson(QJsonDocument::Compact));
@@ -1231,8 +1260,11 @@ Result<QPair<int, QString>> HttpBackend::moveToTrashBatch(const QStringList &ids
     const int         ok  = o.value(QStringLiteral("ok_count")).toInt();
     const int         bad = o.value(QStringLiteral("failed_count")).toInt();
     QString           err;
-    if (bad > 0)
-        err = QStringLiteral("%1 项失败（可能已被删除或无权限）").arg(bad);
+    if (bad > 0) {
+        // 文案要点：删目录失败最常见的原因是"目录已不在/路径非法"，而不是真的没权限。
+        // 写成"权限不足"会把用户引向错误方向（实测就有人这么报）。
+        err = QStringLiteral("%1 项失败（可能已被删除、或路径不合法）").arg(bad);
+    }
     return Result<QPair<int, QString>>::success(qMakePair(ok, err));
 }
 

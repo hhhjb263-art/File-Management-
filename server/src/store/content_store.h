@@ -18,6 +18,12 @@ namespace cv {
 //   杜绝“伪装明文”绕过加密完整性校验。
 //   向后兼容：加密开启时读取先找 <hash>.enc，找不到再回退同名明文 <hash>（支持从明文库平滑迁移）。
 class ContentStore {
+public:
+  // 关掉镜像树：materializeFromChunks 变成空操作（省一半磁盘/写入）。
+  // 0 字节文件例外：它没有分块，镜像就是它的唯一表示，仍然会建。
+  void setMirrorEnabled(bool on) { mirrorEnabled_ = on; }
+  bool mirrorEnabled() const { return mirrorEnabled_; }
+
  public:
   explicit ContentStore(std::string root);
 
@@ -94,6 +100,7 @@ class ContentStore {
   std::string root_;
   std::vector<unsigned char> key_;   // 32 字节静态加密密钥（仅加密开启时有效）
   bool encEnabled_ = false;          // 静态加密开关
+  bool mirrorEnabled_ = true;        // 镜像树开关（off ⇒ 只存内容库一份）
 };
 
 }  // namespace cv

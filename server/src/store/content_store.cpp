@@ -435,12 +435,31 @@ bool ContentStore::readRange(const std::vector<std::string>& chunkHashes,
 
 bool ContentStore::materializeFromChunks(const std::vector<std::string>& chunkHashes,
                                         const std::string& targetAbs, std::string& err) {
+  // 镜像树关闭时：有分块的文件不建镜像（内容库才是权威副本，下载会回落到分块读取）。
+  // 0 字节文件没有分块 ⇒ 镜像就是它唯一的存在形式，照旧建。
+  if (!mirrorEnabled_ && !chunkHashes.empty())
+    return true;
   if (targetAbs.empty()) {
     err = "empty target path";
     return false;
   }
   const std::string tmp = targetAbs + ".tmp";
   {
+    // ⚠️ 必须先建父目录（2026-10-20 真机定位）：
+    //    上传到**子目录**（dir 非空）时 files/<dir>/ 可能从来不存在 ——
+    //    根目录文件的父目录 files/ 恰好存在，所以以前只在根目录上传时看不出问题。
+    //    一旦子目录缺镜像目录，open 失败 ⇒ 镜像维护失败 ⇒ **删除/移动该目录整条操作失败**
+    //    （日志：cannot open tmp for write: .../files/bt-dir/bt-c.bin.tmp）。
+    {
+      std::error_code dec;
+      const fs::path parent = fs::path(tmp).parent_path();
+      if (!parent.empty())
+        fs::create_directories(parent, dec);
+      if (dec) {
+        err = "cannot create mirror parent dir: " + parent.string() + " (" + dec.message() + ")";
+        return false;
+      }
+    }
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
       err = "cannot open tmp for write: " + tmp;

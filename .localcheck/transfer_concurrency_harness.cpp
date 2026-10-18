@@ -138,6 +138,37 @@ int main(int argc, char **argv)
     CHECK(finishedOk == kFiles, "所有任务都应成功");
     CHECK(dupFinish == 0, "同一任务不应被结束两次");
 
+    // ---- 3) 同名冲突：UI 的"覆盖"应答必须真的能解掉冲突（回归用例）----
+    // 盯的是一个真实回归：resolveConflict 曾用 m_cur 做守卫，而它是从**UI 回调**进来的
+    // （那时 m_cur 已被别的任务改掉或置空）⇒ 应答被当成"无对应冲突"丢弃
+    // ⇒ 任务永久停在 awaitingConflict，一直占着并发槽 ⇒ 后续文件排队/超时。
+    std::printf("---- 冲突应答用例 ----\n");
+    {
+        QTemporaryDir tmp2;
+        const QString p2 = tmp2.path() + QStringLiteral("/f00.bin");   // 与第一批**同名**
+        QFile f(p2);
+        f.open(QIODevice::WriteOnly);
+        f.write(QByteArray(4 * 1024, 'Z'));                            // 内容不同 ⇒ 撞 409
+        f.close();
+
+        const int before     = finished.size();
+        const int beforeOk   = finishedOk;
+        tm.enqueueUpload(QStringList{p2}, QString());
+
+        QEventLoop l2;
+        QTimer     t2;
+        t2.setSingleShot(true);
+        QObject::connect(&tm, &TransferManager::taskFinished, &l2, &QEventLoop::quit);
+        QObject::connect(&t2, &QTimer::timeout, &l2, &QEventLoop::quit);
+        t2.start(20000);
+        l2.exec();
+
+        CHECK(finished.size() == before + 1, "冲突任务必须结束（不能应答被丢弃后永久卡住）");
+        CHECK(finishedOk >= beforeOk + 1, "冲突任务应成功（覆盖）");
+        std::printf("  冲突用例：结束 %d，成功增量 %d\n", int(finished.size() - before),
+                    finishedOk - beforeOk);
+    }
+
     std::printf("\n结果：pass=%d fail=%d\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

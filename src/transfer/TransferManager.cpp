@@ -292,16 +292,44 @@ void TransferManager::cancelCurrent()
                         QStringLiteral("用户取消：%1")
                             .arg(t->kind == TransferKind::Upload ? t->name : t->fileId));
 
-        if (t->kind == TransferKind::Upload && !t->uploadId.isEmpty()) {
-            // 通知服务端丢弃会话；但保留本地 manifest，下次仍可续传
-            const QString uploadId = t->uploadId;
-            Backend      *be       = m_backend;
-            QThreadPool  *pool     = m_pool;
-            if (pool) {
-                pool->start([be, uploadId]() {
-                    if (be)
-                        be->cancelUpload(uploadId);
-                });
+        if (t->kind == TransferKind::Upload) {
+            // ⚠️ 「取消」与「暂停」语义必须分开：
+            //    · 暂停 —— 保留 manifest，重启后可续传；
+            //    · 取消 —— **放弃这次上传**，连本地断点一起清掉。
+            //    以前这里保留 manifest，于是"取消 → 重启客户端"时 restoreInterrupted()
+            //    会把它当成未完成任务**重新上传**（用户实测 2.08G 文件复现）。
+            clearManifest(t->localPath);
+
+            if (!t->uploadId.isEmpty()) {
+                // 通知服务端丢弃会话（服务端会删临时分块，**释放磁盘**）
+                const QString uploadId = t->uploadId;
+                Backend      *be       = m_backend;
+                QThreadPool  *pool     = m_pool;
+                QPointer<TransferManager> self(this);
+                ++m_cancelPending;
+                if (pool) {
+                    pool->start([self, be, uploadId]() {
+                        if (be)
+                            be->cancelUpload(uploadId);
+                        if (!self)
+                            return;
+                        // 清理完成后回主线程：全部取消落地 → 发一次用量刷新
+                        QMetaObject::invokeMethod(
+                            self.data(),
+                            [self]() {
+                                if (!self)
+                                    return;
+                                --self->m_cancelPending;
+                                if (self->m_cancelPending <= 0) {
+                                    self->m_cancelPending = 0;
+                                    emit self->storageChanged();
+                                }
+                            },
+                            Qt::QueuedConnection);
+                    });
+                } else {
+                    --m_cancelPending;
+                }
             }
         }
         finishTask(false, QStringLiteral("已取消"));
@@ -605,7 +633,20 @@ void TransferManager::onBeginUpload(qint64 gen, const Result<UploadTicket> &r)
         return;
     }
 
+    // ⚠️ 会话变了 ⇒ 服务端手上**没有**这些块（断电超过会话 GC 期 / 换了服务器 / 被清理）。
+    //    此时若继续信 manifest 的"已传"记录，就会跳过服务端真正缺的块，
+    //    只能靠"合并报缺块→再重传"兜底（多跑一轮，日志看起来还像出错）。
+    //    这里直接作废本地断点，一次到位：这些块反正服务端也没有，重传一遍才是对的。
+    //    （uploadId 非空 = 本次是从 manifest 恢复的，否则本来就是全新任务，无需提示。）
+    const QString prevSession = m_cur->uploadId;
     m_cur->uploadId = t.uploadId;
+    if (!prevSession.isEmpty() && prevSession != t.uploadId) {
+        m_cur->doneSeq.clear();
+        m_cur->resumeHit = false;
+        emit logMessage(QStringLiteral("warn"),
+                        QStringLiteral("服务端会话已变更（%1 → %2），本地断点作废，该文件将重新上传")
+                            .arg(prevSession, t.uploadId));
+    }
     // 服务端已收字节数 → 连续前缀；与本地 manifest 已确认集合求并（PUT 幂等，重复无害）
     for (int seq = 0; seq < m_cur->totalChunks; ++seq) {
         const ChunkRange &c = m_cur->chunks.at(seq);
@@ -638,11 +679,26 @@ void TransferManager::onUploadConflict(const QString &errorText)
 
 void TransferManager::resolveConflict(const QString &taskId, bool overwrite)
 {
-    if (!(m_cur != nullptr) || m_cur->id != taskId || !m_cur->awaitingConflict) {
+    // ⚠️ 必须按 taskId 在**在途表**里找任务，不能用 m_cur。
+    //    resolveConflict 是从 UI（冲突对话框的按钮）回调进来的 —— 那一刻**没有"当前回调链"**，
+    //    m_cur 早已被别的任务的回调改掉（并发下几乎必然如此），甚至被置空。
+    //    用 m_cur 做守卫 ⇒ 用户的"覆盖/跳过"应答被当成"无对应冲突"丢弃 ⇒
+    //    任务永久停在 awaitingConflict，**一直占着并发槽** ⇒
+    //    后续文件排队变慢、超时、看起来像"秒传没生效/卡住"。
+    Task *t = nullptr;
+    for (Task *p : m_active) {
+        if (p && p->id == taskId) {
+            t = p;
+            break;
+        }
+    }
+    if (!t || !t->awaitingConflict) {
         emit logMessage(QStringLiteral("warn"),
-                        QStringLiteral("忽略无对应冲突的应答（taskId=%1）").arg(taskId));
+                        QStringLiteral("忽略无对应冲突的应答（taskId=%1 不在途或不在等冲突）")
+                            .arg(taskId));
         return;
     }
+    m_cur = t;                       // 后面沿用原有的 m_cur 逻辑（此时已指向正确任务）
     m_cur->awaitingConflict = false;
 
     if (!overwrite) {
@@ -662,7 +718,10 @@ void TransferManager::resolveConflict(const QString &taskId, bool overwrite)
     m_cur->resumeHit    = false;
     m_cur->completeSent = false;
     refresh();
+    const qint64 gen = m_cur->gen;      // requestBeginUpload 里要用 m_cur，先留住
+    (void)gen;
     requestBeginUpload(true); // 置真 → init → 复位 在同一工作线程内原子完成
+    // 注意：不要在这里清 m_cur —— requestBeginUpload 是异步派发，此后回调会重新按 gen 定位。
 }
 
 void TransferManager::pumpChunks()
@@ -1200,6 +1259,58 @@ QList<ChunkRange> TransferManager::makeChunkPlan(qint64 size, qint64 chunkBytes)
     return plan;
 }
 
+int TransferManager::restoreInterrupted()
+{
+    // 启动时调用：把 manifest 里「本地文件仍在、且记录了目标目录」的条目重新入队。
+    // pipeline 里 loadManifest 会命中同一份 manifest ⇒ 从上次已确认的块继续（不重传）。
+    // 返回恢复的任务数（用于启动提示）；本地文件已消失的条目顺手清理。
+    QFile f(m_manifestFile);
+    if (!f.open(QIODevice::ReadOnly))
+        return 0;
+    const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+    f.close();
+
+    QJsonObject keep = root;   // 默认全保留；下面按情况剔除
+    QStringList   restore;
+    for (auto it = root.constBegin(); it != root.constEnd(); ++it) {
+        const QJsonObject e = it.value().toObject();
+        const QString abs = e.value(QStringLiteral("abs_path")).toString();
+        if (abs.isEmpty()) { keep.remove(it.key()); continue; }
+        if (!QFileInfo(abs).isFile()) {            // 本地文件已不在：断点无意义，清理
+            keep.remove(it.key());
+            continue;
+        }
+        const QString dir = e.value(QStringLiteral("dir")).toString();
+        if (!e.contains(QStringLiteral("dir"))) {  // 旧版 manifest 没记目标目录：无法确定传到哪，
+            continue;                              // 保留条目（用户手动重传时仍可续块），但不自动恢复
+        }
+        restore << abs;
+        // enqueueUpload 用的目标目录 = 记录里的 dir（'' = 根）
+    }
+    {
+        QFile w(m_manifestFile);
+        if (w.open(QIODevice::WriteOnly)) {
+            w.write(QJsonDocument(keep).toJson(QJsonDocument::Compact));
+            w.close();
+        }
+    }
+    if (restore.isEmpty())
+        return 0;
+
+    // 按各自记录的目标目录分组 enqueue（不同目录不能混在一批）
+    QHash<QString, QStringList> byDir;
+    for (const QString &abs : restore) {
+        const QString d = root.value(abs).toObject().value(QStringLiteral("dir")).toString();
+        byDir[d] << abs;
+    }
+    int n = 0;
+    for (auto it = byDir.constBegin(); it != byDir.constEnd(); ++it)
+        enqueueUpload(it.value(), it.key()), n += it.value().size();
+    emit logMessage(QStringLiteral("info"),
+                    QStringLiteral("已恢复 %1 个未完成的上传（从断点继续）").arg(n));
+    return n;
+}
+
 bool TransferManager::loadManifest(const QString &path, qint64 size, qint64 mtime, qint64 chunkBytes,
                                    const QString &hash, QString *uploadId, QSet<int> *seqs) const
 {
@@ -1259,6 +1370,7 @@ void TransferManager::saveManifest() const
     entry.insert(QStringLiteral("full_hash"), m_cur->fullHash);
     entry.insert(QStringLiteral("upload_id"), m_cur->uploadId);
     entry.insert(QStringLiteral("chunk_size"), double(m_cur->chunkSize)); // 单一来源（§8.5）
+    entry.insert(QStringLiteral("dir"), m_cur->dir);   // ⚠️ 必须记：重启后自动恢复要知道传到哪个目录
     QJsonArray uploaded;
     for (int s : m_cur->doneSeq)
         uploaded.append(s);

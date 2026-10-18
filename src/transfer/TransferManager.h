@@ -82,6 +82,10 @@ public:
     // 取消当前任务（并终止当前批次剩余的排队任务）
     Q_INVOKABLE void cancelCurrent();
 
+    // 启动时恢复「上次没传完」的上传：读 manifest，把本地文件仍在的条目重新入队，
+    // pipeline 会命中同一 manifest 从断点继续。返回恢复的任务数。
+    Q_INVOKABLE int restoreInterrupted();
+
     // 暂停 / 继续**当前任务**。因为引擎一次只跑一个任务，暂停它会同时挡住后面的队列
     // （这正是"暂停传输"该有的语义）。已在途的分块/区间会自然收尾，不再派发新的。
     Q_INVOKABLE void pauseCurrent();
@@ -111,6 +115,9 @@ signals:
     // 上传**成功合并**后的远端条目（含 rev/content_hash）。
     // 同步引擎要拿它写索引：rev 是云端权威信号，缺了会写出过期索引 ⇒ 下轮误判"云端变了"。
     void taskCompleted(const QString &taskId, const FileItem &item);
+    // 取消任务后磁盘占用会变（服务端删掉会话的临时分块），且这一刻**晚于** taskFinished，
+    // 所以单独发一个信号，让上层在"服务端清理完成"之后再刷用量（否则数字是旧的）。
+    void storageChanged();
     // 同名冲突：由 TransferController 弹「是否覆盖」，再回调解续
     void conflictDetected(const QString &taskId, const QString &dir, const QString &name);
     void logMessage(const QString &level, const QString &text);
@@ -235,6 +242,8 @@ private:
     // finishTask 后不能立刻 delete（调用栈里可能还有人用 m_cur），
     // 先挪进待回收列表，下次 pump() 开头统一回收。
     QList<Task *> m_graveyard;
+    // 还在等服务端 cancelUpload 落地的任务数；减到 0 才发 storageChanged（只发一次）
+    int m_cancelPending = 0;
 
     int     m_activeCount = 0;
     QString m_statusText  = QStringLiteral("空闲");

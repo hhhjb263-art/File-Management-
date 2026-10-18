@@ -434,6 +434,49 @@ bool ownerVisible(const cv::UploadSession& s, std::int64_t authUserId) {
   return s.ownerId == authUserId;
 }
 
+// 把 TrashTarget 真正移入回收站（文件 / 目录两条路）。
+// 从 main() 里的 doTrash lambda 提出来的：**批量删除路由**（POST /api/v1/files/trash）
+// 也要用它，而那个 lambda 定义在所有路由之后，拿不到。提成自由函数 ⇒ 只有一份实现，
+// 单条与批量的语义/权限/回收站行为**必然一致**。
+bool trashTargetApply(cv::FileRepository& repo, std::int64_t authUserId, const TrashTarget& t,
+                      cv::json::Value& out, std::string& err) {
+  const std::int64_t oid   = scopeOwner(authUserId);
+  const std::int64_t nowMs = cv::nowMillis();
+
+  if (!t.isDir) {
+    cv::FileRow row;
+    if (!repo.findById(t.fileId, row, err) || !ownerVisible(row, authUserId)) {
+      err = "file not found";
+      return false;
+    }
+    if (!repo.trashFile(t.fileId, nowMs, err)) return false;
+    out.set("file_id", static_cast<long long>(t.fileId));
+    out.set("name", row.name);
+    out.set("dir", row.dir);
+    out.set("deleted_at", static_cast<long long>(nowMs));
+    return true;
+  }
+
+  // 目录：自身 + 全部后代目录 + 其下全部未删除文件
+  std::vector<std::string> allDirs;
+  if (!repo.listDirPathsUnder(oid, t.dir, allDirs, err)) return false;
+  if (allDirs.empty()) {
+    err = "dir not found";
+    return false;
+  }
+  std::vector<std::int64_t> fileIds;
+  if (!repo.listFileIdsUnderDir(oid, t.dir, fileIds, err)) return false;
+  if (!repo.setDirsTrashed(oid, allDirs, true, nowMs, err)) return false;
+  for (std::int64_t fid : fileIds) {
+    if (!repo.trashFile(fid, nowMs, err)) return false;
+  }
+  out.set("dir", t.dir);
+  out.set("dir_count", static_cast<long long>(allDirs.size()));
+  out.set("file_count", static_cast<long long>(fileIds.size()));
+  out.set("deleted_at", static_cast<long long>(nowMs));
+  return true;
+}
+
 // 镜像树路径按 owner 作用域隔离：
 //   ownerId <= 0  → 维持历史布局 <filesRoot>/<dir>/<name>（兼容既有部署的镜像目录不"消失"）。
 //   ownerId >= 1  → <filesRoot>/u<ownerId>/<dir>/<name>，各用户互不覆盖。
@@ -1167,6 +1210,10 @@ int main(int argc, char** argv) {
 
 
   ContentStore store(cfg.blobRoot());
+  store.setMirrorEnabled(cfg.mirrorEnabled);
+  if (!cfg.mirrorEnabled)
+    CV_LOG_INFO("镜像文件树已关闭（mirror=off）：每个文件只存内容库一份，"
+                "下载回落到分块读取；如需人工浏览目录树，改回 mirror=on");
   if (!store.init(err)) {
     CV_LOG_ERROR("初始化内容存储失败: " << err);
     return 1;
@@ -1733,6 +1780,9 @@ int main(int argc, char** argv) {
       // owner 不匹配一律按"查不到"处理，避免泄漏他人文件是否存在
       if (id <= 0 || !repo.findById(id, before, perr) || before.ownerId != oid
           || !repo.moveFileToDir(oid, id, newDir, perr)) {
+        CV_LOG_WARN("批量移动失败 id=" << id << " → " << (newDir.empty() ? "(根)" : newDir)
+                                      << " 原因: " << perr);
+        perr.clear();
         failIds.push_back(json::Value(static_cast<long long>(id)));
         continue;
       }
@@ -1862,6 +1912,40 @@ int main(int argc, char** argv) {
     json::Value okIds   = json::Value::array();
     json::Value failIds = json::Value::array();
 
+    // ⚠️ **文件夹必须单独走 dirs 数组**：目录存在 dir_node 里，**没有数字 file_id**；
+    //    客户端对目录的 id 是 "dir:<相对路径>"，若直接取数字会变成 0 ⇒ 整批判失败
+    //    （客户端文案是"可能已被删除或无权限"，用户会读成"权限不足"）。
+    //    这里复用单条删除那套 doTrash()，语义/权限/回收站行为完全一致。
+    json::Value okDirs   = json::Value::array();
+    json::Value failDirs = json::Value::array();
+    if (const json::Value* dirsV = in.find("dirs")) {
+      if (dirsV->type() == json::Value::Type::Array) {
+        for (const json::Value& one : dirsV->items()) {
+          if (one.type() != json::Value::Type::String || one.stringValue().empty()) {
+            failDirs.push_back(one);
+            continue;
+          }
+          std::string rel;
+          const cv::PathStatus pst = cv::sanitizeRelPath(one.stringValue(), rel);
+          if (pst != cv::PathStatus::Ok) {
+            failDirs.push_back(one);
+            continue;
+          }
+          TrashTarget t;
+          t.isDir = true;
+          t.dir   = rel;
+          json::Value dummy = json::Value::object();
+          if (!trashTargetApply(repo, auth, t, dummy, perr)) {
+            CV_LOG_WARN("批量删目录失败 dir=" << rel << " 原因: " << perr);
+            perr.clear();
+            failDirs.push_back(one);
+            continue;
+          }
+          okDirs.push_back(one);
+        }
+      }
+    }
+
     for (const json::Value& one : idsV->items()) {
       const std::int64_t id = static_cast<std::int64_t>(one.numberValue(-1));
       if (id <= 0) {
@@ -1880,12 +1964,16 @@ int main(int argc, char** argv) {
     json::Value out = json::Value::object();
     out.set("ok_ids", okIds);
     out.set("failed_ids", failIds);
-    out.set("ok_count", static_cast<long long>(okIds.items().size()));
-    out.set("failed_count", static_cast<long long>(failIds.items().size()));
+    out.set("ok_dirs", okDirs);
+    out.set("failed_dirs", failDirs);
+    out.set("ok_count", static_cast<long long>(okIds.items().size() + okDirs.items().size()));
+    out.set("failed_count",
+            static_cast<long long>(failIds.items().size() + failDirs.items().size()));
     resp.setJson(200, json::dump(out));
-    CV_LOG_INFO("批量移入回收站：成功 " << okIds.items().size() << " 项，失败 "
-                                      << failIds.items().size() << " 项（请求 "
-                                      << idsV->items().size() << " 项）");
+    CV_LOG_INFO("批量移入回收站：文件 成功 " << okIds.items().size() << " / 失败 "
+                                          << failIds.items().size() << "；目录 成功 "
+                                          << okDirs.items().size() << " / 失败 "
+                                          << failDirs.items().size());
   });
 
   // ---- GET /api/v1/storage （磁盘空间自查）----
@@ -2775,43 +2863,10 @@ int main(int argc, char** argv) {
   };
 
   // 移入回收站。幂等：trashFile 自带 `AND deleted = 0` 守卫，重复进站不会刷新时间戳。
+  // 薄包装：真正的实现在 trashTargetApply()（批量路由也要用同一份）
   auto doTrash = [&](std::int64_t auth, const TrashTarget& t, json::Value& out,
                      std::string& err) -> bool {
-    const std::int64_t oid = scopeOwner(auth);
-    const std::int64_t nowMs = nowMillis();
-
-    if (!t.isDir) {
-      FileRow row;
-      if (!repo.findById(t.fileId, row, err) || !ownerVisible(row, auth)) {
-        err = "file not found";
-        return false;
-      }
-      if (!repo.trashFile(t.fileId, nowMs, err)) return false;
-      out.set("file_id", static_cast<long long>(t.fileId));
-      out.set("name", row.name);
-      out.set("dir", row.dir);
-      out.set("deleted_at", static_cast<long long>(nowMs));
-      return true;
-    }
-
-    // 目录：自身 + 全部后代目录 + 其下全部未删除文件
-    std::vector<std::string> allDirs;
-    if (!repo.listDirPathsUnder(oid, t.dir, allDirs, err)) return false;
-    if (allDirs.empty()) {
-      err = "dir not found";
-      return false;
-    }
-    std::vector<std::int64_t> fileIds;
-    if (!repo.listFileIdsUnderDir(oid, t.dir, fileIds, err)) return false;
-    if (!repo.setDirsTrashed(oid, allDirs, true, nowMs, err)) return false;
-    for (std::int64_t fid : fileIds) {
-      if (!repo.trashFile(fid, nowMs, err)) return false;
-    }
-    out.set("dir", t.dir);
-    out.set("dir_count", static_cast<long long>(allDirs.size()));
-    out.set("file_count", static_cast<long long>(fileIds.size()));
-    out.set("deleted_at", static_cast<long long>(nowMs));
-    return true;
+    return trashTargetApply(repo, auth, t, out, err);
   };
 
   // 从回收站恢复。

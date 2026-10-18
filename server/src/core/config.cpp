@@ -82,6 +82,7 @@ bool loadFile(const std::string& path, Config& cfg, std::string& err) {
     else if (k == "backup_blobs") cfg.backupBlobsDir = v;
     else if (k == "restore_blobs") cfg.restoreBlobsDir = v;
     else if (k == "scan") cfg.scanEnabled = (toLowerLocal(v) != "off");
+    else if (k == "mirror") cfg.mirrorEnabled = (toLowerLocal(v) != "off");
     else if (k == "scan_api_key") cfg.scanApiKey = v;
     else if (k == "scan_block_threshold") cfg.scanBlockThreshold = toInt(v, cfg.scanBlockThreshold);
     else if (k == "scan_fail_open") cfg.scanFailOpen = (toLowerLocal(v) != "off");
@@ -180,6 +181,8 @@ Config loadConfig(int argc, char** argv) {
   cfg.restoreBlobsDir = envOr("CV_RESTORE_BLOBS", cfg.restoreBlobsDir);
   if (!envOr("CV_SCAN", "").empty())
     cfg.scanEnabled = (toLowerLocal(envOr("CV_SCAN", "")) != "off");
+  if (!envOr("CV_MIRROR", "").empty())
+    cfg.mirrorEnabled = (toLowerLocal(envOr("CV_MIRROR", "")) != "off");
   cfg.scanApiKey = envOr("CV_SCAN_API_KEY", cfg.scanApiKey);
   cfg.scanTimeoutMs = toInt(envOr("CV_SCAN_TIMEOUT_MS", ""), cfg.scanTimeoutMs);
 

@@ -50,6 +50,10 @@ struct Config {
   // 另一个进程可能正在上传）；0 = 不限（危险）。
   // 三通道：--blob-gc / CV_BLOB_GC / blob_gc；--blob-gc-grace-min / CV_BLOB_GC_GRACE_MIN / blob_gc_grace_min。
   bool blobGcEnabled = true;
+  // 是否维护「镜像文件树」（<data>/files/<dir>/<name>，明文副本）。
+  // on（默认）：下载走镜像快路径；代价是每个文件在磁盘上占 **两份**（内容库 + 镜像）。
+  // off：省一半磁盘、少一半写入；下载回落到内容库分块读取（功能不变，略慢）。
+  bool mirrorEnabled = true;
   int  blobGcGraceMinutes = 60;
 
   // 数据库备份模式：非空 → 只做一次一致性热备（VACUUM INTO）然后退出，不启动服务。

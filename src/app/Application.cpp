@@ -25,6 +25,7 @@
 #include "../net/HttpBackend.h"
 #include "../net/MockBackend.h"
 #include "../sync/LocalIndex.h"
+#include <QTimer>
 #include "../transfer/TransferManager.h"
 
 namespace {
@@ -91,6 +92,9 @@ void Application::start()
     // 在把这个差异抹平并让 A/B 双模式都 17/0 之前，生产走已验证的内联路径。
     // m_sync->setTransferManager(m_transfer);
     m_transfers = new cv::TransferController(m_transfer, this);
+    // 启动恢复：把上次没传完的上传按 manifest 重新入队（断点续传，不重传已确认块）。
+    // 稍等片刻让界面/日志先就绪再跑。
+    QTimer::singleShot(1500, m_transfer, &cv::TransferManager::restoreInterrupted);
     // 把队列进度镜像到 QML 数据模型（否则传输页/侧栏永远空白）
     m_transfers->setTaskModel(m_transferModel);
     m_shares = new cv::ShareController(m_backend, this);
@@ -160,6 +164,12 @@ void Application::start()
                          if (ok && m_stats)
                              m_stats->refresh();
                      });
+    // 取消任务：服务端删掉会话的临时分块后才真正释放磁盘，且这一步**晚于** taskFinished，
+    // 所以由 TransferManager 在清理落地后单独发一次（否则底栏用量停在旧数字上）。
+    QObject::connect(m_transfer, &cv::TransferManager::storageChanged, this, [this] {
+        if (m_stats)
+            m_stats->refresh();
+    });
 
     // ================= 三项功能的跨模块联动 =================
     // 说明：这三个功能各自"独立可用"，但共享同一份文件实体，所以状态必须互相通知 ——
