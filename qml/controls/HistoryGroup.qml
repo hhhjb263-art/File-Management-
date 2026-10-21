@@ -215,6 +215,16 @@ ColumnLayout {
                                     text: historyRow.info.stateText !== undefined
                                           ? String(historyRow.info.stateText) : ""
                                 }
+
+                                // 「重新传输」：只在失败 / 取消的行上出现（回环箭头）
+                                GhostButton {
+                                    visible: historyRow.info.state === "failed"
+                                             || historyRow.info.state === "canceled"
+                                    iconName: "refresh"
+                                    onClicked: Transfers.retry(String(historyRow.info.taskId))
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: qsTr("重新传输")
+                                }
                             }
 
                             Label {

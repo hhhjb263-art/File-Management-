@@ -524,7 +524,12 @@ ApplicationWindow {
         // （FilesPage 在不可见时已 clearPreview()，这里只是把面板本身也收掉，二者一致。）
         PreviewPanel {
             id: previewPanel
-            visible: window.wide && window.navIndex === window.pageFiles
+            // ⚠️ 这里**不用** window.wide（=1280）：那个断点管的是整体布局，
+            //    而预览面板只需要"列表还能放下"的宽度。实际踩到的场景：
+            //    1366×768 的笔记本，或 1920 屏开 125% 缩放（逻辑宽 ≈1536，扣边框后贴着 1280），
+            //    面板整块不显示 ⇒ 用户以为"客户端不支持预览 txt"。
+            //    面板自身 ~ sidePanelWidth，列表留 700 就够 ⇒ 1040 起显示。
+            visible: window.width >= 1040 && window.navIndex === window.pageFiles
             Layout.preferredWidth: Theme.sidePanelWidth
             Layout.fillHeight: true
         }

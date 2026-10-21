@@ -134,6 +134,11 @@ private:
 
     QList<TransferTask> m_tasks;
     QList<TransferTask> m_history; // 头插：索引 0 = 最新
+
+    // 历史落盘：重启客户端后「已上传 / 已下载」不再被清空（用户要求）。
+    // 只存展示需要的字段；重试用的参数由 TransferManager 自己另存一份。
+    void loadHistory();
+    void saveHistory() const;
 };
 
 } // namespace cv

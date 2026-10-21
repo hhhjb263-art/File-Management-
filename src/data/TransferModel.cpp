@@ -3,8 +3,15 @@
  ****************************************************************************/
 #include "TransferModel.h"
 
-#include "Util.h" // cv::Util::humanSize（历史 sizeText 复用全项目统一格式化）
+#include "Util.h"
+#include "../core/AppPaths.h" // cv::Util::humanSize（历史 sizeText 复用全项目统一格式化）
 
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QModelIndex>
 #include <QSet>
 
@@ -58,7 +65,10 @@ bool TransferModel::isTerminalState(TransferState state)
 
 // ============================ 构造 / 查询 ============================
 
-TransferModel::TransferModel(QObject *parent) : QAbstractListModel(parent) {}
+TransferModel::TransferModel(QObject *parent) : QAbstractListModel(parent)
+{
+    loadHistory();   // 上次运行留下的「已上传 / 已下载」记录
+}
 
 int TransferModel::rowCount(const QModelIndex &parent) const
 {
@@ -227,6 +237,7 @@ void TransferModel::updateState(const QString &taskId, TransferState state, cons
         while (m_history.size() > kHistoryLimit) {
             m_history.removeLast(); // 超上限丢弃最旧（尾部）
         }
+        saveHistory();     // 历史变了就落盘（重启后还能看到）
         emit historyChanged();
         // 行已不在 m_tasks，不再对该行发 dataChanged。
         return;
@@ -323,7 +334,96 @@ void TransferModel::clearHistory()
         return;
     }
     m_history.clear();
+    saveHistory();   // 空历史 ⇒ 顺手把文件也清掉
     emit historyChanged();
+}
+
+// ---------------------------------------------------------------------------
+//  历史落盘（transfer_history.json）
+// ---------------------------------------------------------------------------
+
+QString historyFilePath()
+{
+    return AppPaths::configDir() + QStringLiteral("/transfer_history.json");
+}
+
+// 文件内自用的状态 <-> token（不依赖成员函数 stateToken，历史里只有终端态）
+static QString stateTok(TransferState st)
+{
+    switch (st) {
+    case TransferState::Queued:    return QStringLiteral("queued");
+    case TransferState::Hashing:   return QStringLiteral("hashing");
+    case TransferState::Running:   return QStringLiteral("running");
+    case TransferState::Paused:    return QStringLiteral("paused");
+    case TransferState::Completed: return QStringLiteral("completed");
+    case TransferState::Failed:    return QStringLiteral("failed");
+    case TransferState::Canceled:  return QStringLiteral("canceled");
+    }
+    return QStringLiteral("completed");
+}
+
+static TransferState stateFromTok(const QString &s)
+{
+    if (s == QLatin1String("failed"))   return TransferState::Failed;
+    if (s == QLatin1String("canceled")) return TransferState::Canceled;
+    return TransferState::Completed;   // 历史里只可能是终端态
+}
+
+void TransferModel::saveHistory() const
+{
+    QDir().mkpath(AppPaths::configDir());
+    QJsonArray arr;
+    for (const TransferTask &t : m_history) {
+        QJsonObject o;
+        o.insert(QStringLiteral("id"), t.id);
+        o.insert(QStringLiteral("kind"), kindToken(t.kind));
+        o.insert(QStringLiteral("fileName"), t.fileName);
+        o.insert(QStringLiteral("localPath"), t.localPath);
+        o.insert(QStringLiteral("remotePath"), t.remotePath);
+        o.insert(QStringLiteral("total"), double(t.total));
+        o.insert(QStringLiteral("done"), double(t.done));
+        o.insert(QStringLiteral("state"), stateTok(t.state));
+        o.insert(QStringLiteral("error"), t.error);
+        o.insert(QStringLiteral("startedMs"), double(t.started.toMSecsSinceEpoch()));
+        o.insert(QStringLiteral("instant"), t.instant);
+        arr.append(o);
+    }
+    QFile f(historyFilePath());
+    if (!f.open(QIODevice::WriteOnly))
+        return;
+    f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void TransferModel::loadHistory()
+{
+    QFile f(historyFilePath());
+    if (!f.open(QIODevice::ReadOnly))
+        return;
+    const QJsonArray arr = QJsonDocument::fromJson(f.readAll()).array();
+    f.close();
+    for (const auto &v : arr) {
+        const QJsonObject o = v.toObject();
+        TransferTask t;
+        t.id         = o.value(QStringLiteral("id")).toString();
+        if (t.id.isEmpty())
+            continue;
+        t.kind       = o.value(QStringLiteral("kind")).toString() == QLatin1String("download")
+                           ? TransferKind::Download
+                           : TransferKind::Upload;
+        t.fileName   = o.value(QStringLiteral("fileName")).toString();
+        t.localPath  = o.value(QStringLiteral("localPath")).toString();
+        t.remotePath = o.value(QStringLiteral("remotePath")).toString();
+        t.total      = o.value(QStringLiteral("total")).toVariant().toLongLong();
+        t.done       = o.value(QStringLiteral("done")).toVariant().toLongLong();
+        t.state      = stateFromTok(o.value(QStringLiteral("state")).toString());
+        t.error      = o.value(QStringLiteral("error")).toString();
+        t.started    = QDateTime::fromMSecsSinceEpoch(
+            o.value(QStringLiteral("startedMs")).toVariant().toLongLong());
+        t.instant    = o.value(QStringLiteral("instant")).toBool();
+        m_history.append(t);   // 文件里本来就是"最新在前"
+    }
+    while (m_history.size() > kHistoryLimit)
+        m_history.removeLast();
 }
 
 QVariantMap TransferModel::historyAtOfKind(TransferKind kind, int i) const

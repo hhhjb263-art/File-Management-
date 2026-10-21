@@ -444,8 +444,10 @@ Item {
                             //
                             // ⚠️ 外面套一层 Item 先把角色值抓出来：ComboBox 自己的 `model` 属性
                             //    会遮蔽 delegate 的 `model`，届时 `model.mode` 会变成 undefined。
+                            // 宽度给足：`双向同步` 四个汉字 + 下拉箭头 + 内边距，86px 会截掉最后一个字
                             Item {
-                                Layout.preferredWidth: 86
+                                Layout.preferredWidth: 112
+                                Layout.minimumWidth: 112
                                 Layout.preferredHeight: 24
                                 property int    pairMode: model.mode
                                 property string pairId:   String(model.id)

@@ -356,6 +356,13 @@ Item {
                 text: qsTr("上传")
                 onClicked: Files.uploadHere()
             }
+            // 「打开」：交给系统默认程序。本地没有副本会先下载再打开；
+            // 可执行文件（exe/bat/ps1…）由 FileController::openWithSystem 拦截并弹出原因。
+            PrimaryButton {
+                text: qsTr("打开")
+                enabled: page.selectedIds.length > 0 && !page.isDirId(page.selectedIds[0])
+                onClicked: Files.openWithSystem(page.selectedIds[0])
+            }
             PrimaryButton {
                 glyph: "⬇"
                 text: qsTr("下载")
@@ -765,11 +772,6 @@ Item {
                 page.requestVersions(id, page.nameForId(id))
             }
         }
-        MenuItem {
-            text: qsTr("病毒查杀…")
-            enabled: page.selectedIds.length === 1 && !page.isDirId(page.selectedIds[0])
-            onTriggered: Files.scanFile(page.selectedIds[0])
-        }
         MenuSeparator { }
         MenuItem {
             text: qsTr("重命名…")
@@ -829,6 +831,12 @@ Item {
 
         // ---- 组1 操作 ----
         MenuItem {
+            // 用系统默认程序打开；可执行文件会被拦截（原因见 C++ 侧文案）
+            text: qsTr("打开（系统默认程序）")
+            enabled: page.ctxId.length > 0 && !page.ctxIsDir
+            onTriggered: Files.openWithSystem(page.ctxId)
+        }
+        MenuItem {
             id: miOpen
             text: (page.ctxIsDir ? qsTr("打开文件夹") : qsTr("打开下载目录"))
             onTriggered: {
@@ -866,13 +874,6 @@ Item {
             enabled: page.ctxId.length > 0 && !page.ctxIsDir
             onTriggered: page.requestVersions(page.ctxId, page.ctxName)
         }
-        MenuItem {
-            // 病毒查杀：服务端按**内容哈希**查（文件本身不出服务器），与上传时的判定共用缓存
-            text: qsTr("病毒查杀…")
-            enabled: page.ctxId.length > 0 && !page.ctxIsDir
-            onTriggered: Files.scanFile(page.ctxId)
-        }
-
         MenuSeparator { }
 
         // ---- 组2 修改 ----

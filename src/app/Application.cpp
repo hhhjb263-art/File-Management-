@@ -26,6 +26,8 @@
 #include "../net/MockBackend.h"
 #include "../sync/LocalIndex.h"
 #include <QTimer>
+#include <QDesktopServices>
+#include <QUrl>
 #include "../transfer/TransferManager.h"
 
 namespace {
@@ -166,6 +168,21 @@ void Application::start()
                      });
     // 取消任务：服务端删掉会话的临时分块后才真正释放磁盘，且这一步**晚于** taskFinished，
     // 所以由 TransferManager 在清理落地后单独发一次（否则底栏用量停在旧数字上）。
+    // ---- 「打开」：本地没有副本时先下载（openWhenDone），下完交给系统默认程序 ----
+    QObject::connect(m_files, &cv::FileController::openNeedsDownload, this,
+                     [this](const QString &fileId, const QString &) {
+                         if (!m_transfer)
+                             return;
+                         m_transfer->enqueueDownload({fileId},
+                                                     cv::Settings::instance().downloadDir(), true);
+                     });
+    QObject::connect(m_transfer, &cv::TransferManager::fileReady, this,
+                     [](const QString &path) {
+                         // 可执行文件的拦截在 FileController::openWithSystem 里做，
+                         // 这里只处理"已经决定要打开"的普通文件。
+                         QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+                     });
+
     QObject::connect(m_transfer, &cv::TransferManager::storageChanged, this, [this] {
         if (m_stats)
             m_stats->refresh();

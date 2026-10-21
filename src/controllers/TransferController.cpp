@@ -62,6 +62,13 @@ TransferController::TransferController(TransferManager *manager, QObject *parent
 {
 #ifdef CV_HAVE_TRANSFERMANAGER
     if (m_manager) {
+        // 取消 = 放弃：临时文件（.part / manifest）由 TransferManager 清掉；
+        // **行不删** —— 它会自动移入「已上传 / 已下载」历史分组，
+        // 那里带「重新传输」按钮（用户 2026-10-21 明确要求）。
+        connect(m_manager, &TransferManager::taskCancelled, this, [this](const QString &taskId) {
+            emit logMessage(QStringLiteral("warn"),
+                            QStringLiteral("已取消并清理临时文件（任务 %1）").arg(taskId));
+        });
         // manager 自身用 changed() 汇总通知；这里转成三个细粒度属性信号
         connect(m_manager, &TransferManager::changed, this, &TransferController::pullState);
 
@@ -139,6 +146,13 @@ TransferController::TransferController(TransferManager *manager, QObject *parent
     if (!m_manager)
         m_statusText = QStringLiteral("传输组件未就绪");
     pullState();
+}
+
+void TransferController::retry(const QString &taskId)
+{
+    if (!m_manager || taskId.isEmpty())
+        return;
+    m_manager->retryTask(taskId);   // 参数从任务留存表里取，无需模型参与
 }
 
 void TransferController::setTaskModel(TransferModel *model)

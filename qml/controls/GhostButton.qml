@@ -36,25 +36,33 @@ Button {
     rightPadding: _hasIcon && _hasText ? Theme.spaceM : Theme.spaceS
     font.pointSize: Theme.fontBody
 
-    contentItem: RowLayout {
-        id: contentRow
-        spacing: Theme.spaceS
+    // 与 DangerButton 一致：包一层 Item 让内容**居中**。
+    // （RowLayout 直接作 contentItem 时是左对齐的，纯图标按钮会被顶到左边、右边空一块。）
+    contentItem: Item {
+        implicitWidth: contentRow.implicitWidth
+        implicitHeight: contentRow.implicitHeight
 
-        CvIcon {
-            visible: control._hasIcon
-            Layout.alignment: Qt.AlignVCenter
-            name: control._icon
-            size: Theme.iconSize
-            color: control._fg
-        }
+        RowLayout {
+            id: contentRow
+            anchors.centerIn: parent
+            spacing: Theme.spaceS
 
-        Label {
-            visible: control._hasText
-            text: control.text
-            font: control.font
-            color: control._fg
-            elide: Text.ElideRight
-            verticalAlignment: Text.AlignVCenter
+            CvIcon {
+                visible: control._hasIcon
+                Layout.alignment: Qt.AlignVCenter
+                name: control._icon
+                size: Theme.iconSize
+                color: control._fg
+            }
+
+            Label {
+                visible: control._hasText
+                text: control.text
+                font: control.font
+                color: control._fg
+                elide: Text.ElideRight
+                verticalAlignment: Text.AlignVCenter
+            }
         }
     }
 

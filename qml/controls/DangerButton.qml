@@ -39,25 +39,35 @@ Button {
     font.pointSize: Theme.fontBody
     font.bold: true
 
-    contentItem: RowLayout {
-        id: contentRow
-        spacing: Theme.spaceS
+    // ⚠️ 外面包一层 Item 再 anchors.centerIn：
+    //    RowLayout 作为 contentItem 时是**左对齐**的 —— 按钮比内容宽时（比如纯图标按钮
+    //    宽度 = controlHeight*2.5），图标会被顶到左边、右边空一大块。
+    //    包一层 Item + centerIn 后，图标/图文整体在按钮里居中。
+    contentItem: Item {
+        implicitWidth: contentRow.implicitWidth
+        implicitHeight: contentRow.implicitHeight
 
-        CvIcon {
-            visible: control._hasIcon
-            Layout.alignment: Qt.AlignVCenter
-            name: control._icon
-            size: Theme.iconSize
-            color: control._fg
-        }
+        RowLayout {
+            id: contentRow
+            anchors.centerIn: parent
+            spacing: Theme.spaceS
 
-        Label {
-            visible: control._hasText
-            text: control.text
-            font: control.font
-            color: control._fg
-            elide: Text.ElideRight
-            verticalAlignment: Text.AlignVCenter
+            CvIcon {
+                visible: control._hasIcon
+                Layout.alignment: Qt.AlignVCenter
+                name: control._icon
+                size: Theme.iconSize
+                color: control._fg
+            }
+
+            Label {
+                visible: control._hasText
+                text: control.text
+                font: control.font
+                color: control._fg
+                elide: Text.ElideRight
+                verticalAlignment: Text.AlignVCenter
+            }
         }
     }
 

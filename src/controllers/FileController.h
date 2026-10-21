@@ -93,7 +93,10 @@ public:
     Q_INVOKABLE void remove(const QString &id);
     Q_INVOKABLE void createFolder(const QString &path);  // 相对路径，自动补齐中间目录
     Q_INVOKABLE void uploadHere();                       // 请求 QML 选择文件并上传到 currentDir
-    Q_INVOKABLE void downloadSelected();                 // 下载 selectedIds
+    Q_INVOKABLE void downloadSelected();
+    // 用**系统默认程序**打开：本地已有且大小吻合就直接开，否则先下载再开。
+    // 可执行文件一律拦截（见 isBlockedExecutable），并给出原因。
+    Q_INVOKABLE void openWithSystem(const QString &fileId);                 // 下载 selectedIds
     // 批量操作：对**当前选中的全部**生效（原来只有单目标 remove/moveTo，
     // 菜单里取 selectedIds[0] ⇒ 多选时只动第一个，这是用户报的那个现象）。
     Q_INVOKABLE void removeSelected();                   // 批量移入回收站
@@ -125,9 +128,15 @@ signals:
     void storageChanged();
     void uploadRequested(const QString &dir);          // QML 打开文件选择框后调 Transfer.upload
     void downloadRequested(const QStringList &fileIds); // QML 或上层转交 Transfer.download
+    // 「打开」时本地还没有副本 → 上层先下载（openWhenDone=true），下完再打开
+    void openNeedsDownload(const QString &fileId, const QString &name);
     void logMessage(const QString &level, const QString &text);
 
 private:
+    // 不让客户端直接"运行"的危险后缀（.exe/.bat/.ps1…）。
+    // 注意：拦截的是"打开运行"，不是"预览/下载"——纯文本预览仍然可用。
+    static bool isBlockedExecutable(const QString &name);
+
     void setLoading(bool on);
     void setEmptyText(const QString &text);
     void setCurrentDir(const QString &dir);

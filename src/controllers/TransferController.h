@@ -49,6 +49,8 @@ public:
     // ---- 契约 §3 冻结方法 ----
     Q_INVOKABLE void upload(const QStringList &paths, const QString &dir);
     Q_INVOKABLE void download(const QStringList &ids, const QString &dest);
+    // 历史里「重新传输」：按 taskId 找回原参数重新入队（上传重传同一源文件 / 下载重下同一 fileId）
+    Q_INVOKABLE void retry(const QString &taskId);
     Q_INVOKABLE void cancel();
     Q_INVOKABLE void pause();
     Q_INVOKABLE void resume();

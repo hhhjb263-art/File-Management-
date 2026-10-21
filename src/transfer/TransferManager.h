@@ -78,13 +78,20 @@ public:
     // 上传：本地文件绝对路径列表 → 远端目录（dir 为相对路径，'' = 根目录）
     Q_INVOKABLE void enqueueUpload(const QStringList &localPaths, const QString &dir);
     // 下载：fileId 列表 → 本地保存目录
-    Q_INVOKABLE void enqueueDownload(const QStringList &fileIds, const QString &destDir);
+    // openWhenDone：下载完成后发 fileReady(本地路径)，供"打开（系统默认程序）"用
+    Q_INVOKABLE void enqueueDownload(const QStringList &fileIds, const QString &destDir,
+                                     bool openWhenDone = false);
     // 取消当前任务（并终止当前批次剩余的排队任务）
     Q_INVOKABLE void cancelCurrent();
 
     // 启动时恢复「上次没传完」的上传：读 manifest，把本地文件仍在的条目重新入队，
     // pipeline 会命中同一 manifest 从断点继续。返回恢复的任务数。
     Q_INVOKABLE int restoreInterrupted();
+
+    // 「重新传输」：按 taskId 在完成/失败任务的留存表里找回原参数，重新入队。
+    // 上传 → 重新上传同一个本地文件到原云端目录；下载 → 重新下载同一个 fileId 到原目录
+    // （.part 还在就自动续传；被"取消"清掉过就从 0 开始）。
+    Q_INVOKABLE bool retryTask(const QString &taskId);
 
     // 暂停 / 继续**当前任务**。因为引擎一次只跑一个任务，暂停它会同时挡住后面的队列
     // （这正是"暂停传输"该有的语义）。已在途的分块/区间会自然收尾，不再派发新的。
@@ -118,6 +125,10 @@ signals:
     // 取消任务后磁盘占用会变（服务端删掉会话的临时分块），且这一刻**晚于** taskFinished，
     // 所以单独发一个信号，让上层在"服务端清理完成"之后再刷用量（否则数字是旧的）。
     void storageChanged();
+    // 任务被**取消**：语义是"放弃"，上层应把该行从队列里移除（与"失败"不同，失败要留痕）。
+    void taskCancelled(const QString &taskId);
+    // 下载完成且该任务要求"下完就打开" → 携带本地绝对路径（上层用系统默认程序打开）
+    void fileReady(const QString &path);
     // 同名冲突：由 TransferController 弹「是否覆盖」，再回调解续
     void conflictDetected(const QString &taskId, const QString &dir, const QString &name);
     void logMessage(const QString &level, const QString &text);
@@ -162,8 +173,10 @@ private:
         QMap<qint64, QByteArray>         readySegments; // 乱序到达缓存（起点 → 数据）
         QList<QPair<qint64, QByteArray>> writeQueue;    // 按序写盘队列
         int                              inflightSegments = 0;
+        QHash<qint64, int>               segRetries;   // 各分段已重试次数（下载）
         qint64                           nextReqOffset    = 0;
         bool                             writing          = false;
+        bool                             openWhenDone     = false; // 下载完成后自动用系统程序打开
 
         // ---- 通用 ----
         qint64  total = 0;
@@ -204,6 +217,8 @@ private:
     void pumpDownload();
     void launchRangeRead(qint64 offset, qint64 length);
     void onRangeData(qint64 gen, qint64 offset, const Result<QByteArray> &r);
+    // 下载分段失败/长度不符时重试该段（网络抖动、服务端重启都不该让整个任务失败）
+    void retrySegment(qint64 gen, qint64 offset, qint64 length, const QString &why);
     void drainReady();
     void maybeWrite();
     void launchWrite(qint64 offset, const QByteArray &data);
@@ -244,6 +259,27 @@ private:
     QList<Task *> m_graveyard;
     // 还在等服务端 cancelUpload 落地的任务数；减到 0 才发 storageChanged（只发一次）
     int m_cancelPending = 0;
+    // 未完成下载任务的持久化（重启客户端后回到传输列表）；
+    // 每次入队/结束/取消都整体重写 = 天然自清理，不需要单独删条目。
+    // 「重新传输」用的参数快照。
+    // ⚠️ 不能用 m_graveyard：pump() 每次开头 reapGraveyard() 会把已结束的 Task 对象删掉，
+    //    于是用户点 ↻ 时参数早没了（表现为"点了没反应"）。这里存纯数据，不受回收影响。
+    struct FinishedParams {
+        QString      id;
+        TransferKind kind = TransferKind::Upload;
+        QString      name;
+        QString      fileId;     // 下载用
+        QString      localPath;  // 上传源文件
+        QString      dir;        // 上传目标目录
+        QString      destDir;    // 下载目标目录
+    };
+    QList<FinishedParams> m_finished;
+    // 同上那份快照的落盘版本：**重启后历史行上的 ↻ 也能用**（否则重启就丢参数）
+    QString m_finishedFile;
+    void saveFinishedParams() const;
+    void loadFinishedParams();
+    QString m_dlTasksFile;
+    void saveDownloadTasks() const;
 
     int     m_activeCount = 0;
     QString m_statusText  = QStringLiteral("空闲");

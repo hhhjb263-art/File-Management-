@@ -8,6 +8,8 @@
  ****************************************************************************/
 #include "FileController.h"
 
+#include "../core/Settings.h"
+
 #include "core/Util.h"          // Util::humanSize（预览元信息）
 #include "core/Async.h"        // 病毒查杀异步执行（服务端可能等远端结论）
 #include "data/FileListModel.h" // cv::FileListModel / cv::FileRow（契约 §4）
@@ -16,6 +18,10 @@
 
 #include <QBuffer>
 #include <QCryptographicHash>
+#include <QDesktopServices>
+#include <QFileInfo>
+#include <QSet>
+#include <QUrl>
 #include <QDateTime>
 #include <QFileInfo>
 #include <QImage>
@@ -829,6 +835,83 @@ void FileController::downloadSelected()
     }
     // QML / 上层监听 downloadRequested(ids) → 选择保存目录 → Transfer.download(ids, dest)
     emit downloadRequested(m_selectedIds);
+}
+
+// ---------------------------------------------------------------------------
+//  「打开」：用系统默认程序打开；可执行文件一律拦截
+// ---------------------------------------------------------------------------
+
+bool FileController::isBlockedExecutable(const QString &name)
+{
+    // 拦截的是"**运行**"这类动作。纯预览（文本/图片）不受影响，下载也不受影响。
+    static const QSet<QString> kBlocked = {
+        QStringLiteral("exe"),  QStringLiteral("com"),  QStringLiteral("scr"),
+        QStringLiteral("pif"),  QStringLiteral("bat"),  QStringLiteral("cmd"),
+        QStringLiteral("msi"),  QStringLiteral("msix"), QStringLiteral("appx"),
+        QStringLiteral("ps1"),  QStringLiteral("ps2"),  QStringLiteral("vbs"),
+        QStringLiteral("vbe"),  QStringLiteral("js"),   QStringLiteral("jse"),
+        QStringLiteral("wsf"),  QStringLiteral("wsh"),  QStringLiteral("hta"),
+        QStringLiteral("reg"),  QStringLiteral("lnk"),  QStringLiteral("dll"),
+        QStringLiteral("cpl"),  QStringLiteral("sys"),  QStringLiteral("drv"),
+        QStringLiteral("ocx"),  QStringLiteral("jar"),  QStringLiteral("apk"),
+        QStringLiteral("bin"),  QStringLiteral("run"),  QStringLiteral("deb"),
+        QStringLiteral("rpm"),  QStringLiteral("iso"),  QStringLiteral("img")};
+    return kBlocked.contains(QFileInfo(name).suffix().toLower());
+}
+
+void FileController::openWithSystem(const QString &fileId)
+{
+    if (!m_backend) {
+        emit errorOccurred(QStringLiteral("未配置数据源"));
+        return;
+    }
+    const FileItem *it = nullptr;
+    for (const FileItem &f : m_items) {
+        if (f.id == fileId) {
+            it = &f;
+            break;
+        }
+    }
+    if (!it) {
+        emit errorOccurred(QStringLiteral("找不到该文件（列表可能已刷新，请重新选择）"));
+        return;
+    }
+    if (it->isDir) {
+        emit errorOccurred(QStringLiteral("这是云端文件夹，不能“打开”；双击可以进入"));
+        return;
+    }
+
+    if (isBlockedExecutable(it->name)) {
+        const QString ext = QFileInfo(it->name).suffix().toUpper();
+        // 用字符串拼接而不是跨行字面量：避免把换行写进源码（也就不会有转义踩坑）
+        const QString msg =
+            QStringLiteral("出于安全考虑，客户端不直接运行可执行文件（.%1）。").arg(ext)
+            + QStringLiteral("\n\n")
+            + QStringLiteral("原因：这类文件一旦交给系统关联程序启动，就等于在你的电脑上执行了"
+                             "它携带的代码 —— 网盘/下载器类工具最常见的攻击入口就是"
+                             "“点一下就能跑”。")
+            + QStringLiteral("\n\n")
+            + QStringLiteral("如确需使用：先下载到本地，用杀毒软件扫描确认后，"
+                             "再在资源管理器里手动打开。");
+        emit errorOccurred(msg);
+        emit logMessage(QStringLiteral("warn"),
+                        QStringLiteral("已拦截打开可执行文件：%1").arg(it->name));
+        return;
+    }
+
+    const QString dir  = Settings::instance().downloadDir();
+    const QString path = dir.isEmpty() ? QString() : dir + QLatin1Char('/') + it->name;
+    const QFileInfo fi(path);
+    if (!path.isEmpty() && fi.isFile() && fi.size() == it->size) {
+        // 本地已有一份且大小吻合 ⇒ 直接用系统默认程序打开
+        QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+        emit statusMessage(QStringLiteral("已用系统默认程序打开：%1").arg(it->name), true);
+        return;
+    }
+    // 本地没有（或大小不一致）⇒ 让上层先下载，下完自动打开
+    emit openNeedsDownload(fileId, it->name);
+    emit logMessage(QStringLiteral("info"),
+                    QStringLiteral("本地还没有「%1」，先下载再打开").arg(it->name));
 }
 
 } // namespace cv

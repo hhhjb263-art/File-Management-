@@ -33,6 +33,9 @@ namespace {
 
 constexpr std::size_t kMaxRequestBytes = 256u * 1024u * 1024u;  // 单次请求上限 256MB
 constexpr int kTimeoutSeconds = 30;
+// 单次 writeAll 允许的"对端读取停滞"总时限：send 超时（EAGAIN）后继续重试，
+// 直到这个总时限才放弃。给大块下载留足余量（客户端可能同时在写几 GB 的 .part）。
+constexpr int kWriteStallSeconds = 180;
 
 std::string statusText(int code) {
   switch (code) {
@@ -658,12 +661,33 @@ bool HttpServer::dispatch(const Request& req, Response& resp) {
 }
 
 bool HttpServer::writeAll(const Conn& conn, const char* data, std::size_t len) {
+  // ⚠️ **不能把 EAGAIN 当致命错误**（2026-10-21 真机定位）：
+  //    accept 时设了 SO_SNDTIMEO=30s。对端读得慢时（客户端正在写 2.2GB 的 .part），
+  //    一次 send() 超时会返回 -1 + EAGAIN —— 但 **socket 仍然可写**，继续重试就能写完。
+  //    旧实现 `if (n <= 0) return false;` 直接判失败并 closeConn ⇒ 只发出 socket 缓冲里那
+  //    约 635KB，其余丢弃 ⇒ 客户端收到「数据段长度不符（期望 8MiB，实得 635100 字节）」。
+  //    现在：EINTR 重试；EAGAIN/EWOULDBLOCK 在总时限内重试；只有真错误（EPIPE/ECONNRESET）才放弃。
   std::size_t sent = 0;
+  const auto  deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(kWriteStallSeconds);
   while (sent < len) {
     ssize_t n = 0;
+    errno = 0;
     if (!connWrite(conn, data + sent, len - sent, n)) return false;
-    if (n <= 0) return false;
-    sent += static_cast<std::size_t>(n);
+    if (n > 0) {
+      sent += static_cast<std::size_t>(n);
+      continue;
+    }
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        CV_LOG_WARN("writeAll 放弃：对端读取停滞超过 " << kWriteStallSeconds << "s（已发 "
+                                                      << sent << "/" << len << " 字节）");
+        return false;
+      }
+      continue;
+    }
+    return false;
   }
   return true;
 }

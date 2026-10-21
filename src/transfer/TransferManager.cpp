@@ -48,6 +48,7 @@ constexpr int    kDownloadConcurrency  = 4;                 // 下载并发段�
 constexpr int    kMaxConcurrent        = 3;                 // 单文件内并发块数
 constexpr int    kFileConcurrency      = 4;                 // **同时进行的文件数**（文件级并发）
 constexpr int    kMaxRetries           = 3;                 // 单块最大重试次数
+constexpr int    kDownloadSegmentRetries = 3;                // 下载单个分段最多重试次数
 constexpr qint64 kStreamUploadThreshold = 8 * 1024 * 1024;  // 大文件阈值（> 该值走分块日志提示）
 
 // IO / 网络线程池大小（哈希 + 读块 + 阻塞式请求）
@@ -132,6 +133,9 @@ TransferManager::TransferManager(Backend *backend, QObject *parent)
     m_pool->setMaxThreadCount(kIoPoolThreads);
 
     m_manifestFile = AppPaths::configDir() + QStringLiteral("/upload_manifest.json");
+    m_dlTasksFile  = AppPaths::configDir() + QStringLiteral("/download_tasks.json");
+    m_finishedFile = AppPaths::configDir() + QStringLiteral("/finished_params.json");
+    loadFinishedParams();
     QDir().mkpath(AppPaths::configDir());
 
     refresh();
@@ -235,7 +239,8 @@ void TransferManager::enqueueUpload(const QStringList &localPaths, const QString
     pump();
 }
 
-void TransferManager::enqueueDownload(const QStringList &fileIds, const QString &destDir)
+void TransferManager::enqueueDownload(const QStringList &fileIds, const QString &destDir,
+                                      bool openWhenDone)
 {
     if (fileIds.isEmpty())
         return;
@@ -244,10 +249,12 @@ void TransferManager::enqueueDownload(const QStringList &fileIds, const QString 
         t.id      = newTaskId();
         t.kind    = TransferKind::Download;
         t.fileId  = id;
-        t.destDir = destDir;
-        t.name    = id; // 真实文件名在 statById 后补齐
+        t.destDir      = destDir;
+        t.openWhenDone = openWhenDone;
+        t.name         = id; // 真实文件名在 statById 后补齐
         m_pending.append(t);
     }
+    saveDownloadTasks();   // 记下来：重启客户端后这些任务要回到列表
     emit logMessage(QStringLiteral("info"),
                     QStringLiteral("加入下载队列 %1 项 → 目录「%2」")
                         .arg(fileIds.size())
@@ -292,6 +299,27 @@ void TransferManager::cancelCurrent()
                         QStringLiteral("用户取消：%1")
                             .arg(t->kind == TransferKind::Upload ? t->name : t->fileId));
 
+        if (t->kind == TransferKind::Download && !t->partPath.isEmpty()) {
+            // 取消 = 放弃这次下载 ⇒ **删掉 .part**。
+            // 取消与暂停语义不同；而且在此之前**没有任何入口能清理 .part**
+            // ⇒ 一个 2.2GB 的 .part 会永久占着本地磁盘。
+            const QString pp = t->partPath;
+            QThreadPool *dlPool = m_pool;
+            QPointer<TransferManager> dlSelf(this);
+            const QString dlId = t->id;
+            if (dlPool) {
+                dlPool->start([pp, dlSelf, dlId]() {
+                    QFile::remove(pp);
+                    if (!dlSelf) return;
+                    QMetaObject::invokeMethod(dlSelf.data(), [dlSelf, dlId]() {
+                        if (dlSelf) emit dlSelf->taskCancelled(dlId);
+                    }, Qt::QueuedConnection);
+                });
+            } else {
+                QFile::remove(pp);
+                emit taskCancelled(dlId);
+            }
+        }
         if (t->kind == TransferKind::Upload) {
             // ⚠️ 「取消」与「暂停」语义必须分开：
             //    · 暂停 —— 保留 manifest，重启后可续传；
@@ -333,6 +361,8 @@ void TransferManager::cancelCurrent()
             }
         }
         finishTask(false, QStringLiteral("已取消"));
+        if (t->kind == TransferKind::Upload)
+            emit taskCancelled(t->id);   // 上传没有 .part，直接把行从队列移除
     }
     m_cur = nullptr;
 }
@@ -458,8 +488,23 @@ void TransferManager::finishTask(bool ok, const QString &message)
     if (canceled)
         m_pending.clear();   // 取消 = 终止整批：排队中的也不再启动
 
+    {   // 记一份「重新传输」需要的参数（纯数据，pump() 的 reapGraveyard 不会动它）
+        FinishedParams fp;
+        fp.id        = t->id;
+        fp.kind      = t->kind;
+        fp.name      = t->name;
+        fp.fileId    = t->fileId;
+        fp.localPath = t->localPath;
+        fp.dir       = t->dir;
+        fp.destDir   = t->destDir;
+        m_finished.prepend(fp);
+        while (m_finished.size() > 100)
+            m_finished.removeLast();
+        saveFinishedParams();   // 落盘 ⇒ 重启后历史行的 ↻ 仍可用
+    }
     retireTask(t);           // 从在途集合摘下（内存延迟回收，见 retireTask）
     m_cur = nullptr;
+    saveDownloadTasks();     // 任务结束 ⇒ 清单重写（成功的自动消失，未完成的留着）
 
     if (!message.isEmpty()) {
         emit logMessage(ok ? QStringLiteral("info")
@@ -1005,6 +1050,7 @@ void TransferManager::onDownloadStat(qint64 gen, const Result<FileItem> &r)
     }
     m_cur->finalPath = Util::joinPath(dest, m_cur->name);
     m_cur->partPath  = m_cur->finalPath + QStringLiteral(".part");
+    saveDownloadTasks();   // 路径已解析 ⇒ 现在写清单才有意义（重启才能恢复这条）
 
     qint64 offset = 0;
     if (QFile::exists(m_cur->partPath))
@@ -1071,6 +1117,46 @@ void TransferManager::launchRangeRead(qint64 offset, qint64 length)
     });
 }
 
+void TransferManager::retrySegment(qint64 gen, qint64 offset, qint64 length, const QString &why)
+{
+    // 下载分段失败（网络抖动 / 服务端被重启 / 传输被掐断）时的统一处理：
+    // **只重试这一段**，不牵连整个任务 —— .part 里的进度都还在，代价只有这 8MB。
+    Task *const tp = taskForGen(gen);
+    if (!tp)
+        return;
+    m_cur = tp;
+    if (m_cur->cancelRequested || m_cur->paused)
+        return;
+
+    const int n = ++m_cur->segRetries[offset];
+    if (n > kDownloadSegmentRetries) {
+        finishTask(false, QStringLiteral("分段重试 %1 次仍失败（offset=%2）：%3")
+                              .arg(kDownloadSegmentRetries)
+                              .arg(offset)
+                              .arg(why));
+        return;
+    }
+    const int delayMs = 800 * n;   // 0.8s / 1.6s / 2.4s
+    emit logMessage(QStringLiteral("warn"),
+                    QStringLiteral("分段失败，%1 ms 后重试（第 %2/%3 次）· offset=%4 · %5")
+                        .arg(delayMs)
+                        .arg(n)
+                        .arg(kDownloadSegmentRetries)
+                        .arg(offset)
+                        .arg(why));
+
+    QTimer::singleShot(delayMs, this, [this, gen, offset, length] {
+        Task *t = taskForGen(gen);
+        if (!t)
+            return;
+        m_cur = t;
+        if (t->cancelRequested || t->paused)
+            return;
+        ++t->inflightSegments;   // 重新计入在途（onRangeData 会再减回来）
+        launchRangeRead(offset, length);
+    });
+}
+
 void TransferManager::onRangeData(qint64 gen, qint64 offset, const Result<QByteArray> &r)
 {
     Task *const tp = taskForGen(gen);
@@ -1085,21 +1171,27 @@ void TransferManager::onRangeData(qint64 gen, qint64 offset, const Result<QByteA
     if (m_cur->inflightSegments > 0)
         --m_cur->inflightSegments;
 
+    const qint64 len = qMin<qint64>(kDownloadChunkSize, m_cur->total - offset);
+
     if (!r.ok) {
-        finishTask(false, QStringLiteral("分段下载失败（offset=%1）：%2").arg(offset).arg(r.error));
+        // 以前：直接 finishTask ⇒ 服务端重启/网络抖一下，整个下载就废了。
+        // 现在：先重试该段（.part 里的进度都还在，重试代价只是这一段的 8MB）。
+        retrySegment(gen, offset, len, r.error);
         return;
     }
 
     const QByteArray data = r.value;
-    const qint64     expected = qMin<qint64>(kDownloadChunkSize, m_cur->total - offset);
+    const qint64     expected = len;
     if (data.size() != expected) {
-        finishTask(false,
-                   QStringLiteral("数据段长度不符（offset=%1，期望 %2 字节，实得 %3）")
-                       .arg(offset)
-                       .arg(expected)
-                       .arg(data.size()));
+        // 长度不符 = 连接在传输中被打断（服务端被 kill / 网络断）导致收到半截。
+        // 同样按"重试该段"处理，而不是判整个任务失败。
+        retrySegment(gen, offset, len,
+                     QStringLiteral("数据段长度不符（期望 %1 字节，实得 %2）")
+                         .arg(expected)
+                         .arg(data.size()));
         return;
     }
+    m_cur->segRetries.remove(offset);   // 该段成功，清掉重试计数
 
     // 乱序到达先缓存（起点低于已写位置的重复段直接丢弃），按序推进写盘
     if (offset >= m_cur->done && !m_cur->readySegments.contains(offset))
@@ -1236,8 +1328,11 @@ void TransferManager::finalizeDownload()
     }
 
     const QString saved = m_cur->finalPath;
+    const bool    openIt = m_cur->openWhenDone;
     emit logMessage(QStringLiteral("info"), QStringLiteral("下载完成：%1").arg(saved));
     finishTask(true, QStringLiteral("已保存到 %1").arg(saved));
+    if (openIt)
+        emit fileReady(saved);   // "打开"入口：下完立刻交给系统默认程序
 }
 
 // =========================================================================
@@ -1264,11 +1359,19 @@ int TransferManager::restoreInterrupted()
     // 启动时调用：把 manifest 里「本地文件仍在、且记录了目标目录」的条目重新入队。
     // pipeline 里 loadManifest 会命中同一份 manifest ⇒ 从上次已确认的块继续（不重传）。
     // 返回恢复的任务数（用于启动提示）；本地文件已消失的条目顺手清理。
-    QFile f(m_manifestFile);
-    if (!f.open(QIODevice::ReadOnly))
-        return 0;
-    const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
-    f.close();
+    // ⚠️ 上传清单**不存在是正常情况**（用户只下文件、没在传上传任务时就没有这个文件）。
+    //    以前这里直接 `return 0`，于是"恢复未完成的下载"那段永远跑不到 —— 用户实测
+    //    「突然关闭客户端后任务没回来」就是这个原因。
+    QJsonObject root;
+    bool        hadUploadManifest = false;
+    {
+        QFile f(m_manifestFile);
+        if (f.open(QIODevice::ReadOnly)) {
+            hadUploadManifest = true;
+            root = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+        }
+    }
 
     QJsonObject keep = root;   // 默认全保留；下面按情况剔除
     QStringList   restore;
@@ -1287,15 +1390,14 @@ int TransferManager::restoreInterrupted()
         restore << abs;
         // enqueueUpload 用的目标目录 = 记录里的 dir（'' = 根）
     }
-    {
+    if (hadUploadManifest) {
         QFile w(m_manifestFile);
         if (w.open(QIODevice::WriteOnly)) {
             w.write(QJsonDocument(keep).toJson(QJsonDocument::Compact));
             w.close();
         }
     }
-    if (restore.isEmpty())
-        return 0;
+    // 注意：这里**不能** return —— 下面还要恢复未完成的下载任务。
 
     // 按各自记录的目标目录分组 enqueue（不同目录不能混在一批）
     QHash<QString, QStringList> byDir;
@@ -1308,7 +1410,159 @@ int TransferManager::restoreInterrupted()
         enqueueUpload(it.value(), it.key()), n += it.value().size();
     emit logMessage(QStringLiteral("info"),
                     QStringLiteral("已恢复 %1 个未完成的上传（从断点继续）").arg(n));
+
+    // ---- 未完成的**下载**：按 download_tasks.json 重新入队 ----
+    // 判据：.part 还在且小于总大小（否则说明已经下完或者早被清掉，不恢复）。
+    {
+        QFile df(m_dlTasksFile);
+        if (df.open(QIODevice::ReadOnly)) {
+            const QJsonObject droot = QJsonDocument::fromJson(df.readAll()).object();
+            df.close();
+            for (auto it = droot.constBegin(); it != droot.constEnd(); ++it) {
+                const QJsonObject e = it.value().toObject();
+                const QString fid  = e.value(QStringLiteral("file_id")).toString();
+                const QString name = e.value(QStringLiteral("name")).toString();
+                const QString dest = e.value(QStringLiteral("dest_dir")).toString();
+                const qint64  tot  = e.value(QStringLiteral("total")).toVariant().toLongLong();
+                if (fid.isEmpty())
+                    continue;
+                QString part = e.value(QStringLiteral("part")).toString();
+                if (part.isEmpty() && !dest.isEmpty() && !name.isEmpty())
+                    part = dest + QLatin1Char('/') + name + QStringLiteral(".part");
+                const QFileInfo pi(part);
+                if (!part.isEmpty() && pi.isFile() && (tot <= 0 || pi.size() < tot)) {
+                    enqueueDownload({fid}, dest);
+                    ++n;
+                }
+            }
+        }
+    }
+    if (n > 0)
+        emit logMessage(QStringLiteral("info"),
+                        QStringLiteral("传输列表已恢复 %1 个未完成任务").arg(n));
     return n;
+}
+
+void TransferManager::saveFinishedParams() const
+{
+    QDir().mkpath(AppPaths::configDir());
+    QJsonArray arr;
+    for (const FinishedParams &f : m_finished) {
+        QJsonObject o;
+        o.insert(QStringLiteral("id"), f.id);
+        o.insert(QStringLiteral("kind"), int(f.kind));
+        o.insert(QStringLiteral("name"), f.name);
+        o.insert(QStringLiteral("file_id"), f.fileId);
+        o.insert(QStringLiteral("local_path"), f.localPath);
+        o.insert(QStringLiteral("dir"), f.dir);
+        o.insert(QStringLiteral("dest_dir"), f.destDir);
+        arr.append(o);
+    }
+    QFile f(m_finishedFile);
+    if (!f.open(QIODevice::WriteOnly))
+        return;
+    f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void TransferManager::loadFinishedParams()
+{
+    QFile f(m_finishedFile);
+    if (!f.open(QIODevice::ReadOnly))
+        return;
+    const QJsonArray arr = QJsonDocument::fromJson(f.readAll()).array();
+    f.close();
+    for (const auto &v : arr) {
+        const QJsonObject o = v.toObject();
+        FinishedParams fp;
+        fp.id        = o.value(QStringLiteral("id")).toString();
+        if (fp.id.isEmpty())
+            continue;
+        fp.kind      = o.value(QStringLiteral("kind")).toInt() == int(TransferKind::Download)
+                           ? TransferKind::Download
+                           : TransferKind::Upload;
+        fp.name      = o.value(QStringLiteral("name")).toString();
+        fp.fileId    = o.value(QStringLiteral("file_id")).toString();
+        fp.localPath = o.value(QStringLiteral("local_path")).toString();
+        fp.dir       = o.value(QStringLiteral("dir")).toString();
+        fp.destDir   = o.value(QStringLiteral("dest_dir")).toString();
+        m_finished.append(fp);   // 文件里本来就是最新在前
+    }
+}
+
+void TransferManager::saveDownloadTasks() const
+{
+    // 整体重写"当前未完成的下载任务"：m_active + m_pending 里 kind==Download 的。
+    // 已经结束的任务不在里面 ⇒ 天然从清单消失，不用单独删条目。
+    QDir().mkpath(AppPaths::configDir());
+    QJsonObject root;
+    auto put = [&root](const Task &t) {
+        // ⚠️ 只存**已经开始**的下载（partPath 已解析）。
+        //   刚入队时 t.name 还是 fileId、t.destDir 还是空串（等 statById 才补齐），
+        //   存下来就是脏数据 —— 恢复时算不出 .part 路径，直接跳过（踩过这个坑）。
+        if (t.kind != TransferKind::Download || t.fileId.isEmpty() || t.partPath.isEmpty())
+            return;
+        QJsonObject e;
+        e.insert(QStringLiteral("file_id"), t.fileId);
+        e.insert(QStringLiteral("name"), t.name);
+        e.insert(QStringLiteral("dest_dir"), QFileInfo(t.finalPath).path()); // 绝对目录
+        e.insert(QStringLiteral("part"), t.partPath);                        // 绝对 .part 路径
+        e.insert(QStringLiteral("total"), double(t.total));
+        root.insert(t.id, e);
+    };
+    for (const Task *t : m_active)
+        if (t) put(*t);
+    for (const Task &t : m_pending) put(t);
+
+    QFile f(m_dlTasksFile);
+    if (!f.open(QIODevice::WriteOnly))
+        return;
+    f.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+}
+
+bool TransferManager::retryTask(const QString &taskId)
+{
+    // 从**参数快照**里找（不是 m_graveyard —— 那些对象会被 pump() 回收掉）。
+    FinishedParams fp;
+    bool           found = false;
+    for (const FinishedParams &e : m_finished) {
+        if (e.id == taskId) { fp = e; found = true; break; }
+    }
+    if (!found) {
+        for (const Task *t : m_active) {
+            if (t && t->id == taskId) {
+                fp.id = t->id; fp.kind = t->kind; fp.name = t->name;
+                fp.fileId = t->fileId; fp.localPath = t->localPath;
+                fp.dir = t->dir; fp.destDir = t->destDir;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        emit logMessage(QStringLiteral("warn"),
+                        QStringLiteral("重新传输失败：找不到该任务的原始参数（可能已清理）"));
+        return false;
+    }
+
+    if (fp.kind == TransferKind::Upload) {
+        if (fp.localPath.isEmpty()) {
+            emit logMessage(QStringLiteral("warn"), QStringLiteral("重新上传失败：源文件路径丢失"));
+            return false;
+        }
+        emit logMessage(QStringLiteral("info"),
+                        QStringLiteral("重新上传：%1").arg(fp.name));
+        enqueueUpload({fp.localPath}, fp.dir);
+        return true;
+    }
+
+    if (fp.fileId.isEmpty()) {
+        emit logMessage(QStringLiteral("warn"), QStringLiteral("重新下载失败：缺少文件 ID"));
+        return false;
+    }
+    emit logMessage(QStringLiteral("info"),
+                    QStringLiteral("重新下载：%1").arg(fp.name.isEmpty() ? fp.fileId : fp.name));
+    enqueueDownload({fp.fileId}, fp.destDir);
+    return true;
 }
 
 bool TransferManager::loadManifest(const QString &path, qint64 size, qint64 mtime, qint64 chunkBytes,
