@@ -10,6 +10,8 @@ namespace cv {
 class AppPaths
 {
 public:
+    // 便携模式：exe 同目录存在 portable.txt ⇒ 配置/缓存/日志/下载都放在 exe 旁边
+    static bool    isPortable();
     static QString rootDir();      // %LOCALAPPDATA%/CloudVault
     static QString configDir();    // 配置
     static QString logDir();       // 日志

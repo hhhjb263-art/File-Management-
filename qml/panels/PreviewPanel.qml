@@ -44,6 +44,32 @@ Rectangle {
     }
     readonly property string pText: apiReady && Files.previewText !== undefined
                                     ? String(Files.previewText) : ""
+    // ---- 编辑模式（仅文本预览可用）----
+    // 说明：Ctrl+A / C / V / X / Z / Y / Delete 是 TextArea **原生**支持的，
+    // 这里不重复注册（重复注册会和原生编辑行为打架），只补 Ctrl+S 保存 与 Esc 退出。
+    property bool   editing: false
+    property string draft:   ""
+    property bool   dirty:   false
+
+    function beginEdit() {
+        if (pState !== "text") return
+        draft = pText
+        dirty = false
+        editing = true
+        editor.forceActiveFocus()
+    }
+    function cancelEdit() {
+        editing = false
+        draft = ""
+        dirty = false
+    }
+    function doSave() {
+        if (!editing) return
+        const id = (pMeta && pMeta.id !== undefined) ? String(pMeta.id) : ""
+        if (id.length === 0) return
+        Files.savePreviewText(id, draft)
+        dirty = false
+    }
     readonly property string pImage: apiReady && Files.previewImageUrl !== undefined
                                      ? String(Files.previewImageUrl) : ""
     readonly property string pError: apiReady && Files.previewError !== undefined
@@ -215,14 +241,73 @@ Rectangle {
             }
 
             // text
-            ScrollView {
+            ColumnLayout {
                 anchors.fill: parent
                 visible: panel.pState === "text"
-                clip: true
+                spacing: Theme.spaceXs
+
+                // 工具条：编辑 / 保存 / 取消（带快捷键提示）
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.spaceXs
+
+                    Label {
+                        Layout.fillWidth: true
+                        visible: panel.editing
+                        text: panel.dirty
+                              ? qsTr("编辑中（未保存）· Ctrl+S 保存 · Esc 退出")
+                              : qsTr("编辑中 · Ctrl+S 保存 · Esc 退出")
+                        color: panel.dirty ? Theme.warning : Theme.textTertiary
+                        font.pointSize: Theme.fontMicro
+                        elide: Text.ElideRight
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        visible: !panel.editing
+                        text: qsTr("Ctrl+A 全选可复制")
+                        color: Theme.textTertiary
+                        font.pointSize: Theme.fontMicro
+                        elide: Text.ElideRight
+                    }
+
+                    GhostButton {
+                        visible: !panel.editing
+                        text: qsTr("编辑")
+                        onClicked: panel.beginEdit()
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("编辑内容（文本文件）")
+                    }
+                    GhostButton {
+                        visible: panel.editing
+                        text: qsTr("取消")
+                        onClicked: panel.cancelEdit()
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("放弃修改并退出（Esc）")
+                    }
+                    PrimaryButton {
+                        visible: panel.editing
+                        text: qsTr("保存")
+                        onClicked: panel.doSave()
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("保存到云端（Ctrl+S）· 会保留上一版历史")
+                    }
+                }
+
+                ScrollView {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
 
                 TextArea {
-                    readOnly: true
-                    text: panel.pText
+                    id: editor
+                    readOnly: !panel.editing
+                    text: panel.editing ? panel.draft : panel.pText
+                    onTextChanged: {
+                        if (panel.editing) {
+                            panel.draft = text
+                            panel.dirty = (text !== panel.pText)
+                        }
+                    }
                     wrapMode: TextEdit.WrapAnywhere
                     font.family: "monospace"
                     font.pointSize: Theme.fontMono
@@ -231,9 +316,10 @@ Rectangle {
                     background: Rectangle {
                         color: Theme.bg
                         border.width: 1
-                        border.color: Theme.border
+                        border.color: panel.editing ? Theme.primary : Theme.border
                         radius: Theme.radiusControl
                     }
+                }
                 }
             }
 
@@ -274,5 +360,32 @@ Rectangle {
                 wrapMode: Text.WordWrap
             }
         }
+    }
+    // ---- 快捷键：只在编辑态生效，不抢全局 Ctrl+*（上传 U / 下载 D / 设置 L / 过滤 F）----
+    // 用 StandardKey.Save 而不是字面 "Ctrl+S"：Windows/Linux 是 Ctrl+S，
+    // macOS 自动映射为 ⌘S —— 字面 "Ctrl+S" 在 macOS 上只会认 Control 键，按 ⌘S 没反应。
+    Shortcut {
+        sequences: [StandardKey.Save]
+        enabled: panel.editing
+        onActivated: panel.doSave()
+    }
+    Shortcut {
+        sequence: "Escape"
+        enabled: panel.editing
+        onActivated: panel.cancelEdit()
+    }
+
+    // 保存成功 → 退出编辑态
+    Connections {
+        target: (typeof Files !== "undefined") ? Files : null
+        function onPreviewSaved(fileId) {
+            panel.cancelEdit()
+        }
+    }
+
+    // 预览目标变了 → 退出编辑态（否则 A 的草稿会被存到 B 上）
+    onPMetaChanged: {
+        if (panel.editing)
+            panel.cancelEdit()
     }
 }

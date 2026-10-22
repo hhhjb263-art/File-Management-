@@ -112,3 +112,6 @@ build_b/
 # QA/lead 临时探针目录（不入库）
 /.qa6_probe/
 /.qa*_probe/
+
+# 便携版打包产物（103MB，不入库）
+/dist/

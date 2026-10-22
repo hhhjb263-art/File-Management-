@@ -591,6 +591,59 @@ void FileController::scanFile(const QString &fileId)
         });
 }
 
+// 在线编辑的大小上限：整文件上传走单发通道，别让"编辑器里塞 200MB"变成事故
+constexpr qint64 kMaxEditableBytes = 1LL * 1024 * 1024;   // 1 MiB
+
+void FileController::savePreviewText(const QString &fileId, const QString &text)
+{
+    if (!m_backend) {
+        emit errorOccurred(QStringLiteral("未配置数据源"));
+        return;
+    }
+    auto *hb = dynamic_cast<HttpBackend *>(m_backend);
+    if (!hb) {
+        emit errorOccurred(QStringLiteral("当前数据源不支持在线保存（仅本地引擎）"));
+        return;
+    }
+    const FileItem *it = nullptr;
+    for (const FileItem &f : m_items) {
+        if (f.id == fileId) {
+            it = &f;
+            break;
+        }
+    }
+    if (!it) {
+        emit errorOccurred(QStringLiteral("找不到该文件（列表可能已刷新，请重新选择）"));
+        return;
+    }
+    const QByteArray bytes = text.toUtf8();
+    if (bytes.size() > kMaxEditableBytes) {
+        emit errorOccurred(QStringLiteral("文件超过 %1 MB，不支持在线编辑")
+                               .arg(kMaxEditableBytes / (1024 * 1024)));
+        return;
+    }
+    const QString parentId = it->parentId;
+    const QString name     = it->name;
+    emit statusMessage(QStringLiteral("正在保存：%1").arg(name), true);
+
+    Async::run(
+        this,
+        [hb, parentId, name, bytes] { return hb->uploadWholeFile(parentId, name, bytes, true); },
+        [this, fileId, name](Result<FileItem> r) {
+            if (!r.ok) {
+                emit errorOccurred(friendlyError(r.error));
+                return;
+            }
+            emit statusMessage(QStringLiteral("已保存：%1（服务端已自动保留上一版）").arg(name),
+                               true);
+            emit logMessage(QStringLiteral("info"),
+                            QStringLiteral("在线编辑已保存并覆盖：%1").arg(name));
+            refresh();              // size / hash / 版本号都变了
+            requestPreview(fileId); // 让面板显示最新内容
+            emit previewSaved(fileId);
+        });
+}
+
 void FileController::moveTo(const QString &id, const QString &targetParentId)
 {
     if (!m_backend) {
